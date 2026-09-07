@@ -110,7 +110,14 @@ The workspace is layered so that everything portable stays testable on Linux:
 Building realm-core needs `cmake` and a C++17 compiler. A cold build takes about two minutes.
 
 Cross-compile a Windows executable from Linux with `scripts/package-windows.sh`, which needs
-`cargo-xwin`. Testing that executable needs the database on an NTFS volume: Windows file
+`cargo-xwin`. The same tool lints against the Windows target, which is worth running before
+pushing because some differences appear only there:
+
+```
+cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+```
+
+Testing a Windows executable needs the database on an NTFS volume, because Windows file
 locking does not work over the WSL filesystem.
 
 Some tests need a real osu!lazer library at `ref/client.realm`. They are skipped when it is

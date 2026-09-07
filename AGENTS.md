@@ -39,6 +39,17 @@ Each rule comes from osu!lazer's own source. Read the source before changing one
 - **Paths are re-checked immediately before they are touched**, independently of the check made
   while scanning. A plan can be minutes old by the time it runs.
 
+## Check both targets before pushing
+
+Some differences only appear on Windows, and CI is a slow way to find them. bindgen maps C
+enums to `u32` on Linux and `i32` on Windows, so a cast that is required on one platform is a
+lint error on the other. `CMake` generators differ too: Ninja writes a flat output tree, while
+the Visual Studio generator nests artifacts per build configuration.
+
+```
+cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+```
+
 ## Tests
 
 Tests are inline `#[cfg(test)] mod tests` blocks using `tempfile`. There is no `tests/`
