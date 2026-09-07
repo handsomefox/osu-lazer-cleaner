@@ -168,6 +168,7 @@ mod tests {
                     category: Category::Junk,
                     frees_blob: true,
                 }],
+                files: 1,
                 bytes: 4096,
                 selected: true,
             }],

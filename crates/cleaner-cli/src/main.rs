@@ -202,7 +202,7 @@ fn report_scan(library: &Library, plan: &Plan, json: bool) {
         println!(
             "{:<16} {:>9} {:>12}",
             group.category.slug(),
-            group.len(),
+            group.files,
             human_bytes(group.bytes)
         );
     }
@@ -229,6 +229,7 @@ fn clean(
             serde_json::to_string_pretty(&serde_json::json!({
                 "dry_run": outcome.dry_run,
                 "files": plan.selected_files(),
+                "references": plan.selected_references(),
                 "bytes": outcome.bytes,
                 "detached": outcome.detached,
                 "stashed": outcome.stashed,
@@ -241,8 +242,9 @@ fn clean(
 
     if outcome.dry_run {
         println!(
-            "would remove {} files and reclaim {}",
+            "would remove {} files ({} references) and reclaim {}",
             plan.selected_files(),
+            plan.selected_references(),
             human_bytes(outcome.bytes)
         );
         println!("re-run with --confirm to do it");

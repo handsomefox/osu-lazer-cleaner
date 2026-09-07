@@ -23,6 +23,18 @@ const OWNERS_WITH_FILE_LISTS: &[(&str, &str)] = &[
     ("Skin", "Files"),
 ];
 
+/// Everything a scan needs from the database.
+#[derive(Debug, Clone)]
+pub struct Library {
+    /// Beatmap sets eligible for cleaning.
+    pub beatmap_sets: Vec<BeatmapSet>,
+    /// How many usages across the whole database point at each file hash.
+    ///
+    /// This is the reference count that decides whether a blob can be removed.
+    /// `RealmFileStore.Cleanup` expresses the same rule as `Usages.@count = 0`.
+    pub usage_counts: HashMap<String, u32>,
+}
+
 /// A beatmap set and the files it owns.
 #[derive(Debug, Clone)]
 pub struct BeatmapSet {
@@ -289,82 +301,72 @@ impl Realm {
         keys.into_iter().map(|key| self.class(key)).collect()
     }
 
-    /// Reads every beatmap set, with the files each one owns.
+    /// Reads every beatmap set and counts every file reference, in one pass.
     ///
-    /// Sets that lazer would exclude from bulk operations are skipped: `DeletePending` ones
-    /// are already on their way out, and `Protected` ones are the built-in tutorial and intro
-    /// maps that `BeatmapManager.DeleteAllVideos` also filters out.
+    /// These two results are returned together because gathering them separately means walking
+    /// every file usage in the database twice, and a large library holds hundreds of thousands
+    /// of them. That second pass was a large part of the time a scan took.
     ///
-    /// # Errors
-    ///
-    /// Returns [`RealmError::Core`] if the schema does not match what osu!lazer writes.
-    pub fn beatmap_sets(&self) -> Result<Vec<BeatmapSet>, RealmError> {
-        let class = self.class_key("BeatmapSet")?;
-        let files_key = self.property_key(class, "Files")?;
-        let delete_pending_key = self.property_key(class, "DeletePending")?;
-        let protected_key = self.property_key(class, "Protected")?;
-
-        let usage = self.class_key("RealmNamedFileUsage")?;
-        let filename_key = self.property_key(usage, "Filename")?;
-        let target_key = self.property_key(usage, "File")?;
-        let hash_key = self.property_key(self.class_key("File")?, "Hash")?;
-
-        let mut sets = Vec::new();
-
-        for index in 0..self.count(class)? {
-            let object = self.object_at(class, index)?;
-
-            if object.boolean(delete_pending_key)? || object.boolean(protected_key)? {
-                continue;
-            }
-
-            sets.push(BeatmapSet {
-                index,
-                files: Self::read_usages(&object, files_key, filename_key, target_key, hash_key)?,
-            });
-        }
-
-        Ok(sets)
-    }
-
-    /// Counts how many usages across the whole database point at each file hash.
-    ///
-    /// This is the reference count that decides whether a blob can be removed. It spans every
-    /// type that owns file usages, because a blob shared between a beatmap and a skin must not
-    /// be removed when only the beatmap gives it up. `RealmFileStore.Cleanup` expresses the
-    /// same rule as the query `Usages.@count = 0`.
+    /// The returned sets exclude ones osu!lazer itself excludes from bulk operations:
+    /// `DeletePending` sets are already on their way out, and `Protected` sets are the built-in
+    /// tutorial and intro maps that `BeatmapManager.DeleteAllVideos` also filters out. The
+    /// counts still include those sets, because a reference held by a protected set is a
+    /// reference all the same.
     ///
     /// Owner classes absent from the schema are skipped rather than treated as an error:
     /// `RealmOnlineAsset` only exists from schema 52 onwards.
     ///
     /// # Errors
     ///
-    /// Returns [`RealmError::Core`] if a class that does exist has an unexpected shape.
-    pub fn usage_counts(&self) -> Result<HashMap<String, u32>, RealmError> {
+    /// Returns [`RealmError::Core`] if the schema does not match what osu!lazer writes.
+    pub fn read_library(&self) -> Result<Library, RealmError> {
         let usage = self.class_key("RealmNamedFileUsage")?;
         let filename_key = self.property_key(usage, "Filename")?;
         let target_key = self.property_key(usage, "File")?;
         let hash_key = self.property_key(self.class_key("File")?, "Hash")?;
 
-        let mut counts = HashMap::new();
+        let mut sets = Vec::new();
+        let mut counts: HashMap<String, u32> = HashMap::new();
 
         for (class_name, property) in OWNERS_WITH_FILE_LISTS {
             let Some(class) = self.optional_class_key(class_name)? else {
                 continue;
             };
+
             let list_key = self.property_key(class, property)?;
+            let is_beatmap_set = *class_name == "BeatmapSet";
+
+            let skip_keys = if is_beatmap_set {
+                Some((
+                    self.property_key(class, "DeletePending")?,
+                    self.property_key(class, "Protected")?,
+                ))
+            } else {
+                None
+            };
 
             for index in 0..self.count(class)? {
                 let object = self.object_at(class, index)?;
-                for file in
-                    Self::read_usages(&object, list_key, filename_key, target_key, hash_key)?
+                let files =
+                    Self::read_usages(&object, list_key, filename_key, target_key, hash_key)?;
+
+                for file in &files {
+                    *counts.entry(file.hash.clone()).or_insert(0) += 1;
+                }
+
+                if let Some((delete_pending, protected)) = skip_keys
+                    && !object.boolean(delete_pending)?
+                    && !object.boolean(protected)?
                 {
-                    *counts.entry(file.hash).or_insert(0) += 1;
+                    sets.push(BeatmapSet { index, files });
                 }
             }
         }
 
-        Ok(counts)
+        Ok(Library {
+            beatmap_sets: sets,
+            usage_counts: counts,
+        })
     }
 
     /// Removes the named usages from their beatmap sets, in one transaction.
@@ -924,7 +926,10 @@ mod tests {
             // Detach the first two usages of one set through the production write path.
             let (set_index, erased, files_before) = {
                 let realm = Realm::open_for_write(path).expect("failed to open for write");
-                let sets = realm.beatmap_sets().expect("failed to read beatmap sets");
+                let sets = realm
+                    .read_library()
+                    .expect("failed to read library")
+                    .beatmap_sets;
                 let set = sets
                     .iter()
                     .find(|s| s.files.len() >= 2)
@@ -947,8 +952,9 @@ mod tests {
             let realm = Realm::open_read_only(path).expect("failed to reopen");
 
             let after = realm
-                .beatmap_sets()
-                .expect("failed to reread beatmap sets")
+                .read_library()
+                .expect("failed to read library")
+                .beatmap_sets
                 .into_iter()
                 .find(|s| s.index == set_index)
                 .expect("the edited set disappeared");
@@ -994,8 +1000,9 @@ mod tests {
         with_sample(|path| {
             let realm = Realm::open_read_only(path).expect("failed to open");
 
-            let counts = realm.usage_counts().expect("failed to count usages");
-            let sets = realm.beatmap_sets().expect("failed to read beatmap sets");
+            let contents = realm.read_library().expect("failed to read library");
+            let counts = contents.usage_counts;
+            let sets = contents.beatmap_sets;
 
             let total: u32 = counts.values().sum();
             let from_sets: u32 = sets
@@ -1030,7 +1037,10 @@ mod tests {
         with_sample(|path| {
             let (set_index, before) = {
                 let realm = Realm::open_read_only(path).expect("failed to open");
-                let sets = realm.beatmap_sets().expect("failed to read sets");
+                let sets = realm
+                    .read_library()
+                    .expect("failed to read library")
+                    .beatmap_sets;
                 let set = sets
                     .iter()
                     .find(|s| s.files.len() >= 3)
@@ -1048,7 +1058,10 @@ mod tests {
 
             {
                 let realm = Realm::open_for_write(path).expect("failed to open for write");
-                let sets = realm.beatmap_sets().expect("failed to read sets");
+                let sets = realm
+                    .read_library()
+                    .expect("failed to read library")
+                    .beatmap_sets;
                 let set = sets
                     .iter()
                     .find(|s| s.index == set_index)
@@ -1086,8 +1099,9 @@ mod tests {
 
             let realm = Realm::open_read_only(path).expect("failed to reopen");
             let after: Vec<_> = realm
-                .beatmap_sets()
-                .expect("failed to reread sets")
+                .read_library()
+                .expect("failed to read library")
+                .beatmap_sets
                 .into_iter()
                 .find(|s| s.index == set_index)
                 .expect("set disappeared")
@@ -1110,7 +1124,10 @@ mod tests {
     fn restoring_twice_is_idempotent() {
         with_sample(|path| {
             let realm = Realm::open_for_write(path).expect("failed to open for write");
-            let sets = realm.beatmap_sets().expect("failed to read sets");
+            let sets = realm
+                .read_library()
+                .expect("failed to read library")
+                .beatmap_sets;
             let set = sets.iter().find(|s| !s.files.is_empty()).expect("no files");
 
             let restoration = Restoration {

@@ -32,16 +32,22 @@ pub struct Candidate {
 pub struct Group {
     /// Which category these belong to.
     pub category: Category,
-    /// Files in this category.
+    /// References to remove. One file shared by several beatmap sets appears once per set.
     pub candidates: Vec<Candidate>,
-    /// Bytes that would actually be freed, counting each blob once.
+    /// Distinct files that would leave the library, which is what `bytes` measures.
+    pub files: usize,
+    /// Bytes that would actually be freed, counting each file once.
     pub bytes: u64,
     /// Whether the user selected this category.
     pub selected: bool,
 }
 
 impl Group {
-    /// Number of files in the group.
+    /// Number of references in the group.
+    ///
+    /// This counts one entry per beatmap set that refers to a file, so it is larger than
+    /// [`Group::files`] whenever osu!lazer has shared a file between sets. Report
+    /// [`Group::files`] to users: it is the number that pairs with [`Group::bytes`].
     #[must_use]
     pub fn len(&self) -> usize {
         self.candidates.len()
@@ -88,9 +94,25 @@ impl Plan {
         bytes
     }
 
-    /// Number of file usages selected categories would detach.
+    /// Distinct files selected categories would remove from the library.
+    ///
+    /// Counts each file once however many beatmap sets refer to it, so this number pairs with
+    /// [`Plan::selected_bytes`].
     #[must_use]
     pub fn selected_files(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+
+        self.groups
+            .iter()
+            .filter(|g| g.selected)
+            .flat_map(|g| g.candidates.iter())
+            .filter(|c| c.frees_blob && seen.insert(c.hash.as_str()))
+            .count()
+    }
+
+    /// References selected categories would detach from beatmap sets.
+    #[must_use]
+    pub fn selected_references(&self) -> usize {
         self.groups
             .iter()
             .filter(|g| g.selected)
@@ -165,7 +187,7 @@ pub enum Progress {
 pub fn totals(plan: &Plan) -> BTreeMap<Category, (usize, u64)> {
     plan.groups
         .iter()
-        .map(|g| (g.category, (g.len(), g.bytes)))
+        .map(|g| (g.category, (g.files, g.bytes)))
         .collect()
 }
 
@@ -198,12 +220,14 @@ mod tests {
             Group {
                 category: Category::Videos,
                 candidates: vec![candidate("aa", 100, Category::Videos, true)],
+                files: 1,
                 bytes: 100,
                 selected: true,
             },
             Group {
                 category: Category::Backgrounds,
                 candidates: vec![candidate("aa", 100, Category::Backgrounds, true)],
+                files: 1,
                 bytes: 100,
                 selected: true,
             },
@@ -217,12 +241,22 @@ mod tests {
         let plan = plan_with(vec![Group {
             category: Category::Videos,
             candidates: vec![candidate("bb", 500, Category::Videos, false)],
+            files: 0,
             bytes: 0,
             selected: true,
         }]);
 
         assert_eq!(plan.selected_bytes(), 0);
-        assert_eq!(plan.selected_files(), 1);
+        assert_eq!(
+            plan.selected_files(),
+            0,
+            "a file that stays put is not removed"
+        );
+        assert_eq!(
+            plan.selected_references(),
+            1,
+            "but its reference is detached"
+        );
     }
 
     #[test]
@@ -230,6 +264,7 @@ mod tests {
         let plan = plan_with(vec![Group {
             category: Category::Videos,
             candidates: vec![candidate("cc", 700, Category::Videos, true)],
+            files: 1,
             bytes: 700,
             selected: false,
         }]);

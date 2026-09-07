@@ -44,8 +44,9 @@ pub fn build_plan(
     let database = copy_database(library, scratch.path())?;
     let realm = Realm::open_read_only(&database)?;
 
-    let usage_counts = realm.usage_counts()?;
-    let sets = realm.beatmap_sets()?;
+    let contents = realm.read_library()?;
+    let sets = contents.beatmap_sets;
+    let usage_counts = contents.usage_counts;
 
     let total_sets = sets.len();
     let mut candidates = classify_sets(library, &sets, &sizes, &usage_counts, &mut progress);
@@ -274,18 +275,21 @@ fn assemble(
         .map(|&category| {
             let candidates = by_category.remove(&category).unwrap_or_default();
 
-            // Count each blob once, so a file shared between sets does not inflate the total.
+            // Count each file once, so one shared between beatmap sets does not inflate the
+            // totals. The candidate list keeps every reference, because each has to be
+            // detached, but users should see how many files actually leave.
             let mut seen = HashSet::new();
-            let bytes = candidates
+            let freed: Vec<u64> = candidates
                 .iter()
                 .filter(|c| c.frees_blob && seen.insert(c.hash.as_str()))
                 .map(|c| c.bytes)
-                .sum();
+                .collect();
 
             Group {
                 category,
                 candidates,
-                bytes,
+                files: freed.len(),
+                bytes: freed.iter().sum(),
                 selected: selected.contains(&category),
             }
         })
@@ -304,11 +308,76 @@ fn assemble(
 /// `RealmFile` has no size column, so sizes have to come from the filesystem. One walk is much
 /// cheaper than a `stat` per database row: a large library holds hundreds of thousands of
 /// blobs.
+///
+/// The walk runs in parallel across the store's top-level shards. osu!lazer names each blob
+/// after its own hash and files it under `files/<first character>/`, so the tree is already
+/// split sixteen ways and each shard can be walked independently. This matters most on
+/// Windows, where directory traversal is the slowest part of a scan by a wide margin.
 fn measure_blobs(library: &Library, progress: &mut impl FnMut(Progress)) -> HashMap<String, u64> {
     let files_dir = library.files_dir();
-    let mut sizes = HashMap::new();
 
-    for entry in walkdir::WalkDir::new(&files_dir).follow_links(false) {
+    let Ok(entries) = std::fs::read_dir(&files_dir) else {
+        return HashMap::new();
+    };
+
+    let shards: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|entry| entry.path())
+        .collect();
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let counted = std::sync::atomic::AtomicUsize::new(0);
+    let collected = std::sync::Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        let workers = shards
+            .len()
+            .min(std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2);
+
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let mut local = HashMap::new();
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(shard) = shards.get(index) else {
+                        break;
+                    };
+
+                    measure_shard(shard, &mut local, &counted);
+                }
+
+                collected
+                    .lock()
+                    .expect("blob measurement mutex was poisoned")
+                    .push(local);
+            });
+        }
+
+        // Report from this thread, so the caller's closure never has to be `Sync`.
+        while next.load(std::sync::atomic::Ordering::Relaxed) < shards.len() {
+            progress(Progress::MeasuringFiles {
+                done: counted.load(std::sync::atomic::Ordering::Relaxed),
+            });
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    });
+
+    collected
+        .into_inner()
+        .expect("blob measurement mutex was poisoned")
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Measures every blob under one shard directory.
+fn measure_shard(
+    shard: &Path,
+    sizes: &mut HashMap<String, u64>,
+    counted: &std::sync::atomic::AtomicUsize,
+) {
+    for entry in walkdir::WalkDir::new(shard).follow_links(false) {
         // A blob that vanished mid-walk is not an error: lazer may be tidying up.
         let Ok(entry) = entry else {
             continue;
@@ -332,13 +401,8 @@ fn measure_blobs(library: &Library, progress: &mut impl FnMut(Progress)) -> Hash
         };
 
         sizes.insert(name.to_owned(), metadata.len());
-
-        if sizes.len() % 8192 == 0 {
-            progress(Progress::MeasuringFiles { done: sizes.len() });
-        }
+        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-
-    sizes
 }
 
 /// Copies the database out of the library so opening it cannot touch the original directory.

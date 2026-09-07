@@ -280,7 +280,7 @@ impl App {
                             };
 
                             ui.label(text(group.category.label().to_owned()));
-                            ui.label(text(group.len().to_string()));
+                            ui.label(text(group.files.to_string()));
                             ui.label(text(human_bytes(group.bytes)));
                             ui.end_row();
                         }
