@@ -355,6 +355,7 @@ fn snapshots(cli: &Cli, command: &SnapshotCommand) -> Result<(), Box<dyn std::er
             let entry = find(&available, id)?;
             let restored = cleaner_core::restore(&library, entry)?;
             println!("restored {restored} files into the library");
+            println!("snapshot {id} is gone; its files are back where they were");
             Ok(())
         }
 

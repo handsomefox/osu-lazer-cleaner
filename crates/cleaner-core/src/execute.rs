@@ -135,8 +135,15 @@ pub fn restore(library: &Library, snapshot: &Snapshot) -> Result<usize, Snapshot
         })
         .collect();
 
-    let realm = Realm::open_for_write(&library.database())?;
-    let rows = realm.restore_usages(&restorations)?;
+    let rows = {
+        let realm = Realm::open_for_write(&library.database())?;
+        realm.restore_usages(&restorations)?
+    };
+
+    // A restored snapshot holds nothing: its files are back in the library. Leaving the
+    // directory behind would keep advertising space it no longer occupies, and offering to
+    // restore it a second time.
+    snapshot::delete(library, snapshot)?;
 
     tracing::info!(blobs, rows, "restored a snapshot");
     Ok(blobs)
