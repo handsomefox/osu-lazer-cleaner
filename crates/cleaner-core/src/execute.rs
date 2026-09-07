@@ -9,7 +9,7 @@ use crate::error::SnapshotError;
 use crate::plan::{Options, Plan};
 use crate::snapshot::{self, Manifest, Snapshot};
 use crate::storage::Library;
-use cleaner_realm::{Realm, Removal};
+use cleaner_realm::{Realm, Removal, Restoration};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -110,22 +110,36 @@ pub fn run(library: &Library, plan: &Plan, options: &Options) -> Result<Outcome,
     })
 }
 
-/// Puts a snapshot's files back.
+/// Puts a snapshot's files back, both the bytes and the database rows.
 ///
-/// Blobs move back first, so that the database never points at files that are missing.
+/// Blobs move back first, so the database never points at a file that is missing. Reattaching
+/// the rows matters as much as the bytes: without them nothing refers to the restored files,
+/// and osu!lazer would sweep them again on its next startup.
 ///
 /// # Errors
 ///
-/// Returns [`SnapshotError`] if a blob cannot be moved back.
+/// Returns [`SnapshotError`] if a blob cannot be moved back or the database cannot be updated.
 pub fn restore(library: &Library, snapshot: &Snapshot) -> Result<usize, SnapshotError> {
-    let restored = snapshot::restore_blobs(library, snapshot)?;
+    let blobs = snapshot::restore_blobs(library, snapshot)?;
 
-    // Reattaching usages needs realm-core to recreate embedded objects, which the C API cannot
-    // express as a single call. Blobs alone are enough for lazer to see the files again on
-    // re-import, and a full row-level restore is the next step here.
-    tracing::info!(restored, "restored blobs from snapshot");
+    let restorations: Vec<Restoration> = snapshot
+        .manifest
+        .detached
+        .iter()
+        // Orphaned blobs were never attached to anything, so there is nothing to reattach.
+        .filter(|c| c.set_index != usize::MAX)
+        .map(|c| Restoration {
+            set_index: c.set_index,
+            filename: c.filename.clone(),
+            hash: c.hash.clone(),
+        })
+        .collect();
 
-    Ok(restored)
+    let realm = Realm::open_for_write(&library.database())?;
+    let rows = realm.restore_usages(&restorations)?;
+
+    tracing::info!(blobs, rows, "restored a snapshot");
+    Ok(blobs)
 }
 
 #[cfg(test)]

@@ -43,6 +43,17 @@ pub struct NamedFile {
     pub hash: String,
 }
 
+/// A usage to reattach to a beatmap set when restoring a snapshot.
+#[derive(Debug, Clone)]
+pub struct Restoration {
+    /// Index of the owning set.
+    pub set_index: usize,
+    /// Name the file had inside the set.
+    pub filename: String,
+    /// SHA-256 of the file's contents.
+    pub hash: String,
+}
+
 /// A usage to detach from a beatmap set.
 #[derive(Debug, Clone, Copy)]
 pub struct Removal {
@@ -408,6 +419,172 @@ impl Realm {
         }
 
         Ok(())
+    }
+
+    /// Reattaches usages to their beatmap sets, in one transaction.
+    ///
+    /// This is the inverse of [`Realm::erase_usages`], used when restoring a snapshot. Each
+    /// entry recreates a `RealmNamedFileUsage` at the end of its set's list and points it at
+    /// the existing `File` row for that hash.
+    ///
+    /// Without this, restoring would put the bytes back but leave nothing referring to them,
+    /// and osu!lazer would delete them again on its next startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RealmError::Core`] if a hash has no `File` row, or if the transaction cannot
+    /// be committed. The transaction is rolled back on any failure.
+    pub fn restore_usages(&self, restorations: &[Restoration]) -> Result<usize, RealmError> {
+        if restorations.is_empty() {
+            return Ok(0);
+        }
+
+        let class = self.class_key("BeatmapSet")?;
+        let files_key = self.property_key(class, "Files")?;
+        let usage = self.class_key("RealmNamedFileUsage")?;
+        let filename_key = self.property_key(usage, "Filename")?;
+        let target_key = self.property_key(usage, "File")?;
+        let file_class = self.class_key("File")?;
+
+        // SAFETY: begins a transaction that every path below either commits or rolls back.
+        if !unsafe { sys::realm_begin_write(self.ptr) } {
+            return Err(last_error());
+        }
+
+        let mut restored = 0;
+        for entry in restorations {
+            let outcome = self.restore_one(
+                class,
+                files_key,
+                file_class,
+                filename_key,
+                target_key,
+                entry,
+            );
+
+            match outcome {
+                Ok(true) => restored += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    // SAFETY: a transaction is open; rolling back discards every edit above.
+                    unsafe { sys::realm_rollback(self.ptr) };
+                    return Err(error);
+                }
+            }
+        }
+
+        // SAFETY: the transaction opened above is still current.
+        if !unsafe { sys::realm_commit(self.ptr) } {
+            return Err(last_error());
+        }
+
+        Ok(restored)
+    }
+
+    /// Reattaches one usage. Callers hold the transaction.
+    ///
+    /// Returns `false` when the set already lists the file, which happens if a restore is run
+    /// twice.
+    fn restore_one(
+        &self,
+        class: sys::realm_class_key_t,
+        files_key: sys::realm_property_key_t,
+        file_class: sys::realm_class_key_t,
+        filename_key: sys::realm_property_key_t,
+        target_key: sys::realm_property_key_t,
+        entry: &Restoration,
+    ) -> Result<bool, RealmError> {
+        let object = self.object_at(class, entry.set_index)?;
+
+        let existing = Self::read_usages(&object, files_key, filename_key, target_key, {
+            self.property_key(file_class, "Hash")?
+        })?;
+        if existing.iter().any(|f| f.filename == entry.filename) {
+            return Ok(false);
+        }
+
+        let file = self.find_file_row(file_class, &entry.hash)?;
+        let raw_name = value::c_string(&entry.filename)?;
+
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "one insert-and-populate sequence; the new object is unusable until both                       of its properties are set"
+        )]
+        // SAFETY: `object` and `file` are live, and every handle is released before returning.
+        unsafe {
+            let list = sys::realm_get_list(object.ptr, files_key);
+            if list.is_null() {
+                return Err(last_error());
+            }
+
+            let mut size = 0;
+            if !sys::realm_list_size(list, &raw mut size) {
+                sys::realm_release(list.cast());
+                return Err(last_error());
+            }
+
+            let entry_object = sys::realm_list_insert_embedded(list, size);
+            sys::realm_release(list.cast());
+
+            let entry_object = value::Object::from_raw(entry_object)?;
+
+            let name = sys::realm_value_t {
+                __bindgen_anon_1: sys::realm_value__bindgen_ty_1 {
+                    string: sys::realm_string_t {
+                        data: raw_name.as_ptr(),
+                        size: entry.filename.len(),
+                    },
+                },
+                type_: sys::realm_value_type_RLM_TYPE_STRING,
+            };
+            if !sys::realm_set_value(entry_object.ptr, filename_key, name, false) {
+                return Err(last_error());
+            }
+
+            let link = sys::realm_object_as_link(file.ptr);
+            let target = sys::realm_value_t {
+                __bindgen_anon_1: sys::realm_value__bindgen_ty_1 { link },
+                type_: sys::realm_value_type_RLM_TYPE_LINK,
+            };
+            if !sys::realm_set_value(entry_object.ptr, target_key, target, false) {
+                return Err(last_error());
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Finds the `File` row for a hash.
+    fn find_file_row(
+        &self,
+        file_class: sys::realm_class_key_t,
+        hash: &str,
+    ) -> Result<value::Object, RealmError> {
+        let raw = value::c_string(hash)?;
+        let key = sys::realm_value_t {
+            __bindgen_anon_1: sys::realm_value__bindgen_ty_1 {
+                string: sys::realm_string_t {
+                    data: raw.as_ptr(),
+                    size: hash.len(),
+                },
+            },
+            type_: sys::realm_value_type_RLM_TYPE_STRING,
+        };
+
+        let mut found = false;
+        // SAFETY: `raw` outlives the call and `file_class` came from this realm.
+        let object = unsafe {
+            sys::realm_object_find_with_primary_key(self.ptr, file_class, key, &raw mut found)
+        };
+
+        if !found || object.is_null() {
+            return Err(RealmError::Core {
+                code: 0,
+                message: format!("no File row for hash {hash}"),
+            });
+        }
+
+        value::Object::from_raw(object)
     }
 
     /// Erases the given indices from one set's `Files` list. Callers hold the transaction.
@@ -841,6 +1018,114 @@ mod tests {
 
             let files: usize = sets.iter().map(|s| s.files.len()).sum();
             assert!(files > 0, "expected beatmap sets to own files");
+        });
+    }
+
+    /// Detaching and reattaching must leave the database exactly as it started.
+    ///
+    /// Restoring the bytes without the rows would be worse than useless: nothing would refer
+    /// to the restored files, so osu!lazer would delete them again on its next startup.
+    #[test]
+    fn erasing_and_restoring_round_trips() {
+        with_sample(|path| {
+            let (set_index, before) = {
+                let realm = Realm::open_read_only(path).expect("failed to open");
+                let sets = realm.beatmap_sets().expect("failed to read sets");
+                let set = sets
+                    .iter()
+                    .find(|s| s.files.len() >= 3)
+                    .expect("no set with three files");
+                (
+                    set.index,
+                    set.files
+                        .iter()
+                        .map(|f| (f.filename.clone(), f.hash.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+
+            let removed: Vec<_> = before[..2].to_vec();
+
+            {
+                let realm = Realm::open_for_write(path).expect("failed to open for write");
+                let sets = realm.beatmap_sets().expect("failed to read sets");
+                let set = sets
+                    .iter()
+                    .find(|s| s.index == set_index)
+                    .expect("set disappeared");
+
+                let removals: Vec<_> = set.files[..2]
+                    .iter()
+                    .map(|f| Removal {
+                        set_index,
+                        file_index: f.index,
+                    })
+                    .collect();
+                realm.erase_usages(&removals).expect("failed to erase");
+            }
+
+            {
+                let realm = Realm::open_for_write(path).expect("failed to reopen for write");
+                let restorations: Vec<_> = removed
+                    .iter()
+                    .map(|(filename, hash)| Restoration {
+                        set_index,
+                        filename: filename.clone(),
+                        hash: hash.clone(),
+                    })
+                    .collect();
+
+                assert_eq!(
+                    realm
+                        .restore_usages(&restorations)
+                        .expect("failed to restore"),
+                    2,
+                    "both usages should have been reattached"
+                );
+            }
+
+            let realm = Realm::open_read_only(path).expect("failed to reopen");
+            let after: Vec<_> = realm
+                .beatmap_sets()
+                .expect("failed to reread sets")
+                .into_iter()
+                .find(|s| s.index == set_index)
+                .expect("set disappeared")
+                .files
+                .into_iter()
+                .map(|f| (f.filename, f.hash))
+                .collect();
+
+            // Order within the list is not preserved, because restoring appends.
+            let sorted = |mut v: Vec<(String, String)>| {
+                v.sort();
+                v
+            };
+            assert_eq!(sorted(after), sorted(before), "the set's files must return");
+        });
+    }
+
+    /// Restoring twice must not duplicate a usage.
+    #[test]
+    fn restoring_twice_is_idempotent() {
+        with_sample(|path| {
+            let realm = Realm::open_for_write(path).expect("failed to open for write");
+            let sets = realm.beatmap_sets().expect("failed to read sets");
+            let set = sets.iter().find(|s| !s.files.is_empty()).expect("no files");
+
+            let restoration = Restoration {
+                set_index: set.index,
+                filename: set.files[0].filename.clone(),
+                hash: set.files[0].hash.clone(),
+            };
+
+            // The usage is already present, so nothing should be added.
+            assert_eq!(
+                realm
+                    .restore_usages(std::slice::from_ref(&restoration))
+                    .expect("failed to restore"),
+                0
+            );
         });
     }
 
