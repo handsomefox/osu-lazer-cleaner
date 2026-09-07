@@ -58,6 +58,9 @@ enum Command {
         confirm: bool,
     },
 
+    /// Shrink the database file by rewriting it without its free space.
+    Compact,
+
     /// Work with snapshots taken by previous cleans.
     #[command(subcommand)]
     Snapshot(SnapshotCommand),
@@ -149,6 +152,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             categories,
             confirm,
         } => clean(cli, categories, *confirm),
+        Command::Compact => compact(cli),
         Command::Snapshot(command) => snapshots(cli, command),
     }
 }
@@ -308,6 +312,28 @@ fn clean(
         println!("\nNothing is deleted yet. Start osu!lazer and check your beatmaps.");
         println!("To reclaim the space: osu-lazer-cleaner-cli snapshot delete {id} --confirm");
         println!("To undo instead:      osu-lazer-cleaner-cli snapshot restore {id}");
+    }
+
+    Ok(())
+}
+
+/// Rewrites the database without its free space.
+fn compact(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let library = open_library(cli.library.as_deref())?;
+    let (before, after) = cleaner_core::compact(&library)?;
+
+    if after < before {
+        println!(
+            "database went from {} to {}, freeing {}",
+            human_bytes(before),
+            human_bytes(after),
+            human_bytes(before - after)
+        );
+    } else {
+        println!(
+            "database is already compact at {}; nothing to reclaim",
+            human_bytes(before)
+        );
     }
 
     Ok(())

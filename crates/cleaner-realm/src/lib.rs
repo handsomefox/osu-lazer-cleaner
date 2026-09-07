@@ -319,6 +319,30 @@ impl Realm {
         keys.into_iter().map(|key| self.class(key)).collect()
     }
 
+    /// Rewrites the database without its free space, and reports whether it shrank.
+    ///
+    /// Realm never shrinks on its own. Deleting rows returns their space to an internal free
+    /// list for reuse, so the file stays the same size however much is removed. Compacting
+    /// rewrites it without that free space, which is the only way the file gets smaller.
+    ///
+    /// osu!lazer does the same thing in `RealmAccess.BlockAllOperations`. It is safe only when
+    /// nothing else has the database open.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RealmError::Core`] if realm-core refuses to compact, which it does when
+    /// another handle to the database is open.
+    pub fn compact(&self) -> Result<bool, RealmError> {
+        let mut compacted = false;
+
+        // SAFETY: `self.ptr` is a valid realm and the out-param is ours.
+        if !unsafe { sys::realm_compact(self.ptr, &raw mut compacted) } {
+            return Err(last_error());
+        }
+
+        Ok(compacted)
+    }
+
     /// Reads every beatmap set and counts every file reference, in one pass.
     ///
     /// These two results are returned together because gathering them separately means walking

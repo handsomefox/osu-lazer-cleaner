@@ -123,6 +123,40 @@ pub fn run(
     })
 }
 
+/// Rewrites the database without its free space, reporting the sizes before and after.
+///
+/// Realm never shrinks on its own: deleting rows returns their space to an internal free list
+/// for reuse, so the file stays the same size however much a clean removes. This is the only
+/// operation that makes it smaller.
+///
+/// # Errors
+///
+/// Returns [`SnapshotError`] if the database cannot be read or realm-core refuses to compact,
+/// which it does while anything else has the database open.
+pub fn compact(library: &Library) -> Result<(u64, u64), SnapshotError> {
+    let path = library.database();
+
+    let before = std::fs::metadata(&path)
+        .map_err(|source| SnapshotError::Io {
+            action: "measuring the database",
+            path: path.clone(),
+            source,
+        })?
+        .len();
+
+    Realm::open_for_write(&path)?.compact()?;
+
+    let after = std::fs::metadata(&path)
+        .map_err(|source| SnapshotError::Io {
+            action: "measuring the database",
+            path: path.clone(),
+            source,
+        })?
+        .len();
+
+    Ok((before, after))
+}
+
 /// Moves every freed blob into the snapshot, in parallel.
 ///
 /// Each rename is an independent filesystem operation, and on Windows they are slow enough

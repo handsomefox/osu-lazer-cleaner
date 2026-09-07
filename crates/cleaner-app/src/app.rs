@@ -261,6 +261,9 @@ impl App {
                     let found = group.files > 0;
 
                     ui.vertical(|ui| {
+                        // A grid cell shrinks to its narrowest content, which wraps every
+                        // label onto its own line unless the column is given a width.
+                        ui.set_min_width(300.0);
                         ui.add_enabled_ui(found, |ui| {
                             let mut on = self.selected.contains(&group.category);
                             if ui.checkbox(&mut on, group.category.label()).changed() {

@@ -29,7 +29,7 @@ pub mod storage;
 
 pub use catalog::Category;
 pub use error::{ScanError, SnapshotError, StorageError};
-pub use execute::{CleanProgress, Outcome, restore, run};
+pub use execute::{CleanProgress, Outcome, compact, restore, run};
 pub use format::human_bytes;
 pub use plan::{Candidate, Group, Options, Plan, Progress, Timings};
 pub use report::Report;
