@@ -345,7 +345,11 @@ fn snapshots(cli: &Cli, command: &SnapshotCommand) -> Result<(), Box<dyn std::er
                     entry.id(),
                     entry.manifest.blobs.len(),
                     human_bytes(entry.manifest.bytes()),
-                    entry.manifest.created
+                    entry
+                        .manifest
+                        .created
+                        .to_zoned(jiff::tz::TimeZone::system())
+                        .strftime("%Y-%m-%d %H:%M")
                 );
             }
             Ok(())

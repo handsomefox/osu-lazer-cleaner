@@ -96,11 +96,22 @@ impl From<&Snapshot> for SnapshotSummary {
     fn from(snapshot: &Snapshot) -> Self {
         Self {
             id: snapshot.id(),
-            created: snapshot.manifest.created.to_string(),
+            created: format_taken(snapshot.manifest.created),
             files: snapshot.manifest.blobs.len(),
             bytes: snapshot.manifest.bytes(),
         }
     }
+}
+
+/// Formats when a snapshot was taken, in the reader's own time zone.
+///
+/// The manifest stores UTC, which displayed raw reads as `2026-09-07T21:29:16.7635384Z`.
+/// Nobody needs sub-second precision to recognise which clean they are looking at.
+fn format_taken(created: jiff::Timestamp) -> String {
+    created
+        .to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%Y-%m-%d %H:%M")
+        .to_string()
 }
 
 /// Handle to the worker thread.

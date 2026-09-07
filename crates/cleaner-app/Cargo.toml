@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 cleaner-core = { path = "../cleaner-core" }
 crossbeam-channel.workspace = true
+jiff.workspace = true
 eframe.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
