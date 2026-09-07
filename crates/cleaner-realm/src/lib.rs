@@ -539,6 +539,17 @@ impl Realm {
         let filename_key = self.property_key(usage, "Filename")?;
         let target_key = self.property_key(usage, "File")?;
         let file_class = self.class_key("File")?;
+        let hash_key = self.property_key(file_class, "Hash")?;
+
+        // Group by set so each one is located once and its file list read once. Doing that per
+        // usage meant a fresh query and a full list read for every file being restored.
+        let mut by_set: HashMap<usize, Vec<&Restoration>> = HashMap::new();
+        for restoration in restorations {
+            by_set
+                .entry(restoration.set_index)
+                .or_default()
+                .push(restoration);
+        }
 
         // SAFETY: begins a transaction that every path below either commits or rolls back.
         if !unsafe { sys::realm_begin_write(self.ptr) } {
@@ -546,19 +557,20 @@ impl Realm {
         }
 
         let mut restored = 0;
-        for entry in restorations {
-            let outcome = self.restore_one(
+        for (set_index, entries) in by_set {
+            let outcome = self.restore_into_set(
                 class,
                 files_key,
-                file_class,
                 filename_key,
                 target_key,
-                entry,
+                hash_key,
+                file_class,
+                set_index,
+                &entries,
             );
 
             match outcome {
-                Ok(true) => restored += 1,
-                Ok(false) => {}
+                Ok(count) => restored += count,
                 Err(error) => {
                     // SAFETY: a transaction is open; rolling back discards every edit above.
                     unsafe { sys::realm_rollback(self.ptr) };
@@ -575,34 +587,68 @@ impl Realm {
         Ok(restored)
     }
 
-    /// Reattaches one usage. Callers hold the transaction.
-    ///
-    /// Returns `false` when the set already lists the file, which happens if a restore is run
-    /// twice.
-    fn restore_one(
+    /// Reattaches every usage belonging to one set. Callers hold the transaction.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "property keys are looked up once by the caller and passed down"
+    )]
+    fn restore_into_set(
         &self,
         class: sys::realm_class_key_t,
         files_key: sys::realm_property_key_t,
-        file_class: sys::realm_class_key_t,
         filename_key: sys::realm_property_key_t,
         target_key: sys::realm_property_key_t,
-        entry: &Restoration,
-    ) -> Result<bool, RealmError> {
-        let object = self.object_at(class, entry.set_index)?;
+        hash_key: sys::realm_property_key_t,
+        file_class: sys::realm_class_key_t,
+        set_index: usize,
+        entries: &[&Restoration],
+    ) -> Result<usize, RealmError> {
+        let object = self.object_at(class, set_index)?;
 
-        let existing = Self::read_usages(&object, files_key, filename_key, target_key, {
-            self.property_key(file_class, "Hash")?
-        })?;
-        if existing.iter().any(|f| f.filename == entry.filename) {
-            return Ok(false);
+        let present: std::collections::HashSet<String> =
+            Self::read_usages(&object, files_key, filename_key, target_key, hash_key)?
+                .into_iter()
+                .map(|file| file.filename)
+                .collect();
+
+        let mut restored = 0;
+        for entry in entries {
+            // Already listed, which happens when a restore runs twice.
+            if present.contains(&entry.filename) {
+                continue;
+            }
+
+            self.append_usage(
+                &object,
+                files_key,
+                filename_key,
+                target_key,
+                file_class,
+                entry,
+            )?;
+            restored += 1;
         }
 
+        Ok(restored)
+    }
+
+    /// Adds one `RealmNamedFileUsage` to the end of a set's file list.
+    fn append_usage(
+        &self,
+        object: &value::Object,
+        files_key: sys::realm_property_key_t,
+        filename_key: sys::realm_property_key_t,
+        target_key: sys::realm_property_key_t,
+        file_class: sys::realm_class_key_t,
+        entry: &Restoration,
+    ) -> Result<(), RealmError> {
         let file = self.find_file_row(file_class, &entry.hash)?;
         let raw_name = value::c_string(&entry.filename)?;
 
         #[expect(
             clippy::multiple_unsafe_ops_per_block,
-            reason = "one insert-and-populate sequence; the new object is unusable until both                       of its properties are set"
+            reason = "one insert-and-populate sequence; the new object is unusable until both \
+                      of its properties are set"
         )]
         // SAFETY: `object` and `file` are live, and every handle is released before returning.
         unsafe {
@@ -645,7 +691,7 @@ impl Realm {
             }
         }
 
-        Ok(true)
+        Ok(())
     }
 
     /// Finds the `File` row for a hash.

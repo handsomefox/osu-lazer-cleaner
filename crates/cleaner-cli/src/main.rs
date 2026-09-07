@@ -258,7 +258,13 @@ fn clean(
     let plan = scan(&library, &selected)?;
 
     let options = Options { dry_run: !confirm };
-    let outcome = cleaner_core::run(&library, &plan, &options)?;
+    let outcome = cleaner_core::run(&library, &plan, &options, |progress| match progress {
+        cleaner_core::CleanProgress::UpdatingDatabase => eprint!("\rupdating the database"),
+        cleaner_core::CleanProgress::Moving { done, total } => {
+            eprint!("\rmoving files into the snapshot: {done}/{total}");
+        }
+    })?;
+    eprintln!("\r                                                   ");
 
     if cli.json {
         println!(
@@ -357,7 +363,15 @@ fn snapshots(cli: &Cli, command: &SnapshotCommand) -> Result<(), Box<dyn std::er
 
         SnapshotCommand::Restore { id } => {
             let entry = find(&available, id)?;
-            let restored = cleaner_core::restore(&library, entry)?;
+            let restored = cleaner_core::restore(&library, entry, |progress| match progress {
+                cleaner_core::CleanProgress::UpdatingDatabase => {
+                    eprint!("\rupdating the database");
+                }
+                cleaner_core::CleanProgress::Moving { done, total } => {
+                    eprint!("\rmoving files back: {done}/{total}");
+                }
+            })?;
+            eprintln!("\r                                             ");
             println!("restored {restored} files into the library");
             println!("snapshot {id} is gone; its files are back where they were");
             Ok(())

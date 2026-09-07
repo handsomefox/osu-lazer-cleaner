@@ -215,7 +215,13 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
             };
 
             let options = Options { dry_run: false };
-            match cleaner_core::run(library, &plan, &options) {
+            let result = cleaner_core::run(library, &plan, &options, |progress| {
+                let _ = events.send(Event::Progress {
+                    message: describe_clean(progress),
+                });
+            });
+
+            match result {
                 Ok(outcome) => report(Event::Cleaned {
                     files: outcome.detached,
                     bytes: outcome.bytes,
@@ -242,8 +248,14 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
         }
 
         Command::RestoreSnapshot { id } => {
-            act_on_snapshot(library.as_ref(), &id, events, |library, snapshot| {
-                cleaner_core::restore(library, snapshot).map(|_| ())
+            let reporter = events.clone();
+            act_on_snapshot(library.as_ref(), &id, events, move |library, snapshot| {
+                cleaner_core::restore(library, snapshot, |progress| {
+                    let _ = reporter.send(Event::Progress {
+                        message: describe_clean(progress),
+                    });
+                })
+                .map(|_| ())
             });
         }
 
@@ -292,6 +304,16 @@ fn act_on_snapshot(
         let _ = events.send(Event::Snapshots {
             entries: entries.iter().map(SnapshotSummary::from).collect(),
         });
+    }
+}
+
+/// Turns clean progress into a status line.
+fn describe_clean(progress: cleaner_core::CleanProgress) -> String {
+    match progress {
+        cleaner_core::CleanProgress::UpdatingDatabase => "Updating the database".to_owned(),
+        cleaner_core::CleanProgress::Moving { done, total } => {
+            format!("Moving files into the snapshot: {done} of {total}")
+        }
     }
 }
 

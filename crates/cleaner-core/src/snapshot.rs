@@ -226,7 +226,7 @@ pub fn finalise(temp_dir: &Path, manifest: &Manifest) -> Result<PathBuf, Snapsho
     Ok(final_dir)
 }
 
-/// Moves a snapshot's blobs back into the library.
+/// Moves a snapshot's blobs back into the library, in parallel.
 ///
 /// Returns how many blobs were restored. Restoring the database rows is the caller's job,
 /// because only it holds a writable realm.
@@ -234,40 +234,85 @@ pub fn finalise(temp_dir: &Path, manifest: &Manifest) -> Result<PathBuf, Snapsho
 /// # Errors
 ///
 /// Returns [`SnapshotError::Io`] if a blob cannot be moved back.
-pub fn restore_blobs(library: &Library, snapshot: &Snapshot) -> Result<usize, SnapshotError> {
-    let mut restored = 0;
+///
+/// # Panics
+///
+/// Panics if a worker thread panics while holding the shared error slot, which would mean the
+/// move itself panicked rather than returning an error.
+pub fn restore_blobs(
+    library: &Library,
+    snapshot: &Snapshot,
+    progress: &mut impl FnMut(usize, usize),
+) -> Result<usize, SnapshotError> {
+    let blobs = &snapshot.manifest.blobs;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let failure: std::sync::Mutex<Option<SnapshotError>> = std::sync::Mutex::new(None);
 
-    for (hash, _) in &snapshot.manifest.blobs {
-        let source = snapshot.dir.join(BLOBS_DIR).join(hash);
-        if !source.exists() {
-            continue;
+    std::thread::scope(|scope| {
+        let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((hash, _)) = blobs.get(index) else {
+                        break;
+                    };
+
+                    if let Err(error) = restore_one(library, &snapshot.dir, hash) {
+                        let mut slot = failure.lock().expect("restore mutex was poisoned");
+                        if slot.is_none() {
+                            *slot = Some(error);
+                        }
+                        break;
+                    }
+
+                    done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
         }
 
-        let destination = library.blob_path(hash);
-        if destination.exists() {
-            // The blob came back another way, most likely a re-import. Ours is redundant.
-            restored += 1;
-            continue;
+        // Report from this thread, so the caller's closure never has to be `Sync`.
+        while next.load(std::sync::atomic::Ordering::Relaxed) < blobs.len() {
+            progress(done.load(std::sync::atomic::Ordering::Relaxed), blobs.len());
+            std::thread::sleep(std::time::Duration::from_millis(120));
         }
+    });
 
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent).map_err(|source_error| SnapshotError::Io {
-                action: "recreating a blob directory",
-                path: parent.to_path_buf(),
-                source: source_error,
-            })?;
-        }
-
-        std::fs::rename(&source, &destination).map_err(|source_error| SnapshotError::Io {
-            action: "restoring a file from the snapshot",
-            path: source,
-            source: source_error,
-        })?;
-
-        restored += 1;
+    if let Some(error) = failure.into_inner().expect("restore mutex was poisoned") {
+        return Err(error);
     }
 
-    Ok(restored)
+    Ok(done.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Moves one blob out of a snapshot and back into the library.
+fn restore_one(library: &Library, snapshot_dir: &Path, hash: &str) -> Result<(), SnapshotError> {
+    let source = snapshot_dir.join(BLOBS_DIR).join(hash);
+    if !source.exists() {
+        return Ok(());
+    }
+
+    let destination = library.blob_path(hash);
+    if destination.exists() {
+        // The blob came back another way, most likely a re-import. Ours is redundant.
+        return Ok(());
+    }
+
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|source_error| SnapshotError::Io {
+            action: "recreating a blob directory",
+            path: parent.to_path_buf(),
+            source: source_error,
+        })?;
+    }
+
+    std::fs::rename(&source, &destination).map_err(|source_error| SnapshotError::Io {
+        action: "restoring a file from the snapshot",
+        path: source,
+        source: source_error,
+    })
 }
 
 /// Deletes a snapshot, reclaiming its space.
@@ -414,7 +459,10 @@ mod tests {
         let snapshots = list(&library).unwrap();
         assert_eq!(snapshots.len(), 1);
 
-        assert_eq!(restore_blobs(&library, &snapshots[0]).unwrap(), 1);
+        assert_eq!(
+            restore_blobs(&library, &snapshots[0], &mut |_, _| {}).unwrap(),
+            1
+        );
         assert_eq!(
             std::fs::read(library.blob_path(&hash)).unwrap(),
             b"payload",
