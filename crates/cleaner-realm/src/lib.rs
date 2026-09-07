@@ -100,7 +100,10 @@ pub enum RealmError {
     #[error("realm error {code}: {message}")]
     Core {
         /// realm-core's `realm_errno_e` value.
-        code: i32,
+        ///
+        /// Held as `i64` because bindgen maps C enums to `u32` on Linux and `i32` on Windows.
+        /// Both convert into `i64` losslessly, so no cast is needed on either platform.
+        code: i64,
         /// Human-readable message from realm-core.
         message: String,
     },
@@ -135,11 +138,7 @@ pub(crate) fn last_error() -> RealmError {
     };
 
     RealmError::Core {
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "realm_errno_e is a C enum that fits in i32"
-        )]
-        code: err.error as i32,
+        code: i64::from(err.error),
         message,
     }
 }
@@ -190,13 +189,14 @@ fn make_noop_scheduler() -> *mut sys::realm_scheduler_t {
     }
 }
 
-/// The `RLM_CLASS_EMBEDDED` bit, as a type that matches `realm_class_info_t::flags`.
+/// Reports whether a class's flags mark it as embedded.
 ///
-/// bindgen maps realm-core's C enums to `u32` on Linux but `i32` on Windows, so the constant
-/// cannot be used directly in a portable bitwise test.
-fn embedded_flag() -> i32 {
-    i32::try_from(sys::realm_class_flags_RLM_CLASS_EMBEDDED)
-        .expect("RLM_CLASS_EMBEDDED is a small bit flag")
+/// `realm_class_info_t::flags` is a C `int`, but the flag constants come from an enum, and
+/// bindgen maps C enums to `u32` on Linux and `i32` on Windows. Neither a cast nor a conversion
+/// is portable, because whichever one is written is redundant on one of the two platforms.
+/// Widening both sides to `i64` is lossless from either.
+fn is_embedded(flags: i32) -> bool {
+    i64::from(flags) & i64::from(sys::realm_class_flags_RLM_CLASS_EMBEDDED) != 0
 }
 
 /// An open Realm database.
@@ -895,7 +895,7 @@ impl Realm {
         Ok(ClassInfo {
             name,
             rows,
-            embedded: info.flags & embedded_flag() != 0,
+            embedded: is_embedded(info.flags),
         })
     }
 }
