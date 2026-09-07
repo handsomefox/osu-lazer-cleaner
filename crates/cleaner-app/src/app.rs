@@ -84,6 +84,14 @@ impl App {
                 }
                 Event::Progress { message } => self.status = message,
                 Event::Scanned { plan } => {
+                    // Untick anything the scan found nothing for, so the selection describes
+                    // what is actually there.
+                    for group in &plan.groups {
+                        if group.files == 0 {
+                            self.selected.remove(&group.category);
+                        }
+                    }
+
                     self.status = format!(
                         "Scanned {} beatmap sets holding {}",
                         plan.sets_scanned,
@@ -207,7 +215,11 @@ impl eframe::App for App {
 }
 
 impl App {
-    /// Categories on the left, results on the right.
+    /// Scan results, with a checkbox beside each category.
+    ///
+    /// The selection lives in the results table rather than in a separate panel. A scan always
+    /// classifies every category, so a panel of checkboxes above a scan button would imply the
+    /// two are connected when they are not.
     fn clean_screen(&mut self, ui: &mut egui::Ui) {
         if let Some(result) = self.last_result.clone() {
             ui.colored_label(egui::Color32::from_rgb(120, 190, 120), result);
@@ -215,89 +227,75 @@ impl App {
             ui.separator();
         }
 
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(280.0);
-                ui.strong("What to remove");
-                ui.add_space(4.0);
-
-                let mut changed = false;
-                for category in Category::ALL {
-                    let mut on = self.selected.contains(category);
-                    if ui.checkbox(&mut on, category.label()).changed() {
-                        changed = true;
-                        if on {
-                            self.selected.insert(*category);
-                        } else {
-                            self.selected.remove(category);
-                        }
-                    }
-                    ui.small(category.description());
-                    ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!self.busy && self.library.is_some(), |ui| {
+                let label = if self.plan.is_some() {
+                    "Scan again"
+                } else {
+                    "Scan library"
+                };
+                if ui.button(label).clicked() {
+                    self.scan();
                 }
-
-                if changed {
-                    self.apply_selection();
-                }
-
-                ui.separator();
-                ui.add_enabled_ui(!self.busy && self.library.is_some(), |ui| {
-                    if ui.button("Scan library").clicked() {
-                        self.scan();
-                    }
-                });
             });
 
-            ui.separator();
+            if self.plan.is_none() {
+                ui.label("Nothing has been scanned yet.");
+            }
+        });
 
-            ui.vertical(|ui| {
-                let Some(plan) = self.plan.clone() else {
-                    ui.label("Scan the library to see what can be removed.");
-                    return;
-                };
+        let Some(plan) = self.plan.clone() else {
+            return;
+        };
 
-                ui.strong("Found");
-                ui.add_space(4.0);
+        ui.add_space(12.0);
+        ui.strong("Tick what to remove");
+        ui.add_space(6.0);
 
-                egui::Grid::new("results")
-                    .num_columns(3)
-                    .spacing([24.0, 6.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.strong("Category");
-                        ui.strong("Files");
-                        ui.strong("Reclaimable");
-                        ui.end_row();
+        egui::Grid::new("results")
+            .num_columns(3)
+            .spacing([28.0, 10.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for group in &plan.groups {
+                    let found = group.files > 0;
 
-                        for group in &plan.groups {
-                            let on = self.selected.contains(&group.category);
-                            let text = |value: String| {
+                    ui.vertical(|ui| {
+                        ui.add_enabled_ui(found, |ui| {
+                            let mut on = self.selected.contains(&group.category);
+                            if ui.checkbox(&mut on, group.category.label()).changed() {
                                 if on {
-                                    egui::RichText::new(value).strong()
+                                    self.selected.insert(group.category);
                                 } else {
-                                    egui::RichText::new(value).weak()
+                                    self.selected.remove(&group.category);
                                 }
-                            };
-
-                            ui.label(text(group.category.label().to_owned()));
-                            ui.label(text(group.files.to_string()));
-                            ui.label(text(human_bytes(group.bytes)));
-                            ui.end_row();
-                        }
+                                self.apply_selection();
+                            }
+                        });
+                        ui.small(group.category.description());
                     });
 
-                ui.add_space(10.0);
-                ui.separator();
-                ui.label(format!("Selected: {}", plan.summary()));
-                ui.small("Files move into a snapshot. Nothing is deleted until you delete it.");
-                ui.add_space(6.0);
+                    let cell = |ui: &mut egui::Ui, value: String| {
+                        let text = egui::RichText::new(value);
+                        ui.label(if found { text } else { text.weak() });
+                    };
 
-                ui.add_enabled_ui(!self.busy, |ui| {
-                    if ui.button("Clean").clicked() {
-                        self.request_clean();
-                    }
-                });
+                    cell(ui, group.files.to_string());
+                    cell(ui, human_bytes(group.bytes));
+                    ui.end_row();
+                }
             });
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.label(format!("Selected: {}", plan.summary()));
+        ui.small("Files move into a snapshot. Nothing is deleted until you delete it.");
+        ui.add_space(8.0);
+
+        ui.add_enabled_ui(!self.busy, |ui| {
+            if ui.button("Clean").clicked() {
+                self.request_clean();
+            }
         });
     }
 
