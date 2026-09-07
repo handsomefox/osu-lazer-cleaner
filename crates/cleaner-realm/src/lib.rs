@@ -42,6 +42,13 @@ pub struct BeatmapSet {
     pub index: usize,
     /// Files the set owns, in list order.
     pub files: Vec<NamedFile>,
+    /// Audio tracks its difficulties name, from `BeatmapMetadata.AudioFile`.
+    ///
+    /// Reading these from the database avoids opening the difficulty files, which is by far
+    /// the slowest part of a scan.
+    pub audio: Vec<String>,
+    /// Background images its difficulties name, from `BeatmapMetadata.BackgroundFile`.
+    pub backgrounds: Vec<String>,
 }
 
 /// One entry in an owner's file list.
@@ -53,6 +60,17 @@ pub struct NamedFile {
     pub filename: String,
     /// SHA-256 of the file's contents, which is also its name under `files/`.
     pub hash: String,
+}
+
+/// Property keys needed to read a beatmap set and its metadata.
+#[derive(Debug, Clone, Copy)]
+struct BeatmapSetKeys {
+    delete_pending: sys::realm_property_key_t,
+    protected: sys::realm_property_key_t,
+    beatmaps: sys::realm_property_key_t,
+    metadata: sys::realm_property_key_t,
+    audio_file: sys::realm_property_key_t,
+    background_file: sys::realm_property_key_t,
 }
 
 /// A usage to reattach to a beatmap set when restoring a snapshot.
@@ -336,11 +354,17 @@ impl Realm {
             let list_key = self.property_key(class, property)?;
             let is_beatmap_set = *class_name == "BeatmapSet";
 
-            let skip_keys = if is_beatmap_set {
-                Some((
-                    self.property_key(class, "DeletePending")?,
-                    self.property_key(class, "Protected")?,
-                ))
+            let set_keys = if is_beatmap_set {
+                Some(BeatmapSetKeys {
+                    delete_pending: self.property_key(class, "DeletePending")?,
+                    protected: self.property_key(class, "Protected")?,
+                    beatmaps: self.property_key(class, "Beatmaps")?,
+                    metadata: self.property_key(self.class_key("Beatmap")?, "Metadata")?,
+                    audio_file: self
+                        .property_key(self.class_key("BeatmapMetadata")?, "AudioFile")?,
+                    background_file: self
+                        .property_key(self.class_key("BeatmapMetadata")?, "BackgroundFile")?,
+                })
             } else {
                 None
             };
@@ -354,11 +378,17 @@ impl Realm {
                     *counts.entry(file.hash.clone()).or_insert(0) += 1;
                 }
 
-                if let Some((delete_pending, protected)) = skip_keys
-                    && !object.boolean(delete_pending)?
-                    && !object.boolean(protected)?
+                if let Some(keys) = set_keys
+                    && !object.boolean(keys.delete_pending)?
+                    && !object.boolean(keys.protected)?
                 {
-                    sets.push(BeatmapSet { index, files });
+                    let (audio, backgrounds) = Self::read_metadata(&object, keys)?;
+                    sets.push(BeatmapSet {
+                        index,
+                        files,
+                        audio,
+                        backgrounds,
+                    });
                 }
             }
         }
@@ -367,6 +397,68 @@ impl Realm {
             beatmap_sets: sets,
             usage_counts: counts,
         })
+    }
+
+    /// Reads the audio and background filenames every difficulty in a set names.
+    ///
+    /// `BeatmapMetadata` holds both, so a scan can learn what a set's audio track and
+    /// background are without opening a single difficulty file.
+    fn read_metadata(
+        owner: &value::Object,
+        keys: BeatmapSetKeys,
+    ) -> Result<(Vec<String>, Vec<String>), RealmError> {
+        let mut audio = Vec::new();
+        let mut backgrounds = Vec::new();
+
+        // SAFETY: `owner` is live and `beatmaps` names a list property on its class.
+        let list = unsafe { sys::realm_get_list(owner.ptr, keys.beatmaps) };
+        if list.is_null() {
+            return Err(last_error());
+        }
+
+        let mut size = 0;
+        // SAFETY: `list` is live; released on every path below.
+        if !unsafe { sys::realm_list_size(list, &raw mut size) } {
+            // SAFETY: released before propagating.
+            unsafe { sys::realm_release(list.cast()) };
+            return Err(last_error());
+        }
+
+        for index in 0..size {
+            // SAFETY: `index` is below the size realm-core just reported.
+            let beatmap = unsafe { sys::realm_list_get_linked_object(list, index) };
+
+            let read = (|| {
+                let beatmap = value::Object::from_raw(beatmap)?;
+                // SAFETY: `metadata` is an object link on `Beatmap`.
+                let metadata = unsafe { sys::realm_get_linked_object(beatmap.ptr, keys.metadata) };
+                let metadata = value::Object::from_raw(metadata)?;
+                Ok::<_, RealmError>((
+                    metadata.string(keys.audio_file)?,
+                    metadata.string(keys.background_file)?,
+                ))
+            })();
+
+            match read {
+                Ok((track, background)) => {
+                    if !track.is_empty() && !audio.contains(&track) {
+                        audio.push(track);
+                    }
+                    if !background.is_empty() && !backgrounds.contains(&background) {
+                        backgrounds.push(background);
+                    }
+                }
+                Err(error) => {
+                    // SAFETY: released before propagating.
+                    unsafe { sys::realm_release(list.cast()) };
+                    return Err(error);
+                }
+            }
+        }
+
+        // SAFETY: released exactly once, after the loop.
+        unsafe { sys::realm_release(list.cast()) };
+        Ok((audio, backgrounds))
     }
 
     /// Removes the named usages from their beatmap sets, in one transaction.

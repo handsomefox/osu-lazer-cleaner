@@ -52,7 +52,7 @@ pub struct References {
 
 impl References {
     /// Merges another set of references into this one.
-    fn absorb(&mut self, other: Self) {
+    pub fn absorb(&mut self, other: Self) {
         self.audio.extend(other.audio);
         self.backgrounds.extend(other.backgrounds);
         self.videos.extend(other.videos);

@@ -55,7 +55,8 @@ pub fn build_plan(
 
     let classify_started = std::time::Instant::now();
     let total_sets = sets.len();
-    let mut candidates = classify_sets(library, &sets, &sizes, &usage_counts, &mut progress);
+    let (mut candidates, sets_parsed) =
+        classify_sets(library, &sets, &sizes, &usage_counts, &mut progress);
     let classify_ms = elapsed_ms(classify_started);
 
     candidates.extend(orphan_blobs(&sizes, &usage_counts));
@@ -66,6 +67,7 @@ pub fn build_plan(
         measure_ms,
         database_ms,
         classify_ms,
+        sets_parsed,
     };
     Ok(plan)
 }
@@ -87,7 +89,8 @@ fn classify_sets(
     sizes: &HashMap<String, u64>,
     usage_counts: &HashMap<String, u32>,
     progress: &mut impl FnMut(Progress),
-) -> Vec<Candidate> {
+) -> (Vec<Candidate>, usize) {
+    let parsed = std::sync::atomic::AtomicUsize::new(0);
     let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let done = std::sync::atomic::AtomicUsize::new(0);
@@ -106,7 +109,12 @@ fn classify_sets(
                     };
 
                     for set in *chunk {
-                        local.extend(classify_set(library, set, sizes, usage_counts));
+                        let (candidates, was_parsed) =
+                            classify_set(library, set, sizes, usage_counts);
+                        local.extend(candidates);
+                        if was_parsed {
+                            parsed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                     done.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
                 }
@@ -128,23 +136,44 @@ fn classify_sets(
         }
     });
 
-    collected
+    let candidates = collected
         .into_inner()
         .expect("classification mutex was poisoned")
         .into_iter()
         .flatten()
-        .collect()
+        .collect();
+
+    (
+        candidates,
+        parsed.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// Classifies one beatmap set's files.
+///
+/// Also reports whether the set's difficulty files had to be opened.
 fn classify_set(
     library: &Library,
     set: &cleaner_realm::BeatmapSet,
     sizes: &HashMap<String, u64>,
     usage_counts: &HashMap<String, u32>,
-) -> Vec<Candidate> {
+) -> (Vec<Candidate>, bool) {
     let owned: BTreeSet<String> = set.files.iter().map(|f| f.filename.clone()).collect();
-    let references = read_references(library, set, &owned);
+
+    // Start from what the database already knows, which costs nothing to read.
+    let mut references = osu::References {
+        audio: set.audio.iter().cloned().collect(),
+        backgrounds: set.backgrounds.iter().cloned().collect(),
+        ..osu::References::default()
+    };
+
+    // Only open the difficulty files when the set owns something they might explain. Most
+    // sets are just difficulties, one audio track, and one background, and reading those
+    // files was over 99% of a scan's time on a large library.
+    let parsed = needs_parsing(set, &references);
+    if parsed {
+        references.absorb(read_references(library, set, &owned));
+    }
 
     // Files a beatmap cannot play without. These are never candidates, whatever category
     // else they might match.
@@ -156,7 +185,8 @@ fn classify_set(
             .filter(|name| has_extension(name, DIFFICULTY_EXTENSION)),
     );
 
-    set.files
+    let candidates = set
+        .files
         .iter()
         .filter(|file| !protected.contains(&file.filename))
         .filter_map(|file| {
@@ -177,7 +207,40 @@ fn classify_set(
                 frees_blob: remaining == 0,
             })
         })
-        .collect()
+        .collect();
+
+    (candidates, parsed)
+}
+
+/// Reports whether a set owns anything that only its difficulty files can explain.
+///
+/// Storyboard art and custom hitsounds are named inside `.osu` and `.osb` files, so finding
+/// them means reading those files. Everything else is settled by the database or by the
+/// filename: audio and background come from `BeatmapMetadata`, videos and junk from the
+/// extension, skin elements from the name.
+///
+/// A set therefore needs parsing only when it owns a file that none of those explain. When it
+/// owns nothing but difficulties, its audio track, and its background, there is nothing left
+/// for parsing to find.
+fn needs_parsing(set: &cleaner_realm::BeatmapSet, known: &osu::References) -> bool {
+    set.files.iter().any(|file| {
+        let name = &file.filename;
+
+        if has_extension(name, STORYBOARD_EXTENSION) {
+            return true;
+        }
+
+        let explained = has_extension(name, DIFFICULTY_EXTENSION)
+            || known.audio.contains(name)
+            || known.backgrounds.contains(name)
+            || catalog::is_junk(name)
+            || skin::is_skin_element(name)
+            || osu::VIDEO_EXTENSIONS
+                .iter()
+                .any(|extension| has_extension(name, extension));
+
+        !explained
+    })
 }
 
 /// Decides which category a file belongs to, if any.
@@ -457,6 +520,76 @@ mod tests {
         let mut references = osu::References::default();
         references.backgrounds.insert(name.to_owned());
         references
+    }
+
+    fn set_with(files: &[&str], audio: &[&str], backgrounds: &[&str]) -> cleaner_realm::BeatmapSet {
+        cleaner_realm::BeatmapSet {
+            index: 0,
+            files: files
+                .iter()
+                .enumerate()
+                .map(|(index, name)| cleaner_realm::NamedFile {
+                    index,
+                    filename: (*name).to_owned(),
+                    hash: format!("{index:064}"),
+                })
+                .collect(),
+            audio: audio.iter().map(|s| (*s).to_owned()).collect(),
+            backgrounds: backgrounds.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    fn known(set: &cleaner_realm::BeatmapSet) -> osu::References {
+        osu::References {
+            audio: set.audio.iter().cloned().collect(),
+            backgrounds: set.backgrounds.iter().cloned().collect(),
+            ..osu::References::default()
+        }
+    }
+
+    #[test]
+    fn an_ordinary_set_needs_no_parsing() {
+        // Difficulties, one audio track, one background: the database explains all of it.
+        let set = set_with(
+            &["Map [Easy].osu", "Map [Hard].osu", "audio.mp3", "bg.jpg"],
+            &["audio.mp3"],
+            &["bg.jpg"],
+        );
+        assert!(!needs_parsing(&set, &known(&set)));
+    }
+
+    #[test]
+    fn a_storyboard_always_needs_parsing() {
+        let set = set_with(&["Map.osu", "audio.mp3", "Map.osb"], &["audio.mp3"], &[]);
+        assert!(needs_parsing(&set, &known(&set)));
+    }
+
+    #[test]
+    fn an_unexplained_file_needs_parsing() {
+        // The extra sample could be a custom hitsound, which only the difficulty names.
+        let set = set_with(
+            &["Map.osu", "audio.mp3", "bg.jpg", "soft-hitwhistle2.wav"],
+            &["audio.mp3"],
+            &["bg.jpg"],
+        );
+        assert!(needs_parsing(&set, &known(&set)));
+    }
+
+    #[test]
+    fn junk_and_skin_files_do_not_trigger_parsing() {
+        // Both are recognised by name, so reading the difficulties would find nothing new.
+        let set = set_with(
+            &[
+                "Map.osu",
+                "audio.mp3",
+                "bg.jpg",
+                "Thumbs.db",
+                "hitcircle.png",
+            ],
+            &["audio.mp3"],
+            &["bg.jpg"],
+        );
+        assert!(!needs_parsing(&set, &known(&set)));
     }
 
     #[test]

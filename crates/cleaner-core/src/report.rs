@@ -162,6 +162,11 @@ pub fn render(report: &Report) -> String {
         seconds(report.timings.database_ms),
         seconds(report.timings.classify_ms)
     );
+    let _ = writeln!(
+        out,
+        "opened difficulty files for {} of {} beatmap sets",
+        report.timings.sets_parsed, report.library_totals.sets
+    );
 
     let _ = writeln!(
         out,

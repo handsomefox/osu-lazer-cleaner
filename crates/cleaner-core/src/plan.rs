@@ -72,6 +72,10 @@ pub struct Timings {
     pub database_ms: u64,
     /// Reading and parsing difficulty and storyboard files.
     pub classify_ms: u64,
+    /// Beatmap sets whose difficulty files had to be opened.
+    ///
+    /// The rest were settled from the database alone. A high number here explains a slow scan.
+    pub sets_parsed: usize,
 }
 
 /// Everything a scan found.
