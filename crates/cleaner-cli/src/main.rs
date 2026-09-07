@@ -271,6 +271,9 @@ fn clean(
         cleaner_core::CleanProgress::Moving { done, total } => {
             eprint!("\rmoving files into the snapshot: {done}/{total}");
         }
+        cleaner_core::CleanProgress::Reattaching { done, total } => {
+            eprint!("\rreattaching files to beatmap sets: {done}/{total}");
+        }
     })?;
     eprintln!("\r                                                   ");
 
@@ -425,6 +428,9 @@ fn snapshots(cli: &Cli, command: &SnapshotCommand) -> Result<(), Box<dyn std::er
                 }
                 cleaner_core::CleanProgress::Moving { done, total } => {
                     eprint!("\rmoving files back: {done}/{total}");
+                }
+                cleaner_core::CleanProgress::Reattaching { done, total } => {
+                    eprint!("\rreattaching files to beatmap sets: {done}/{total}");
                 }
             })?;
             eprintln!("\r                                             ");

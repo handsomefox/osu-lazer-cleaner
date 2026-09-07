@@ -312,7 +312,10 @@ fn describe_clean(progress: cleaner_core::CleanProgress) -> String {
     match progress {
         cleaner_core::CleanProgress::UpdatingDatabase => "Updating the database".to_owned(),
         cleaner_core::CleanProgress::Moving { done, total } => {
-            format!("Moving files into the snapshot: {done} of {total}")
+            format!("Moving files: {done} of {total}")
+        }
+        cleaner_core::CleanProgress::Reattaching { done, total } => {
+            format!("Reattaching files to beatmap sets: {done} of {total}")
         }
     }
 }

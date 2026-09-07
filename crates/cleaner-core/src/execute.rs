@@ -18,6 +18,16 @@ use std::path::PathBuf;
 pub enum CleanProgress {
     /// Updating the database.
     UpdatingDatabase,
+    /// Reattaching files to their beatmap sets.
+    ///
+    /// Counted in beatmap sets rather than files, because the whole thing commits at once and
+    /// a per-file count would suggest work is being saved as it goes.
+    Reattaching {
+        /// Beatmap sets done so far.
+        done: usize,
+        /// Beatmap sets in total.
+        total: usize,
+    },
     /// Moving files into the snapshot.
     Moving {
         /// Files moved so far.
@@ -81,7 +91,6 @@ pub fn run(
         })
         .collect();
 
-    progress(CleanProgress::UpdatingDatabase);
     let schema_version = {
         let realm = Realm::open_for_write(&library.database())?;
         realm.erase_usages(&removals)?;
@@ -248,8 +257,6 @@ pub fn restore(
         progress(CleanProgress::Moving { done, total });
     })?;
 
-    progress(CleanProgress::UpdatingDatabase);
-
     let restorations: Vec<Restoration> = snapshot
         .manifest
         .detached
@@ -258,6 +265,7 @@ pub fn restore(
         .filter(|c| c.set_index != usize::MAX)
         .map(|c| Restoration {
             set_id: c.set_id,
+            set_index: c.set_index,
             filename: c.filename.clone(),
             hash: c.hash.clone(),
         })
@@ -265,7 +273,9 @@ pub fn restore(
 
     let rows = {
         let realm = Realm::open_for_write(&library.database())?;
-        realm.restore_usages(&restorations)?
+        realm.restore_usages(&restorations, |done, total| {
+            progress(CleanProgress::Reattaching { done, total });
+        })?
     };
 
     // A restored snapshot holds nothing: its files are back in the library. Leaving the

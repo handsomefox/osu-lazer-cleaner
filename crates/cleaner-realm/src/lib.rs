@@ -82,6 +82,30 @@ struct BeatmapSetKeys {
     background_file: sys::realm_property_key_t,
 }
 
+/// How a snapshot names the beatmap set a file belongs to.
+///
+/// Snapshots taken before beatmap sets were recorded by identity name them by position
+/// instead. Those still restore, so long as the library has not had a beatmap imported or
+/// deleted since, which is why newer snapshots record identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SetRef {
+    /// The set's `Guid` primary key.
+    Id([u8; 16]),
+    /// The set's position in the table.
+    Position(usize),
+}
+
+impl SetRef {
+    /// Picks the best identifier a restoration carries.
+    fn of(restoration: &Restoration) -> Self {
+        if restoration.set_id == [0; 16] {
+            Self::Position(restoration.set_index)
+        } else {
+            Self::Id(restoration.set_id)
+        }
+    }
+}
+
 /// A usage to reattach to a beatmap set when restoring a snapshot.
 #[derive(Debug, Clone)]
 pub struct Restoration {
@@ -89,7 +113,12 @@ pub struct Restoration {
     ///
     /// Named by identity rather than position, because a restore can happen long after the
     /// clean that produced it, and importing or deleting a beatmap shifts every position.
+    ///
+    /// All zeroes for snapshots written before identity was recorded, which fall back to
+    /// [`Restoration::set_index`].
     pub set_id: [u8; 16],
+    /// The owning set's position, used only when [`Restoration::set_id`] is absent.
+    pub set_index: usize,
     /// Name the file had inside the set.
     pub filename: String,
     /// SHA-256 of the file's contents.
@@ -566,7 +595,11 @@ impl Realm {
     ///
     /// Returns [`RealmError::Core`] if a hash has no `File` row, or if the transaction cannot
     /// be committed. The transaction is rolled back on any failure.
-    pub fn restore_usages(&self, restorations: &[Restoration]) -> Result<usize, RealmError> {
+    pub fn restore_usages(
+        &self,
+        restorations: &[Restoration],
+        mut progress: impl FnMut(usize, usize),
+    ) -> Result<usize, RealmError> {
         if restorations.is_empty() {
             return Ok(0);
         }
@@ -580,10 +613,10 @@ impl Realm {
 
         // Group by set so each one is located once and its file list read once. Doing that per
         // usage meant a fresh query and a full list read for every file being restored.
-        let mut by_set: HashMap<[u8; 16], Vec<&Restoration>> = HashMap::new();
+        let mut by_set: HashMap<SetRef, Vec<&Restoration>> = HashMap::new();
         for restoration in restorations {
             by_set
-                .entry(restoration.set_id)
+                .entry(SetRef::of(restoration))
                 .or_default()
                 .push(restoration);
         }
@@ -593,15 +626,21 @@ impl Realm {
             return Err(last_error());
         }
 
+        let total = by_set.len();
         let mut restored = 0;
-        for (set_id, entries) in by_set {
+
+        for (done, (set_ref, entries)) in by_set.into_iter().enumerate() {
+            if done % 64 == 0 {
+                progress(done, total);
+            }
+
             let outcome = self.restore_into_set(
                 class,
                 files_key,
                 filename_key,
                 target_key,
                 file_class,
-                set_id,
+                set_ref,
                 &entries,
             );
 
@@ -614,6 +653,8 @@ impl Realm {
                 }
             }
         }
+
+        progress(total, total);
 
         // SAFETY: the transaction opened above is still current.
         if !unsafe { sys::realm_commit(self.ptr) } {
@@ -635,10 +676,10 @@ impl Realm {
         filename_key: sys::realm_property_key_t,
         target_key: sys::realm_property_key_t,
         file_class: sys::realm_class_key_t,
-        set_id: [u8; 16],
+        set_ref: SetRef,
         entries: &[&Restoration],
     ) -> Result<usize, RealmError> {
-        let Some(object) = self.find_set_by_id(class, set_id)? else {
+        let Some(object) = self.find_set(class, set_ref)? else {
             // The set was deleted since the snapshot was taken. Its files have nowhere to go,
             // which is not an error: the user removed the beatmap deliberately.
             return Ok(0);
@@ -772,10 +813,26 @@ impl Realm {
         Ok(())
     }
 
-    /// Finds a beatmap set by its `Guid` primary key.
+    /// Locates a beatmap set, by identity when the snapshot recorded one and by position
+    /// otherwise.
     ///
-    /// Returns `None` when no set has that key, which means the beatmap was deleted since the
+    /// Returns `None` when no set matches, which means the beatmap was deleted since the
     /// snapshot was taken.
+    fn find_set(
+        &self,
+        class: sys::realm_class_key_t,
+        set_ref: SetRef,
+    ) -> Result<Option<value::Object>, RealmError> {
+        match set_ref {
+            SetRef::Id(id) => self.find_set_by_id(class, id),
+            // Snapshots written before identity was recorded name sets by position. Those
+            // positions were valid when the snapshot was taken, and stay valid as long as no
+            // beatmap has been imported or deleted since.
+            SetRef::Position(index) => self.object_at(class, index).map(Some),
+        }
+    }
+
+    /// Finds a beatmap set by its `Guid` primary key.
     fn find_set_by_id(
         &self,
         class: sys::realm_class_key_t,
@@ -1329,6 +1386,7 @@ mod tests {
                     .iter()
                     .map(|(filename, hash)| Restoration {
                         set_id,
+                        set_index,
                         filename: filename.clone(),
                         hash: hash.clone(),
                     })
@@ -1336,7 +1394,7 @@ mod tests {
 
                 assert_eq!(
                     realm
-                        .restore_usages(&restorations)
+                        .restore_usages(&restorations, |_, _| {})
                         .expect("failed to restore"),
                     2,
                     "both usages should have been reattached"
@@ -1378,6 +1436,7 @@ mod tests {
 
             let restoration = Restoration {
                 set_id: set.id,
+                set_index: set.index,
                 filename: set.files[0].filename.clone(),
                 hash: set.files[0].hash.clone(),
             };
@@ -1385,9 +1444,66 @@ mod tests {
             // The usage is already present, so nothing should be added.
             assert_eq!(
                 realm
-                    .restore_usages(std::slice::from_ref(&restoration))
+                    .restore_usages(std::slice::from_ref(&restoration), |_, _| {})
                     .expect("failed to restore"),
                 0
+            );
+        });
+    }
+
+    /// A snapshot written before beatmap sets were recorded by identity must still restore.
+    ///
+    /// Those manifests name sets by position, and reading them as an absent identity would
+    /// silently reattach nothing while reporting success.
+    #[test]
+    fn restores_a_snapshot_that_names_sets_by_position() {
+        with_sample(|path| {
+            let (set_index, removed) = {
+                let realm = Realm::open_for_write(path).expect("failed to open for write");
+                let sets = realm
+                    .read_library()
+                    .expect("failed to read library")
+                    .beatmap_sets;
+                let set = sets
+                    .iter()
+                    .find(|s| s.files.len() >= 2)
+                    .expect("no set with two files");
+
+                let removed: Vec<_> = set.files[..2]
+                    .iter()
+                    .map(|f| (f.filename.clone(), f.hash.clone()))
+                    .collect();
+
+                let removals: Vec<_> = set.files[..2]
+                    .iter()
+                    .map(|f| Removal {
+                        set_index: set.index,
+                        file_index: f.index,
+                    })
+                    .collect();
+                realm.erase_usages(&removals).expect("failed to erase");
+                (set.index, removed)
+            };
+
+            let realm = Realm::open_for_write(path).expect("failed to reopen for write");
+
+            // An all-zero identity is what an older manifest deserialises to.
+            let restorations: Vec<_> = removed
+                .iter()
+                .map(|(filename, hash)| Restoration {
+                    set_id: [0; 16],
+                    set_index,
+                    filename: filename.clone(),
+                    hash: hash.clone(),
+                })
+                .collect();
+
+            assert_eq!(
+                realm
+                    .restore_usages(&restorations, |_, _| {})
+                    .expect("failed to restore"),
+                2,
+                "a position-only snapshot must still reattach its files"
             );
         });
     }
