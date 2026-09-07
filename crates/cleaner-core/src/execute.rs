@@ -257,7 +257,7 @@ pub fn restore(
         // Orphaned blobs were never attached to anything, so there is nothing to reattach.
         .filter(|c| c.set_index != usize::MAX)
         .map(|c| Restoration {
-            set_index: c.set_index,
+            set_id: c.set_id,
             filename: c.filename.clone(),
             hash: c.hash.clone(),
         })
@@ -296,6 +296,7 @@ mod tests {
                 category: Category::Junk,
                 candidates: vec![Candidate {
                     set_index: 0,
+                    set_id: [0; 16],
                     file_index: 0,
                     filename: "Thumbs.db".to_owned(),
                     hash: "a".repeat(64),

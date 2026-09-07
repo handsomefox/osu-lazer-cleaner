@@ -246,6 +246,7 @@ mod tests {
     fn candidate(hash: &str, name: &str, frees: bool) -> Candidate {
         Candidate {
             set_index: 0,
+            set_id: [0; 16],
             file_index: 0,
             filename: name.to_owned(),
             hash: hash.to_owned(),

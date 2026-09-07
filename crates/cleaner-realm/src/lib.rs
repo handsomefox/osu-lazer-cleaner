@@ -38,8 +38,16 @@ pub struct Library {
 /// A beatmap set and the files it owns.
 #[derive(Debug, Clone)]
 pub struct BeatmapSet {
-    /// Position in the class's natural order, used to address the set for writes.
+    /// Position in the class's natural order.
+    ///
+    /// Only valid for as long as the database is unchanged, so it addresses a set during the
+    /// clean that follows a scan and never afterwards. Use [`BeatmapSet::id`] to name a set
+    /// across time.
     pub index: usize,
+    /// The set's `Guid` primary key, as 16 bytes.
+    ///
+    /// Stable across imports and deletions, unlike the position.
+    pub id: [u8; 16],
     /// Files the set owns, in list order.
     pub files: Vec<NamedFile>,
     /// Audio tracks its difficulties name, from `BeatmapMetadata.AudioFile`.
@@ -65,6 +73,7 @@ pub struct NamedFile {
 /// Property keys needed to read a beatmap set and its metadata.
 #[derive(Debug, Clone, Copy)]
 struct BeatmapSetKeys {
+    id: sys::realm_property_key_t,
     delete_pending: sys::realm_property_key_t,
     protected: sys::realm_property_key_t,
     beatmaps: sys::realm_property_key_t,
@@ -76,8 +85,11 @@ struct BeatmapSetKeys {
 /// A usage to reattach to a beatmap set when restoring a snapshot.
 #[derive(Debug, Clone)]
 pub struct Restoration {
-    /// Index of the owning set.
-    pub set_index: usize,
+    /// The owning set's `Guid` primary key.
+    ///
+    /// Named by identity rather than position, because a restore can happen long after the
+    /// clean that produced it, and importing or deleting a beatmap shifts every position.
+    pub set_id: [u8; 16],
     /// Name the file had inside the set.
     pub filename: String,
     /// SHA-256 of the file's contents.
@@ -382,6 +394,7 @@ impl Realm {
                 Some(BeatmapSetKeys {
                     delete_pending: self.property_key(class, "DeletePending")?,
                     protected: self.property_key(class, "Protected")?,
+                    id: self.property_key(class, "ID")?,
                     beatmaps: self.property_key(class, "Beatmaps")?,
                     metadata: self.property_key(self.class_key("Beatmap")?, "Metadata")?,
                     audio_file: self
@@ -409,6 +422,7 @@ impl Realm {
                     let (audio, backgrounds) = Self::read_metadata(&object, keys)?;
                     sets.push(BeatmapSet {
                         index,
+                        id: object.uuid(keys.id)?.unwrap_or_default(),
                         files,
                         audio,
                         backgrounds,
@@ -563,14 +577,13 @@ impl Realm {
         let filename_key = self.property_key(usage, "Filename")?;
         let target_key = self.property_key(usage, "File")?;
         let file_class = self.class_key("File")?;
-        let hash_key = self.property_key(file_class, "Hash")?;
 
         // Group by set so each one is located once and its file list read once. Doing that per
         // usage meant a fresh query and a full list read for every file being restored.
-        let mut by_set: HashMap<usize, Vec<&Restoration>> = HashMap::new();
+        let mut by_set: HashMap<[u8; 16], Vec<&Restoration>> = HashMap::new();
         for restoration in restorations {
             by_set
-                .entry(restoration.set_index)
+                .entry(restoration.set_id)
                 .or_default()
                 .push(restoration);
         }
@@ -581,15 +594,14 @@ impl Realm {
         }
 
         let mut restored = 0;
-        for (set_index, entries) in by_set {
+        for (set_id, entries) in by_set {
             let outcome = self.restore_into_set(
                 class,
                 files_key,
                 filename_key,
                 target_key,
-                hash_key,
                 file_class,
-                set_index,
+                set_id,
                 &entries,
             );
 
@@ -622,18 +634,26 @@ impl Realm {
         files_key: sys::realm_property_key_t,
         filename_key: sys::realm_property_key_t,
         target_key: sys::realm_property_key_t,
-        hash_key: sys::realm_property_key_t,
         file_class: sys::realm_class_key_t,
-        set_index: usize,
+        set_id: [u8; 16],
         entries: &[&Restoration],
     ) -> Result<usize, RealmError> {
-        let object = self.object_at(class, set_index)?;
+        let Some(object) = self.find_set_by_id(class, set_id)? else {
+            // The set was deleted since the snapshot was taken. Its files have nowhere to go,
+            // which is not an error: the user removed the beatmap deliberately.
+            return Ok(0);
+        };
 
-        let present: std::collections::HashSet<String> =
-            Self::read_usages(&object, files_key, filename_key, target_key, hash_key)?
-                .into_iter()
-                .map(|file| file.filename)
-                .collect();
+        // Only the names matter here. Reading the full usages would resolve each one's linked
+        // File row and read its hash, which is a wasted lookup per file already in the set.
+        let present = Self::read_filenames(&object, files_key, filename_key)?;
+
+        // SAFETY: `object` is live and `files_key` names a list property on its class. The
+        // handle is acquired once and reused, rather than reacquired for every file.
+        let list = unsafe { sys::realm_get_list(object.ptr, files_key) };
+        if list.is_null() {
+            return Err(last_error());
+        }
 
         let mut restored = 0;
         for entry in entries {
@@ -642,25 +662,67 @@ impl Realm {
                 continue;
             }
 
-            self.append_usage(
-                &object,
-                files_key,
-                filename_key,
-                target_key,
-                file_class,
-                entry,
-            )?;
+            if let Err(error) = self.append_usage(list, filename_key, target_key, file_class, entry)
+            {
+                // SAFETY: released before propagating.
+                unsafe { sys::realm_release(list.cast()) };
+                return Err(error);
+            }
+
             restored += 1;
         }
 
+        // SAFETY: released exactly once, after the loop.
+        unsafe { sys::realm_release(list.cast()) };
         Ok(restored)
     }
 
-    /// Adds one `RealmNamedFileUsage` to the end of a set's file list.
+    /// Reads just the filenames from an owner's file list.
+    fn read_filenames(
+        owner: &value::Object,
+        list_key: sys::realm_property_key_t,
+        filename_key: sys::realm_property_key_t,
+    ) -> Result<std::collections::HashSet<String>, RealmError> {
+        // SAFETY: `owner` is live and `list_key` names a list property on its class.
+        let list = unsafe { sys::realm_get_list(owner.ptr, list_key) };
+        if list.is_null() {
+            return Err(last_error());
+        }
+
+        let mut size = 0;
+        // SAFETY: `list` is live; released on every path below.
+        if !unsafe { sys::realm_list_size(list, &raw mut size) } {
+            // SAFETY: released before propagating.
+            unsafe { sys::realm_release(list.cast()) };
+            return Err(last_error());
+        }
+
+        let mut names = std::collections::HashSet::with_capacity(size);
+        for index in 0..size {
+            // SAFETY: `index` is below the size realm-core just reported.
+            let entry = unsafe { sys::realm_list_get_linked_object(list, index) };
+
+            match value::Object::from_raw(entry).and_then(|e| e.string(filename_key)) {
+                Ok(name) => {
+                    names.insert(name);
+                }
+                Err(error) => {
+                    // SAFETY: released before propagating.
+                    unsafe { sys::realm_release(list.cast()) };
+                    return Err(error);
+                }
+            }
+        }
+
+        // SAFETY: released exactly once, after the loop.
+        unsafe { sys::realm_release(list.cast()) };
+        Ok(names)
+    }
+
+    /// Adds one `RealmNamedFileUsage` to the end of an already-acquired file list.
     fn append_usage(
         &self,
-        object: &value::Object,
-        files_key: sys::realm_property_key_t,
+        list: *mut sys::realm_list_t,
         filename_key: sys::realm_property_key_t,
         target_key: sys::realm_property_key_t,
         file_class: sys::realm_class_key_t,
@@ -674,22 +736,14 @@ impl Realm {
             reason = "one insert-and-populate sequence; the new object is unusable until both \
                       of its properties are set"
         )]
-        // SAFETY: `object` and `file` are live, and every handle is released before returning.
+        // SAFETY: `list` and `file` are live, and the caller owns the list handle.
         unsafe {
-            let list = sys::realm_get_list(object.ptr, files_key);
-            if list.is_null() {
-                return Err(last_error());
-            }
-
             let mut size = 0;
             if !sys::realm_list_size(list, &raw mut size) {
-                sys::realm_release(list.cast());
                 return Err(last_error());
             }
 
             let entry_object = sys::realm_list_insert_embedded(list, size);
-            sys::realm_release(list.cast());
-
             let entry_object = value::Object::from_raw(entry_object)?;
 
             let name = sys::realm_value_t {
@@ -716,6 +770,35 @@ impl Realm {
         }
 
         Ok(())
+    }
+
+    /// Finds a beatmap set by its `Guid` primary key.
+    ///
+    /// Returns `None` when no set has that key, which means the beatmap was deleted since the
+    /// snapshot was taken.
+    fn find_set_by_id(
+        &self,
+        class: sys::realm_class_key_t,
+        id: [u8; 16],
+    ) -> Result<Option<value::Object>, RealmError> {
+        let key = sys::realm_value_t {
+            __bindgen_anon_1: sys::realm_value__bindgen_ty_1 {
+                uuid: sys::realm_uuid_t { bytes: id },
+            },
+            type_: sys::realm_value_type_RLM_TYPE_UUID,
+        };
+
+        let mut found = false;
+        // SAFETY: `class` came from this realm's schema and the out-param is ours.
+        let object = unsafe {
+            sys::realm_object_find_with_primary_key(self.ptr, class, key, &raw mut found)
+        };
+
+        if !found || object.is_null() {
+            return Ok(None);
+        }
+
+        value::Object::from_raw(object).map(Some)
     }
 
     /// Finds the `File` row for a hash.
@@ -1197,7 +1280,7 @@ mod tests {
     #[test]
     fn erasing_and_restoring_round_trips() {
         with_sample(|path| {
-            let (set_index, before) = {
+            let (set_index, set_id, before) = {
                 let realm = Realm::open_read_only(path).expect("failed to open");
                 let sets = realm
                     .read_library()
@@ -1209,6 +1292,7 @@ mod tests {
                     .expect("no set with three files");
                 (
                     set.index,
+                    set.id,
                     set.files
                         .iter()
                         .map(|f| (f.filename.clone(), f.hash.clone()))
@@ -1244,7 +1328,7 @@ mod tests {
                 let restorations: Vec<_> = removed
                     .iter()
                     .map(|(filename, hash)| Restoration {
-                        set_index,
+                        set_id,
                         filename: filename.clone(),
                         hash: hash.clone(),
                     })
@@ -1293,7 +1377,7 @@ mod tests {
             let set = sets.iter().find(|s| !s.files.is_empty()).expect("no files");
 
             let restoration = Restoration {
-                set_index: set.index,
+                set_id: set.id,
                 filename: set.files[0].filename.clone(),
                 hash: set.files[0].hash.clone(),
             };

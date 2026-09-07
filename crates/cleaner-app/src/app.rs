@@ -302,7 +302,7 @@ impl App {
         });
     }
 
-    /// Snapshots, with restore and delete.
+    /// Snapshots, newest first, with restore and delete.
     fn snapshots_screen(&mut self, ui: &mut egui::Ui) {
         ui.strong("Snapshots");
         ui.small("Each snapshot holds the files one clean removed. Restoring puts them back.");
@@ -311,6 +311,15 @@ impl App {
         if self.snapshots.is_empty() {
             ui.label("No snapshots yet.");
             return;
+        }
+
+        if self.snapshots.len() > 1 {
+            ui.label(
+                "Restore newest first. Each snapshot was taken against the library as the one \
+                 above it left it, so restoring an older one on its own leaves files missing \
+                 that the newer one still holds.",
+            );
+            ui.add_space(8.0);
         }
 
         let entries = self.snapshots.clone();
@@ -326,16 +335,26 @@ impl App {
                 ui.strong("");
                 ui.end_row();
 
-                for entry in &entries {
+                for (position, entry) in entries.iter().enumerate() {
+                    // Only the newest can be restored on its own; the rest wait their turn.
+                    let newest = position == 0;
+
                     ui.label(&entry.created);
                     ui.label(entry.files.to_string());
                     ui.label(human_bytes(entry.bytes));
 
-                    if ui.button("Restore").clicked() {
-                        self.worker.send(Command::RestoreSnapshot {
-                            id: entry.id.clone(),
-                        });
-                    }
+                    ui.add_enabled_ui(newest, |ui| {
+                        let button = ui.button("Restore");
+                        if !newest {
+                            button.on_disabled_hover_text(
+                                "Restore the snapshot above this one first.",
+                            );
+                        } else if button.clicked() {
+                            self.worker.send(Command::RestoreSnapshot {
+                                id: entry.id.clone(),
+                            });
+                        }
+                    });
 
                     if ui.button("Delete").clicked() {
                         self.pending_delete = Some(entry.id.clone());

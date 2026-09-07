@@ -370,6 +370,7 @@ fn snapshots(cli: &Cli, command: &SnapshotCommand) -> Result<(), Box<dyn std::er
                 return Ok(());
             }
 
+            println!("Newest first. Restore in this order.\n");
             println!("{:<24} {:>8} {:>12}  created", "id", "files", "size");
             for entry in &available {
                 println!(
@@ -389,6 +390,20 @@ fn snapshots(cli: &Cli, command: &SnapshotCommand) -> Result<(), Box<dyn std::er
 
         SnapshotCommand::Restore { id } => {
             let entry = find(&available, id)?;
+
+            // Snapshots are listed newest first, and each was taken against the library as the
+            // one before it left it. Restoring an older one on its own would leave the database
+            // pointing at files a newer snapshot still holds.
+            if available.first().map(cleaner_core::Snapshot::id).as_deref() != Some(id) {
+                return Err(format!(
+                    "restore snapshots newest first; start with {}",
+                    available
+                        .first()
+                        .map(cleaner_core::Snapshot::id)
+                        .unwrap_or_default()
+                )
+                .into());
+            }
             let restored = cleaner_core::restore(&library, entry, |progress| match progress {
                 cleaner_core::CleanProgress::UpdatingDatabase => {
                     eprint!("\rupdating the database");

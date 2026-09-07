@@ -69,7 +69,7 @@ impl Snapshot {
     }
 }
 
-/// Lists snapshots in a library, oldest first.
+/// Lists snapshots in a library, newest first.
 ///
 /// Directories that are half-written or unreadable are skipped rather than failing the whole
 /// listing, so one bad snapshot never hides the rest.
@@ -101,7 +101,10 @@ pub fn list(library: &Library) -> Result<Vec<Snapshot>, SnapshotError> {
         })
         .collect();
 
-    snapshots.sort_by_key(|s| s.manifest.created);
+    // Newest first. Snapshots have to be restored in reverse order, because each one was
+    // taken against the library as the one before it left it, so the most recent is the only
+    // one that can be restored on its own.
+    snapshots.sort_by_key(|s| std::cmp::Reverse(s.manifest.created));
     Ok(snapshots)
 }
 

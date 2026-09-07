@@ -8,8 +8,18 @@ use std::collections::BTreeMap;
 /// One file a clean would remove from one beatmap set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candidate {
-    /// Index of the owning beatmap set in the database.
+    /// Position of the owning beatmap set, used to detach the file during this clean.
+    ///
+    /// Positions shift when beatmaps are imported or deleted, so this is only meaningful
+    /// between a scan and the clean that follows it. [`Candidate::set_id`] names the set
+    /// durably.
     pub set_index: usize,
+    /// The owning beatmap set's primary key, as 16 bytes.
+    ///
+    /// A snapshot records this so that restoring reattaches files to the same beatmap even if
+    /// the library changed in between.
+    #[serde(default, with = "set_id")]
+    pub set_id: [u8; 16],
     /// Index of the usage within that set's file list.
     pub file_index: usize,
     /// Name the file has inside the set.
@@ -166,6 +176,41 @@ impl Plan {
     }
 }
 
+/// Serialises a beatmap set's primary key as hex, so manifests stay readable.
+mod set_id {
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    /// Writes the key as a 32-character hex string.
+    pub(super) fn serialize<S: Serializer>(id: &[u8; 16], out: S) -> Result<S::Ok, S::Error> {
+        use std::fmt::Write as _;
+
+        let mut text = String::with_capacity(32);
+        for byte in id {
+            let _ = write!(text, "{byte:02x}");
+        }
+        out.serialize_str(&text)
+    }
+
+    /// Reads the key back, treating anything malformed as absent.
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<[u8; 16], D::Error> {
+        let text = String::deserialize(input)?;
+        let mut id = [0_u8; 16];
+
+        if text.len() != 32 {
+            return Ok(id);
+        }
+
+        for (index, slot) in id.iter_mut().enumerate() {
+            let Ok(byte) = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16) else {
+                return Ok([0_u8; 16]);
+            };
+            *slot = byte;
+        }
+
+        Ok(id)
+    }
+}
+
 /// How a clean should behave.
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -218,6 +263,7 @@ mod tests {
     fn candidate(hash: &str, bytes: u64, category: Category, frees: bool) -> Candidate {
         Candidate {
             set_index: 0,
+            set_id: [0; 16],
             file_index: 0,
             filename: format!("{hash}.png"),
             hash: hash.to_owned(),

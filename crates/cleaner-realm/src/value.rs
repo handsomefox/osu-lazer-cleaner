@@ -55,6 +55,22 @@ impl Object {
         Ok(unsafe { value.__bindgen_anon_1.boolean })
     }
 
+    /// Reads a property as a UUID, which realm uses for `Guid` primary keys.
+    ///
+    /// Returns `None` when the property holds anything else.
+    pub(crate) fn uuid(
+        &self,
+        key: sys::realm_property_key_t,
+    ) -> Result<Option<[u8; 16]>, RealmError> {
+        let value = self.value(key)?;
+        if value.type_ != sys::realm_value_type_RLM_TYPE_UUID {
+            return Ok(None);
+        }
+
+        // SAFETY: the tag says this variant holds a UUID.
+        Ok(Some(unsafe { value.__bindgen_anon_1.uuid }.bytes))
+    }
+
     /// Reads a raw property value.
     fn value(&self, key: sys::realm_property_key_t) -> Result<sys::realm_value_t, RealmError> {
         let mut value = sys::realm_value_t::default();

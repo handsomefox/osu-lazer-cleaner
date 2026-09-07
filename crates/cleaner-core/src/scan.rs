@@ -199,6 +199,7 @@ fn classify_set(
 
             Some(Candidate {
                 set_index: set.index,
+                set_id: set.id,
                 file_index: file.index,
                 filename: file.filename.clone(),
                 hash: file.hash.clone(),
@@ -326,6 +327,7 @@ fn orphan_blobs(
         .filter(|(hash, _)| !usage_counts.contains_key(*hash))
         .map(|(hash, bytes)| Candidate {
             set_index: usize::MAX,
+            set_id: [0; 16],
             file_index: usize::MAX,
             filename: hash.clone(),
             hash: hash.clone(),
@@ -534,6 +536,7 @@ mod tests {
                     hash: format!("{index:064}"),
                 })
                 .collect(),
+            id: [0; 16],
             audio: audio.iter().map(|s| (*s).to_owned()).collect(),
             backgrounds: backgrounds.iter().map(|s| (*s).to_owned()).collect(),
         }
