@@ -34,7 +34,15 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Report what could be removed, without changing anything.
-    Scan,
+    Scan {
+        /// Print per-category detail, timings, and example filenames.
+        #[arg(long, short)]
+        verbose: bool,
+
+        /// Also write the full diagnostic report to this file, as JSON.
+        #[arg(long, value_name = "FILE")]
+        dump: Option<PathBuf>,
+    },
 
     /// List the cleaning categories.
     Categories,
@@ -115,10 +123,26 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             list_categories(cli.json);
             Ok(())
         }
-        Command::Scan => {
+        Command::Scan { verbose, dump } => {
             let library = open_library(cli.library.as_deref())?;
             let plan = scan(&library, &HashSet::new())?;
-            report_scan(&library, &plan, cli.json);
+            let report =
+                cleaner_core::report::summarise(&plan, &library.root().display().to_string());
+
+            if let Some(path) = dump {
+                let text = serde_json::to_string_pretty(&report)?;
+                std::fs::write(path, text)?;
+                println!("wrote the diagnostic report to {}", path.display());
+            }
+
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if *verbose {
+                print!("{}", cleaner_core::report::render(&report));
+            } else {
+                report_scan(&library, &plan, false);
+            }
+
             Ok(())
         }
         Command::Clean {
@@ -207,6 +231,19 @@ fn report_scan(library: &Library, plan: &Plan, json: bool) {
         );
     }
 
+    println!(
+        "\nscan took {:.1}s: {:.1}s measuring files, {:.1}s reading the database, \
+         {:.1}s reading beatmaps",
+        f64::from(
+            u32::try_from(
+                plan.timings.measure_ms + plan.timings.database_ms + plan.timings.classify_ms
+            )
+            .unwrap_or(u32::MAX)
+        ) / 1000.0,
+        f64::from(u32::try_from(plan.timings.measure_ms).unwrap_or(u32::MAX)) / 1000.0,
+        f64::from(u32::try_from(plan.timings.database_ms).unwrap_or(u32::MAX)) / 1000.0,
+        f64::from(u32::try_from(plan.timings.classify_ms).unwrap_or(u32::MAX)) / 1000.0,
+    );
     println!("\nRemove a category with: osu-lazer-cleaner-cli clean <category> --confirm");
 }
 

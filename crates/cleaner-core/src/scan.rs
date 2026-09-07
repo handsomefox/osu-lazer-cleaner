@@ -7,7 +7,7 @@
 use crate::catalog::{self, Category};
 use crate::error::ScanError;
 use crate::osu::{self, SourceKind};
-use crate::plan::{Candidate, Group, Plan, Progress};
+use crate::plan::{Candidate, Group, Plan, Progress, Timings};
 use crate::skin;
 use crate::storage::Library;
 use cleaner_realm::Realm;
@@ -33,8 +33,11 @@ pub fn build_plan(
     selected: &HashSet<Category, impl std::hash::BuildHasher>,
     mut progress: impl FnMut(Progress),
 ) -> Result<Plan, ScanError> {
+    let started = std::time::Instant::now();
     let sizes = measure_blobs(library, &mut progress);
+    let measure_ms = elapsed_ms(started);
 
+    let database_started = std::time::Instant::now();
     let scratch = tempfile::tempdir().map_err(|source| ScanError::Io {
         action: "creating a scratch directory",
         path: library.root().to_path_buf(),
@@ -48,13 +51,28 @@ pub fn build_plan(
     let sets = contents.beatmap_sets;
     let usage_counts = contents.usage_counts;
 
+    let database_ms = elapsed_ms(database_started);
+
+    let classify_started = std::time::Instant::now();
     let total_sets = sets.len();
     let mut candidates = classify_sets(library, &sets, &sizes, &usage_counts, &mut progress);
+    let classify_ms = elapsed_ms(classify_started);
 
     candidates.extend(orphan_blobs(&sizes, &usage_counts));
     progress(Progress::Done);
 
-    Ok(assemble(candidates, selected, total_sets, &sizes))
+    let mut plan = assemble(candidates, selected, total_sets, &sizes);
+    plan.timings = Timings {
+        measure_ms,
+        database_ms,
+        classify_ms,
+    };
+    Ok(plan)
+}
+
+/// Milliseconds since `started`, saturating rather than panicking on a huge value.
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Classifies every set, reading their difficulty files in parallel.
@@ -296,6 +314,7 @@ fn assemble(
         .collect();
 
     Plan {
+        timings: Timings::default(),
         groups,
         sets_scanned,
         blobs_total: sizes.len(),

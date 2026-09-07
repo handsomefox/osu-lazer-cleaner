@@ -60,9 +60,25 @@ impl Group {
     }
 }
 
+/// How long each phase of a scan took.
+///
+/// Scanning a large library is dominated by the filesystem, and which part dominates depends
+/// on the machine. Reporting the split makes that visible instead of guessable.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct Timings {
+    /// Measuring every blob in the store.
+    pub measure_ms: u64,
+    /// Reading beatmap sets and reference counts out of the database.
+    pub database_ms: u64,
+    /// Reading and parsing difficulty and storyboard files.
+    pub classify_ms: u64,
+}
+
 /// Everything a scan found.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Plan {
+    /// How long each phase took.
+    pub timings: Timings,
     /// Groups, ordered as [`Category::ALL`].
     pub groups: Vec<Group>,
     /// Beatmap sets examined.
