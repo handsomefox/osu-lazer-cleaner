@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/cleaner-realm"]
+members = [
+    "crates/cleaner-app",
+    "crates/cleaner-cli",
+    "crates/cleaner-core",
+    "crates/cleaner-realm",
+]
 resolver = "3"
 
 [workspace.package]
@@ -11,10 +16,18 @@ description = "A Windows desktop app that safely removes unwanted beatmap conten
 
 [workspace.dependencies]
 bindgen = "=0.73.1"
+clap = { version = "=4.6.6", features = ["derive"] }
+crossbeam-channel = "=0.5.17"
 cmake = "=0.1.58"
+eframe = { version = "=0.36.1", default-features = false, features = ["default_fonts", "glow", "persistence", "x11"] }
+jiff = { version = "=0.2.35", features = ["serde"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.11.0"
 tempfile = "=3.27.0"
 thiserror = "=2.0.20"
 tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 walkdir = "=2.5.0"
 
 [profile.release]

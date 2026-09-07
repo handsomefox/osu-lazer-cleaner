@@ -1,0 +1,24 @@
+[package]
+name = "cleaner-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable logic for osu-lazer-cleaner: storage discovery, reference extraction, scanning, planning, and snapshots"
+
+[lints]
+workspace = true
+
+[dependencies]
+cleaner-realm = { path = "../cleaner-realm" }
+jiff.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -6,9 +6,51 @@
 //! schema 51, where `RealmOnlineAsset` does not yet exist, while current lazer is at 52.
 
 pub mod sys;
+mod value;
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::path::Path;
+
+/// Every class that owns a list of `RealmNamedFileUsage`, with the property that holds it.
+///
+/// `RealmOnlineAsset` is deliberately absent: its `File` is a single embedded property rather
+/// than a list, and the class only exists from schema 52. Cached online assets are handled
+/// separately.
+const OWNERS_WITH_FILE_LISTS: &[(&str, &str)] = &[
+    ("BeatmapSet", "Files"),
+    ("Score", "Files"),
+    ("Skin", "Files"),
+];
+
+/// A beatmap set and the files it owns.
+#[derive(Debug, Clone)]
+pub struct BeatmapSet {
+    /// Position in the class's natural order, used to address the set for writes.
+    pub index: usize,
+    /// Files the set owns, in list order.
+    pub files: Vec<NamedFile>,
+}
+
+/// One entry in an owner's file list.
+#[derive(Debug, Clone)]
+pub struct NamedFile {
+    /// Position within the owner's list.
+    pub index: usize,
+    /// Name the file had inside the beatmap archive, with forward slashes.
+    pub filename: String,
+    /// SHA-256 of the file's contents, which is also its name under `files/`.
+    pub hash: String,
+}
+
+/// A usage to detach from a beatmap set.
+#[derive(Debug, Clone, Copy)]
+pub struct Removal {
+    /// Index of the owning set, as reported by [`Realm::beatmap_sets`].
+    pub set_index: usize,
+    /// Index of the file within that set's list.
+    pub file_index: usize,
+}
 
 /// Errors surfaced by realm-core or by our own preconditions.
 #[derive(Debug, thiserror::Error)]
@@ -28,7 +70,7 @@ pub enum RealmError {
 }
 
 /// Fetches the last error realm-core recorded on this thread.
-fn last_error() -> RealmError {
+pub(crate) fn last_error() -> RealmError {
     let mut err = sys::realm_error_t::default();
 
     // SAFETY: `realm_get_last_error` fills the caller-provided struct and borrows nothing.
@@ -236,108 +278,273 @@ impl Realm {
         keys.into_iter().map(|key| self.class(key)).collect()
     }
 
-    /// Removes one `RealmNamedFileUsage` from a beatmap set's `Files` list, in a transaction.
+    /// Reads every beatmap set, with the files each one owns.
     ///
-    /// This mirrors `ModelManager.DeleteFile`, which is just `item.Files.Remove(file)` — the
-    /// blob is swept later by the zero-backlink pass, never here. It exists at this layer so
-    /// the spike can prove the write path round-trips without migrating anything.
+    /// Sets that lazer would exclude from bulk operations are skipped: `DeletePending` ones
+    /// are already on their way out, and `Protected` ones are the built-in tutorial and intro
+    /// maps that `BeatmapManager.DeleteAllVideos` also filters out.
     ///
     /// # Errors
     ///
-    /// Returns [`RealmError::Core`] if the class or property is missing, if there is no row at
-    /// `set_index`, or if realm-core rejects the transaction.
-    pub fn erase_beatmap_set_file(
-        &self,
-        set_index: usize,
-        file_index: usize,
-    ) -> Result<(), RealmError> {
+    /// Returns [`RealmError::Core`] if the schema does not match what osu!lazer writes.
+    pub fn beatmap_sets(&self) -> Result<Vec<BeatmapSet>, RealmError> {
         let class = self.class_key("BeatmapSet")?;
-        let property = self.property_key(class, "Files")?;
+        let files_key = self.property_key(class, "Files")?;
+        let delete_pending_key = self.property_key(class, "DeletePending")?;
+        let protected_key = self.property_key(class, "Protected")?;
 
-        #[expect(
-            clippy::multiple_unsafe_ops_per_block,
-            reason = "a single transaction: each handle is released before the next step, so                       splitting the block would move releases away from their acquisitions"
-        )]
-        // SAFETY: every pointer below is owned by us and released on each exit path; the keys
-        // came from this realm.
-        unsafe {
-            if !sys::realm_begin_write(self.ptr) {
-                return Err(last_error());
+        let usage = self.class_key("RealmNamedFileUsage")?;
+        let filename_key = self.property_key(usage, "Filename")?;
+        let target_key = self.property_key(usage, "File")?;
+        let hash_key = self.property_key(self.class_key("File")?, "Hash")?;
+
+        let mut sets = Vec::new();
+
+        for index in 0..self.count(class)? {
+            let object = self.object_at(class, index)?;
+
+            if object.boolean(delete_pending_key)? || object.boolean(protected_key)? {
+                continue;
             }
 
-            let results = sys::realm_object_find_all(self.ptr, class);
-            if results.is_null() {
-                return Err(last_error());
-            }
+            sets.push(BeatmapSet {
+                index,
+                files: Self::read_usages(&object, files_key, filename_key, target_key, hash_key)?,
+            });
+        }
 
-            let object = sys::realm_results_get_object(results, set_index);
-            sys::realm_release(results.cast());
-            if object.is_null() {
-                return Err(last_error());
-            }
+        Ok(sets)
+    }
 
-            let list = sys::realm_get_list(object, property);
-            sys::realm_release(object.cast());
-            if list.is_null() {
-                return Err(last_error());
-            }
+    /// Counts how many usages across the whole database point at each file hash.
+    ///
+    /// This is the reference count that decides whether a blob can be removed. It spans every
+    /// type that owns file usages, because a blob shared between a beatmap and a skin must not
+    /// be removed when only the beatmap gives it up. `RealmFileStore.Cleanup` expresses the
+    /// same rule as the query `Usages.@count = 0`.
+    ///
+    /// Owner classes absent from the schema are skipped rather than treated as an error:
+    /// `RealmOnlineAsset` only exists from schema 52 onwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RealmError::Core`] if a class that does exist has an unexpected shape.
+    pub fn usage_counts(&self) -> Result<HashMap<String, u32>, RealmError> {
+        let usage = self.class_key("RealmNamedFileUsage")?;
+        let filename_key = self.property_key(usage, "Filename")?;
+        let target_key = self.property_key(usage, "File")?;
+        let hash_key = self.property_key(self.class_key("File")?, "Hash")?;
 
-            let erased = sys::realm_list_erase(list, file_index);
-            sys::realm_release(list.cast());
-            if !erased {
-                return Err(last_error());
-            }
+        let mut counts = HashMap::new();
 
-            if !sys::realm_commit(self.ptr) {
-                return Err(last_error());
+        for (class_name, property) in OWNERS_WITH_FILE_LISTS {
+            let Some(class) = self.optional_class_key(class_name)? else {
+                continue;
+            };
+            let list_key = self.property_key(class, property)?;
+
+            for index in 0..self.count(class)? {
+                let object = self.object_at(class, index)?;
+                for file in
+                    Self::read_usages(&object, list_key, filename_key, target_key, hash_key)?
+                {
+                    *counts.entry(file.hash).or_insert(0) += 1;
+                }
             }
+        }
+
+        Ok(counts)
+    }
+
+    /// Removes the named usages from their beatmap sets, in one transaction.
+    ///
+    /// This is `ModelManager.DeleteFile`, which is only `item.Files.Remove(file)`. Blobs are
+    /// never touched here. lazer sweeps them separately once their backlink count reaches
+    /// zero, and this tool moves them into a snapshot for the same reason: detaching the usage
+    /// and disposing of the bytes are two different steps.
+    ///
+    /// Indices are resolved per set and erased from the highest index down, so that earlier
+    /// erasures cannot shift the positions of later ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RealmError::Core`] if the transaction cannot be committed. The transaction is
+    /// cancelled on any failure, leaving the database untouched.
+    pub fn erase_usages(&self, removals: &[Removal]) -> Result<(), RealmError> {
+        if removals.is_empty() {
+            return Ok(());
+        }
+
+        let class = self.class_key("BeatmapSet")?;
+        let files_key = self.property_key(class, "Files")?;
+
+        let mut by_set: HashMap<usize, Vec<usize>> = HashMap::new();
+        for removal in removals {
+            by_set
+                .entry(removal.set_index)
+                .or_default()
+                .push(removal.file_index);
+        }
+
+        // SAFETY: begins a transaction we either commit or cancel on every path below.
+        if !unsafe { sys::realm_begin_write(self.ptr) } {
+            return Err(last_error());
+        }
+
+        for (set_index, mut file_indices) in by_set {
+            file_indices.sort_unstable();
+            file_indices.reverse();
+
+            if let Err(error) = self.erase_from_set(class, files_key, set_index, &file_indices) {
+                // SAFETY: a transaction is open; rolling back discards every edit above.
+                unsafe { sys::realm_rollback(self.ptr) };
+                return Err(error);
+            }
+        }
+
+        // SAFETY: the transaction opened above is still current.
+        if !unsafe { sys::realm_commit(self.ptr) } {
+            return Err(last_error());
         }
 
         Ok(())
     }
 
-    /// Counts entries in a beatmap set's `Files` list.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RealmError::Core`] if the class or property is missing, or there is no row at
-    /// `set_index`.
-    pub fn beatmap_set_file_count(&self, set_index: usize) -> Result<usize, RealmError> {
-        let class = self.class_key("BeatmapSet")?;
-        let property = self.property_key(class, "Files")?;
-        let mut size = 0;
+    /// Erases the given indices from one set's `Files` list. Callers hold the transaction.
+    fn erase_from_set(
+        &self,
+        class: sys::realm_class_key_t,
+        files_key: sys::realm_property_key_t,
+        set_index: usize,
+        file_indices: &[usize],
+    ) -> Result<(), RealmError> {
+        let object = self.object_at(class, set_index)?;
 
-        #[expect(
-            clippy::multiple_unsafe_ops_per_block,
-            reason = "one lookup chain: each handle is released before the next step, so                       splitting the block would move releases away from their acquisitions"
-        )]
-        // SAFETY: as above; each handle is released before the next step.
-        unsafe {
-            let results = sys::realm_object_find_all(self.ptr, class);
-            if results.is_null() {
-                return Err(last_error());
-            }
+        // SAFETY: `object` is live and `files_key` names a list property on its class.
+        let list = unsafe { sys::realm_get_list(object.ptr, files_key) };
+        if list.is_null() {
+            return Err(last_error());
+        }
 
-            let object = sys::realm_results_get_object(results, set_index);
-            sys::realm_release(results.cast());
-            if object.is_null() {
-                return Err(last_error());
-            }
-
-            let list = sys::realm_get_list(object, property);
-            sys::realm_release(object.cast());
-            if list.is_null() {
-                return Err(last_error());
-            }
-
-            let ok = sys::realm_list_size(list, &raw mut size);
-            sys::realm_release(list.cast());
-            if !ok {
+        for &index in file_indices {
+            // SAFETY: `list` is live for this loop and released immediately after it.
+            if !unsafe { sys::realm_list_erase(list, index) } {
+                // SAFETY: released before propagating the error.
+                unsafe { sys::realm_release(list.cast()) };
                 return Err(last_error());
             }
         }
 
-        Ok(size)
+        // SAFETY: released exactly once, after the last use above.
+        unsafe { sys::realm_release(list.cast()) };
+        Ok(())
+    }
+
+    /// Reads a list of `RealmNamedFileUsage` entries off an owner object.
+    fn read_usages(
+        owner: &value::Object,
+        list_key: sys::realm_property_key_t,
+        filename_key: sys::realm_property_key_t,
+        target_key: sys::realm_property_key_t,
+        hash_key: sys::realm_property_key_t,
+    ) -> Result<Vec<NamedFile>, RealmError> {
+        // SAFETY: `owner` is live and `list_key` names a list property on its class.
+        let list = unsafe { sys::realm_get_list(owner.ptr, list_key) };
+        if list.is_null() {
+            return Err(last_error());
+        }
+
+        let mut size = 0;
+        // SAFETY: `list` is live; released on every path below.
+        if !unsafe { sys::realm_list_size(list, &raw mut size) } {
+            // SAFETY: released before propagating.
+            unsafe { sys::realm_release(list.cast()) };
+            return Err(last_error());
+        }
+
+        let mut files = Vec::with_capacity(size);
+        for index in 0..size {
+            // SAFETY: `index` is below the size realm-core just reported.
+            let entry = unsafe { sys::realm_list_get_linked_object(list, index) };
+            let entry = match value::Object::from_raw(entry) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    // SAFETY: released before propagating.
+                    unsafe { sys::realm_release(list.cast()) };
+                    return Err(error);
+                }
+            };
+
+            let read = (|| {
+                let filename = entry.string(filename_key)?;
+                // SAFETY: `target_key` is an object link on `RealmNamedFileUsage`.
+                let file = unsafe { sys::realm_get_linked_object(entry.ptr, target_key) };
+                let hash = value::Object::from_raw(file)?.string(hash_key)?;
+                Ok::<_, RealmError>(NamedFile {
+                    index,
+                    filename,
+                    hash,
+                })
+            })();
+
+            match read {
+                Ok(file) => files.push(file),
+                Err(error) => {
+                    // SAFETY: released before propagating.
+                    unsafe { sys::realm_release(list.cast()) };
+                    return Err(error);
+                }
+            }
+        }
+
+        // SAFETY: released exactly once, after the loop.
+        unsafe { sys::realm_release(list.cast()) };
+        Ok(files)
+    }
+
+    /// Counts rows in a class.
+    fn count(&self, class: sys::realm_class_key_t) -> Result<usize, RealmError> {
+        let mut rows = 0;
+        // SAFETY: `class` came from this realm's schema.
+        if !unsafe { sys::realm_get_num_objects(self.ptr, class, &raw mut rows) } {
+            return Err(last_error());
+        }
+        Ok(rows)
+    }
+
+    /// Fetches the object at `index` in a class's natural order.
+    fn object_at(
+        &self,
+        class: sys::realm_class_key_t,
+        index: usize,
+    ) -> Result<value::Object, RealmError> {
+        // SAFETY: `class` came from this realm's schema.
+        let results = unsafe { sys::realm_object_find_all(self.ptr, class) };
+        if results.is_null() {
+            return Err(last_error());
+        }
+
+        // SAFETY: `results` is live until released on the next line.
+        let object = unsafe { sys::realm_results_get_object(results, index) };
+        // SAFETY: released exactly once; `object` does not borrow from it.
+        unsafe { sys::realm_release(results.cast()) };
+
+        value::Object::from_raw(object)
+    }
+
+    /// Looks up a class key, returning `None` when the class is absent from the schema.
+    fn optional_class_key(&self, name: &str) -> Result<Option<sys::realm_class_key_t>, RealmError> {
+        let raw = value::c_string(name)?;
+        let mut found = false;
+        let mut info = sys::realm_class_info_t::default();
+
+        // SAFETY: `raw` outlives the call and the out-params are ours.
+        if !unsafe { sys::realm_find_class(self.ptr, raw.as_ptr(), &raw mut found, &raw mut info) }
+        {
+            return Err(last_error());
+        }
+
+        Ok(found.then_some(info.key))
     }
 
     /// Looks up a class key by its on-disk name.
@@ -537,24 +744,40 @@ mod tests {
                     .rows
             };
 
-            let files_before = {
+            // Detach the first two usages of one set through the production write path.
+            let (set_index, erased, files_before) = {
                 let realm = Realm::open_for_write(path).expect("failed to open for write");
-                let before = realm
-                    .beatmap_set_file_count(0)
-                    .expect("failed to count files");
-                assert!(before > 0, "first beatmap set has no files to erase");
+                let sets = realm.beatmap_sets().expect("failed to read beatmap sets");
+                let set = sets
+                    .iter()
+                    .find(|s| s.files.len() >= 2)
+                    .expect("no beatmap set with two files to erase");
+
+                let removals: Vec<_> = set.files[..2]
+                    .iter()
+                    .map(|f| Removal {
+                        set_index: set.index,
+                        file_index: f.index,
+                    })
+                    .collect();
 
                 realm
-                    .erase_beatmap_set_file(0, 0)
-                    .expect("failed to erase file usage");
-                before
+                    .erase_usages(&removals)
+                    .expect("failed to erase usages");
+                (set.index, removals.len(), set.files.len())
             };
 
             let realm = Realm::open_read_only(path).expect("failed to reopen");
 
+            let after = realm
+                .beatmap_sets()
+                .expect("failed to reread beatmap sets")
+                .into_iter()
+                .find(|s| s.index == set_index)
+                .expect("the edited set disappeared");
             assert_eq!(
-                realm.beatmap_set_file_count(0).expect("failed to recount"),
-                files_before - 1,
+                after.files.len(),
+                files_before - erased,
                 "the erase did not survive the commit"
             );
             assert_eq!(
@@ -582,9 +805,42 @@ mod tests {
             };
             assert_eq!(
                 usages(&realm),
-                usages_before - 1,
+                usages_before - erased,
                 "erasing the list entry did not delete the embedded usage row"
             );
+        });
+    }
+
+    /// Reference counts must span every owner, and dedup must be visible in the numbers.
+    #[test]
+    fn counts_usages_across_all_owners() {
+        with_sample(|path| {
+            let realm = Realm::open_read_only(path).expect("failed to open");
+
+            let counts = realm.usage_counts().expect("failed to count usages");
+            let sets = realm.beatmap_sets().expect("failed to read beatmap sets");
+
+            let total: u32 = counts.values().sum();
+            let from_sets: u32 = sets
+                .iter()
+                .map(|s| u32::try_from(s.files.len()).expect("set has a sane file count"))
+                .sum();
+
+            // Scores and skins own usages too, so the global total must exceed what beatmap
+            // sets alone account for. Counting only sets is the bug this guards against.
+            assert!(
+                total > from_sets,
+                "expected owners beyond beatmap sets: {total} total vs {from_sets} from sets"
+            );
+
+            // Deduplication is the whole reason refcounting exists: some blob must be shared.
+            assert!(
+                counts.values().any(|&n| n > 1),
+                "expected at least one blob shared by more than one usage"
+            );
+
+            let files: usize = sets.iter().map(|s| s.files.len()).sum();
+            assert!(files > 0, "expected beatmap sets to own files");
         });
     }
 

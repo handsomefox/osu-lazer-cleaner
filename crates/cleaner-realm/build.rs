@@ -10,7 +10,11 @@ use std::path::{Path, PathBuf};
 const REALM_CORE_DIR: &str = "vendor/realm-core";
 
 fn main() {
-    let vendor = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(REALM_CORE_DIR);
+    // Read at runtime, not through `env!`. Cargo fingerprints build scripts by content, so a
+    // compile-time path can be baked in from a different checkout that shares this file.
+    let manifest =
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is always set by cargo");
+    let vendor = PathBuf::from(manifest).join(REALM_CORE_DIR);
     let header = vendor.join("src/realm.h");
 
     assert!(

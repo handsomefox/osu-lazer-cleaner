@@ -1,0 +1,21 @@
+[package]
+name = "cleaner-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Desktop interface for osu-lazer-cleaner"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "osu-lazer-cleaner"
+path = "src/main.rs"
+
+[dependencies]
+cleaner-core = { path = "../cleaner-core" }
+crossbeam-channel.workspace = true
+eframe.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
