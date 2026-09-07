@@ -1,0 +1,21 @@
+[package]
+name = "cleaner-realm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Safe Rust bindings to realm-core's C API, scoped to what an osu!lazer library cleaner needs"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true
+cmake.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

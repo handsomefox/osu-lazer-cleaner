@@ -1,0 +1,4 @@
+[submodule "crates/cleaner-realm/vendor/realm-core"]
+	path = crates/cleaner-realm/vendor/realm-core
+	url = https://github.com/realm/realm-core.git
+	shallow = true
