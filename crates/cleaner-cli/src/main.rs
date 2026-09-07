@@ -75,6 +75,10 @@ enum SnapshotCommand {
     Restore {
         /// Snapshot identifier, as reported by `snapshot list`.
         id: String,
+
+        /// Confirm the restore. Without this, the command only reports what it would do.
+        #[arg(long)]
+        confirm: bool,
     },
 
     /// Delete a snapshot permanently, reclaiming its space.
@@ -388,7 +392,7 @@ fn snapshots(cli: &Cli, command: &SnapshotCommand) -> Result<(), Box<dyn std::er
             Ok(())
         }
 
-        SnapshotCommand::Restore { id } => {
+        SnapshotCommand::Restore { id, confirm } => {
             let entry = find(&available, id)?;
 
             // Snapshots are listed newest first, and each was taken against the library as the
@@ -404,6 +408,17 @@ fn snapshots(cli: &Cli, command: &SnapshotCommand) -> Result<(), Box<dyn std::er
                 )
                 .into());
             }
+
+            if !confirm {
+                println!(
+                    "would put {} files ({}) back and remove snapshot {id}",
+                    entry.manifest.blobs.len(),
+                    human_bytes(entry.manifest.bytes())
+                );
+                println!("re-run with --confirm to do it");
+                return Ok(());
+            }
+
             let restored = cleaner_core::restore(&library, entry, |progress| match progress {
                 cleaner_core::CleanProgress::UpdatingDatabase => {
                     eprint!("\rupdating the database");

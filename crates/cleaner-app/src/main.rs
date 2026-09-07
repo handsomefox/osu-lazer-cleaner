@@ -6,6 +6,7 @@
 use eframe::egui;
 mod app;
 mod diagnostics;
+mod theme;
 mod worker;
 
 use std::process::ExitCode;
