@@ -83,7 +83,15 @@ fn build_realm_core(vendor: &Path) -> PathBuf {
         .define("REALM_NO_TESTS", "ON")
         // realm-core's vendored externals predate CMake 4's policy floor.
         .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
-        .define("CMAKE_BUILD_TYPE", "Release");
+        // Always build realm-core optimised, whichever profile cargo is using. We never debug
+        // into it, and an unoptimised realm-core makes every scan slower.
+        //
+        // Naming the profile also keeps the output layout predictable. Left to itself, cmake-rs
+        // configures with one build type and then builds `--config RelWithDebInfo`, which
+        // multi-config generators such as Visual Studio honour by nesting artifacts in a
+        // directory nobody went looking in. Ninja, used by the cross-build, ignores the whole
+        // question, so the mismatch only appears on a native Windows build.
+        .profile("Release");
 
     if is_clang_cl() {
         // realm-core defines `REALM_COMPILER_SSE` unconditionally for 64-bit x86
@@ -115,27 +123,39 @@ fn is_clang_cl() -> bool {
     toolchain.contains("clang-cl") || cxx.contains("clang")
 }
 
+/// The libraries `RealmFFIStatic` needs, in link order.
+///
+/// These are `CMake` `OUTPUT_NAME`s, which differ from the target names: `RealmFFIStatic`
+/// becomes `realm-ffi-static`, `ObjectStore` becomes `realm-object-store`, `QueryParser`
+/// becomes `realm-parser`, and `Storage` becomes `realm`. Dependents come before their
+/// dependencies, as static linking requires. `Bid` is an object library that is already folded
+/// into the `Storage` archive.
+const REALM_LIBRARIES: &[&str] = &[
+    "realm-ffi-static",
+    "realm-object-store",
+    "realm-parser",
+    "realm",
+];
+
 /// Tells cargo where the static libraries are and which ones to link.
 fn emit_link_flags(build_dir: &Path) {
-    // `build_target` skips the install step, so artifacts stay in the CMake tree.
+    // `build_target` skips the install step, so artifacts stay in the CMake tree. Where in
+    // that tree depends on the generator: Ninja writes one file per target directory, while
+    // the Visual Studio generator nests each build configuration in its own subdirectory. So
+    // each library is located by name rather than by guessing at the layout.
     let root = build_dir.join("build");
 
-    for dir in walk_dirs(&root) {
-        println!("cargo:rustc-link-search=native={}", dir.display());
-    }
+    for library in REALM_LIBRARIES {
+        let Some(directory) = find_library(&root, library) else {
+            panic!(
+                "built realm-core but could not find {library} under {}; the CMake generator \
+                 may have used a layout this build script does not understand",
+                root.display()
+            );
+        };
 
-    // These are CMake `OUTPUT_NAME`s, which differ from the target names used above:
-    // RealmFFIStatic -> realm-ffi-static, ObjectStore -> realm-object-store,
-    // QueryParser -> realm-parser, Storage -> realm. `Bid` is an OBJECT library and is
-    // already folded into librealm.a, so it is not linked separately.
-    // Order matters for static linking: dependents before their dependencies.
-    for lib in [
-        "realm-ffi-static",
-        "realm-object-store",
-        "realm-parser",
-        "realm",
-    ] {
-        println!("cargo:rustc-link-lib=static={lib}");
+        println!("cargo:rustc-link-search=native={}", directory.display());
+        println!("cargo:rustc-link-lib=static={library}");
     }
 
     // realm-core is C++, so the C++ runtime has to come along. MSVC links its own runtime
@@ -145,35 +165,38 @@ fn emit_link_flags(build_dir: &Path) {
     }
 }
 
-/// Collects every directory under `root` that contains a static library.
-fn walk_dirs(root: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
+/// Finds the directory holding a static library, searching the whole build tree.
+///
+/// Accepts either naming convention, because the same source builds as `realm.lib` under MSVC
+/// and `librealm.a` everywhere else.
+fn find_library(root: &Path, name: &str) -> Option<PathBuf> {
+    let candidates = [format!("{name}.lib"), format!("lib{name}.a")];
     let mut stack = vec![root.to_path_buf()];
 
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
 
-        let mut has_lib = false;
         for entry in entries.flatten() {
             let path = entry.path();
+
             if path.is_dir() {
                 stack.push(path);
-            } else if path
-                .extension()
-                .is_some_and(|ext| ext == "a" || ext == "lib")
-            {
-                has_lib = true;
+                continue;
             }
-        }
 
-        if has_lib {
-            found.push(dir);
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            if candidates.iter().any(|candidate| candidate == file_name) {
+                return Some(directory);
+            }
         }
     }
 
-    found
+    None
 }
 
 /// Generates Rust declarations for the `realm_*` C API.
