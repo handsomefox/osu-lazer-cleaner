@@ -10,23 +10,38 @@
 
 /// Releases the console this process was given, before the window opens.
 ///
-/// A run from a shell keeps that shell's console, which stays where it was. A double-click
-/// from Explorer got a console of its own, which closes here after showing for about a frame.
+/// A run from a shell detaches and leaves that shell's window alone. A double-click from
+/// Explorer got a console of its own, which is hidden first so it shows for about a frame
+/// rather than until the window appears.
 #[cfg(windows)]
 pub(crate) fn release() {
-    use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleWindow};
+    use windows_sys::Win32::System::Console::{
+        FreeConsole, GetConsoleProcessList, GetConsoleWindow,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};
 
-    #[expect(
-        clippy::multiple_unsafe_ops_per_block,
-        reason = "hiding the console window and freeing it are one operation"
-    )]
-    // SAFETY: both calls take no pointers we own and are safe to make with no console, where
-    // `GetConsoleWindow` returns null and `ShowWindow` ignores it.
-    unsafe {
-        ShowWindow(GetConsoleWindow(), SW_HIDE);
-        FreeConsole();
+    // Hiding a console window this process does not own would hide the terminal the user
+    // launched it from. `GetConsoleProcessList` reports how many processes share the console;
+    // one means Explorer allocated it for us alone.
+    let mut owners = [0_u32; 2];
+
+    // SAFETY: the buffer is ours and its length is passed correctly. A failure returns zero,
+    // which is not one, so the window is left alone.
+    let alone = unsafe { GetConsoleProcessList(owners.as_mut_ptr(), 2) } == 1;
+
+    if alone {
+        // SAFETY: `GetConsoleWindow` borrows nothing, and `ShowWindow` ignores the null handle
+        // it returns when there is no console.
+        let window = unsafe { GetConsoleWindow() };
+        // SAFETY: the handle came from `GetConsoleWindow` and is not stored.
+        unsafe { ShowWindow(window, SW_HIDE) };
     }
+
+    // Detaching never touches another process's window, and destroys a console once its last
+    // process leaves.
+    //
+    // SAFETY: borrows nothing, and is safe to call with no console attached.
+    unsafe { FreeConsole() };
 }
 
 #[cfg(not(windows))]
