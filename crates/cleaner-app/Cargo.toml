@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Desktop interface for osu-lazer-cleaner"
+description = "Desktop and command-line interfaces for osu-lazer-cleaner"
 
 [lints]
 workspace = true
@@ -14,9 +14,14 @@ name = "osu-lazer-cleaner"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 cleaner-core = { path = "../cleaner-core" }
 crossbeam-channel.workspace = true
 jiff.workspace = true
 eframe.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

@@ -11,13 +11,21 @@ The workspace is layered so that everything portable stays testable on Linux.
   `crates/cleaner-realm/vendor/`, pinned to the tag matching the Realm .NET version osu!lazer
   uses. `build.rs` compiles it and generates the bindings.
 - `cleaner-core` holds every rule: storage discovery, `.osu` and `.osb` parsing, category
-  assignment, scanning, and snapshots. It depends on no platform and no interface.
-- `cleaner-app` is the egui interface, and the only crate allowed to depend on egui.
-- `cleaner-cli` is the command-line interface.
+  assignment, scanning, and snapshots. It depends on no interface. The two places it touches a
+  platform are `storage` and `running`, both behind `cfg` with a portable fallback, so the rest
+  stays testable anywhere.
+- `cleaner-app` holds both interfaces and builds the one executable. It is the only crate
+  allowed to depend on egui. `main` opens the window when there are no arguments and hands over
+  to `cli` when there are.
 
 A category is data in `cleaner_core::Category`, not a function that removes files. Adding one
 means adding a variant and teaching `scan::categorise` to recognise it, not adding a new
 removal path.
+
+Totals are computed, never stored. `Plan::category_totals` and `Plan::selected_totals` both go
+through `plan::freed_blobs`, which is the one place that knows a blob leaves only when every
+usage pointing at it is being detached. A field holding a precomputed count would go stale the
+moment the user holds a beatmap set back.
 
 ## Do not weaken these checks
 
@@ -34,8 +42,13 @@ Each rule comes from osu!lazer's own source. Read the source before changing one
   `AUTOMATIC` and `MANUAL`, and neither is used here.
 - **Scanning copies the database first.** Opening a Realm database creates `.lock` and
   `.management/` beside it even read-only, so scanning in place would write to the library.
-- **A clean moves bytes into a snapshot, and never deletes them.** Deleting a snapshot is the
-  only destructive operation, and it confirms first.
+- **A clean gives up the library's link to a file only once the snapshot holds the same file.**
+  `preserve_blob` hard-links it in first and `release_blob` re-checks the size before it
+  unlinks. On one filesystem those two names are one inode, so no bytes move and none are lost.
+  Deleting a snapshot is the only operation that destroys anything, and it confirms first.
+- **Recovery data is published before the database commits.** A clean that fails before its
+  commit removes its own half-built snapshot, because those links would pin blobs the library
+  still owns. Never reorder those steps.
 - **Paths are re-checked immediately before they are touched**, independently of the check made
   while scanning. A plan can be minutes old by the time it runs.
 
@@ -57,6 +70,16 @@ directory. Cover the rejection paths, not just the successes: a snapshot outside
 must be refused, an already-missing file must not be an error, and a shared blob must survive
 a clean that gives up one of its references.
 
-Tests that need a real library read `ref/client.realm` and skip when it is absent, so CI never
-exercises them. A committable synthetic database would fix that and is worth building once the
-schema this depends on has settled.
+Everything that must run everywhere uses `cleaner_realm::fixture`, which builds a scratch
+database through the C API under the `test-support` feature. `cleaner-core` turns that feature
+on for its own tests, and `end_to_end.rs` uses it to run whole cleans, restores, and deletes
+against a real database. Nothing there needs a personal library.
+
+Tests that want a library osu!lazer itself wrote read `ref/client-slim.realm`, falling back to
+`ref/client.realm`, and skip when neither is there. `ref/` is gitignored, so CI never runs them.
+Make the slim copy once with:
+
+```
+cargo run -p cleaner-realm --features test-support --example slim -- \
+    ref/client.realm ref/client-slim.realm 400
+```

@@ -7,11 +7,11 @@
 use crate::catalog::{self, Category};
 use crate::error::ScanError;
 use crate::osu::{self, SourceKind};
-use crate::plan::{Candidate, Group, Plan, Progress, Timings};
+use crate::plan::{Candidate, Group, NO_SET, NO_SET_INDEX, Plan, Progress, SetId, Timings};
 use crate::skin;
 use crate::storage::Library;
 use cleaner_realm::Realm;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 /// Extension of a difficulty file. Never a removal candidate.
@@ -62,7 +62,8 @@ pub fn build_plan(
     candidates.extend(orphan_blobs(&sizes, &usage_counts));
     progress(Progress::Done);
 
-    let mut plan = assemble(candidates, selected, total_sets, &sizes);
+    let titles = set_titles(&sets, &candidates);
+    let mut plan = assemble(candidates, titles, selected, total_sets, &sizes);
     plan.timings = Timings {
         measure_ms,
         database_ms,
@@ -158,8 +159,6 @@ fn classify_set(
     sizes: &HashMap<String, u64>,
     usage_counts: &HashMap<String, u32>,
 ) -> (Vec<Candidate>, bool) {
-    let owned: BTreeSet<String> = set.files.iter().map(|f| f.filename.clone()).collect();
-
     // Start from what the database already knows, which costs nothing to read.
     let mut references = osu::References {
         audio: set.audio.iter().cloned().collect(),
@@ -169,37 +168,36 @@ fn classify_set(
 
     // Only open the difficulty files when the set owns something they might explain. Most
     // sets are just difficulties, one audio track, and one background, and reading those
-    // files was over 99% of a scan's time on a large library.
+    // files was over 99% of a scan's time on a large library. Building the name index costs
+    // one allocation per file, so it waits until something is going to use it.
     let parsed = needs_parsing(set, &references);
     if parsed {
+        let owned: BTreeSet<String> = set.files.iter().map(|f| f.filename.clone()).collect();
         references.absorb(read_references(library, set, &owned));
     }
 
-    // Files a beatmap cannot play without. These are never candidates, whatever category
-    // else they might match.
-    let mut protected: BTreeSet<String> = references.audio.clone();
+    // Files a beatmap cannot play without. These are never candidates, whatever category else
+    // they might match. Names go into a set folded the way lazer folds them, because comparing
+    // each file against each protected name in turn is quadratic in a set of thirty
+    // difficulties.
+    let mut protected: HashSet<String> = references
+        .audio
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
     protected.extend(
         set.files
             .iter()
-            .map(|f| f.filename.clone())
-            .filter(|name| has_extension(name, DIFFICULTY_EXTENSION)),
+            .filter(|f| has_extension(&f.filename, DIFFICULTY_EXTENSION))
+            .map(|f| f.filename.to_ascii_lowercase()),
     );
 
     let candidates = set
         .files
         .iter()
-        .filter(|file| {
-            !protected
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(&file.filename))
-        })
+        .filter(|file| !protected.contains(&file.filename.to_ascii_lowercase()))
         .filter_map(|file| {
             let category = categorise(&file.filename, &references)?;
-            let remaining = usage_counts
-                .get(&file.hash)
-                .copied()
-                .unwrap_or(0)
-                .saturating_sub(1);
 
             Some(Candidate {
                 set_index: set.index,
@@ -209,7 +207,7 @@ fn classify_set(
                 hash: file.hash.clone(),
                 bytes: sizes.get(&file.hash).copied().unwrap_or(0),
                 category,
-                frees_blob: remaining == 0,
+                usage_count: usage_counts.get(&file.hash).copied().unwrap_or(0),
             })
         })
         .collect();
@@ -293,11 +291,18 @@ fn categorise(filename: &str, references: &osu::References) -> Option<Category> 
 }
 
 /// Reads and parses every difficulty and storyboard in a set.
+///
+/// Reading beatmaps is by far the slowest part of a scan: 145 of the 147 seconds a 185 GB
+/// library took, against 0.4 seconds walking its 454,820 files. Almost all of those bytes are
+/// `[HitObjects]`, and for most sets that section can name nothing the rest of the file does
+/// not, so `sample_depth` decides whether to read it at all.
 fn read_references(
     library: &Library,
     set: &cleaner_realm::BeatmapSet,
     owned: &BTreeSet<String>,
 ) -> osu::References {
+    let depth = sample_depth(set);
+
     let sources: Vec<(String, SourceKind)> = set
         .files
         .iter()
@@ -310,12 +315,83 @@ fn read_references(
                 return None;
             };
 
-            let text = std::fs::read(library.blob_path(&file.hash)).ok()?;
-            Some((String::from_utf8_lossy(&text).into_owned(), kind))
+            // A storyboard has no `[HitObjects]` and is small, so it is always read whole.
+            let stop_at_hit_objects = depth == Depth::Events && kind == SourceKind::Difficulty;
+            Some((
+                read_source(&library.blob_path(&file.hash), stop_at_hit_objects)?,
+                kind,
+            ))
         })
         .collect();
 
     osu::parse_all(sources.iter().map(|(t, k)| (t.as_str(), *k)), owned)
+}
+
+/// How much of a difficulty has to be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Depth {
+    /// Up to `[HitObjects]`, which is where the sections that name files end.
+    Events,
+    /// All of it, because the set owns a sample only a hit object can name.
+    Samples,
+}
+
+/// Decides whether a set's `[HitObjects]` and `[TimingPoints]` are worth reading.
+///
+/// Those two sections only ever name sample files. `[TimingPoints]` resolves a custom sample
+/// index against the files the set owns, and a hit object either does the same or names a file
+/// outright. A set that owns no sample beyond its audio track therefore has nothing for them to
+/// find, and skipping them skips most of every difficulty.
+///
+/// Getting this wrong can only leave a file in the library: an unread section means one fewer
+/// reference, which means one fewer candidate.
+fn sample_depth(set: &cleaner_realm::BeatmapSet) -> Depth {
+    let owns_a_sample = set.files.iter().any(|file| {
+        osu::AUDIO_EXTENSIONS
+            .iter()
+            .any(|extension| has_extension(&file.filename, extension))
+            && !set
+                .audio
+                .iter()
+                .any(|track| track.eq_ignore_ascii_case(&file.filename))
+    });
+
+    if owns_a_sample {
+        Depth::Samples
+    } else {
+        Depth::Events
+    }
+}
+
+/// Reads a source file, optionally stopping once `[HitObjects]` begins.
+///
+/// Returns `None` when the file cannot be read, which a scan treats as a set with nothing to
+/// say rather than as an error.
+fn read_source(path: &Path, stop_at_hit_objects: bool) -> Option<String> {
+    if !stop_at_hit_objects {
+        let bytes = std::fs::read(path).ok()?;
+        return Some(String::from_utf8_lossy(&bytes).into_owned());
+    }
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut text = String::new();
+    let mut line = Vec::new();
+
+    loop {
+        line.clear();
+        if std::io::BufRead::read_until(&mut reader, b'\n', &mut line).ok()? == 0 {
+            break;
+        }
+
+        let decoded = String::from_utf8_lossy(&line);
+        if decoded.trim().eq_ignore_ascii_case("[HitObjects]") {
+            break;
+        }
+        text.push_str(&decoded);
+    }
+
+    Some(text)
 }
 
 /// Finds blobs on disk that no usage points at.
@@ -330,21 +406,37 @@ fn orphan_blobs(
         .iter()
         .filter(|(hash, _)| !usage_counts.contains_key(*hash))
         .map(|(hash, bytes)| Candidate {
-            set_index: usize::MAX,
-            set_id: [0; 16],
-            file_index: usize::MAX,
+            set_index: NO_SET_INDEX,
+            set_id: NO_SET,
+            file_index: NO_SET_INDEX,
             filename: hash.clone(),
             hash: hash.clone(),
             bytes: *bytes,
             category: Category::Unreferenced,
-            frees_blob: true,
+            usage_count: 0,
         })
         .collect()
 }
 
-/// Groups candidates by category and computes totals.
+/// Labels every beatmap set that owns at least one candidate.
+///
+/// Sets with nothing to clean are left out: a large library holds tens of thousands of them,
+/// and the browse list never shows one.
+fn set_titles(
+    sets: &[cleaner_realm::BeatmapSet],
+    candidates: &[Candidate],
+) -> BTreeMap<SetId, String> {
+    let owners: HashSet<SetId> = candidates.iter().map(|c| c.set_id).collect();
+    sets.iter()
+        .filter(|set| owners.contains(&set.id) && !set.title.is_empty())
+        .map(|set| (set.id, set.title.clone()))
+        .collect()
+}
+
+/// Groups candidates by category.
 fn assemble(
     candidates: Vec<Candidate>,
+    set_titles: BTreeMap<SetId, String>,
     selected: &HashSet<Category, impl std::hash::BuildHasher>,
     sets_scanned: usize,
     sizes: &HashMap<String, u64>,
@@ -359,32 +451,18 @@ fn assemble(
 
     let groups = Category::ALL
         .iter()
-        .map(|&category| {
-            let candidates = by_category.remove(&category).unwrap_or_default();
-
-            // Count each file once, so one shared between beatmap sets does not inflate the
-            // totals. The candidate list keeps every reference, because each has to be
-            // detached, but users should see how many files actually leave.
-            let mut seen = HashSet::new();
-            let freed: Vec<u64> = candidates
-                .iter()
-                .filter(|c| c.frees_blob && seen.insert(c.hash.as_str()))
-                .map(|c| c.bytes)
-                .collect();
-
-            Group {
-                category,
-                candidates,
-                files: freed.len(),
-                bytes: freed.iter().sum(),
-                selected: selected.contains(&category),
-            }
+        .map(|&category| Group {
+            category,
+            candidates: by_category.remove(&category).unwrap_or_default(),
+            selected: selected.contains(&category),
         })
         .collect();
 
     Plan {
         timings: Timings::default(),
         groups,
+        set_titles,
+        excluded: HashSet::new(),
         sets_scanned,
         blobs_total: sizes.len(),
         bytes_total: sizes.values().sum(),
@@ -397,22 +475,14 @@ fn assemble(
 /// cheaper than a `stat` per database row: a large library holds hundreds of thousands of
 /// blobs.
 ///
-/// The walk runs in parallel across the store's top-level shards. osu!lazer names each blob
-/// after its own hash and files it under `files/<first character>/`, so the tree is already
-/// split sixteen ways and each shard can be walked independently. This matters most on
-/// Windows, where directory traversal is the slowest part of a scan by a wide margin.
+/// The walk runs in parallel across the store's directories. osu!lazer names each blob after
+/// its own hash and files it under `files/<first character>/<first two characters>/`, so the
+/// tree is already split 256 ways and each directory can be walked independently. Splitting at
+/// the second level rather than the first matters because the work has to divide evenly: with
+/// sixteen units and sixteen workers, one large directory holds up the whole scan. This is the
+/// slowest part of a scan on Windows by a wide margin.
 fn measure_blobs(library: &Library, progress: &mut impl FnMut(Progress)) -> HashMap<String, u64> {
-    let files_dir = library.files_dir();
-
-    let Ok(entries) = std::fs::read_dir(&files_dir) else {
-        return HashMap::new();
-    };
-
-    let shards: Vec<std::path::PathBuf> = entries
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|entry| entry.path())
-        .collect();
+    let shards = blob_shards(&library.files_dir());
 
     let next = std::sync::atomic::AtomicUsize::new(0);
     let counted = std::sync::atomic::AtomicUsize::new(0);
@@ -457,6 +527,33 @@ fn measure_blobs(library: &Library, progress: &mut impl FnMut(Progress)) -> Hash
         .into_iter()
         .flatten()
         .collect()
+}
+
+/// Lists the directories a blob store's walk can be split across.
+///
+/// Prefers the second level, and falls back to the first for a store lazer has not filled in
+/// yet, or to the store itself when neither can be read.
+fn blob_shards(files_dir: &Path) -> Vec<std::path::PathBuf> {
+    let subdirectories = |path: &Path| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(path).map_or_else(
+            |_| Vec::new(),
+            |entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|entry| entry.path())
+                    .collect()
+            },
+        )
+    };
+
+    let first: Vec<_> = subdirectories(files_dir);
+    if first.is_empty() {
+        return Vec::new();
+    }
+
+    let second: Vec<_> = first.iter().flat_map(|dir| subdirectories(dir)).collect();
+    if second.is_empty() { first } else { second }
 }
 
 /// Measures every blob under one shard directory.
@@ -529,6 +626,232 @@ mod tests {
         assert!(has_extension("あ.MP4", ".mp4"));
     }
 
+    #[test]
+    fn a_video_two_sets_share_counts_once_and_still_frees_its_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join(crate::storage::DATABASE_FILENAME),
+            b"stub",
+        )
+        .unwrap();
+        let library = Library::open(directory.path()).unwrap();
+
+        let first = set_with(&["intro.mp4"], &[], &[]);
+        let mut second = first.clone();
+        second.index = 1;
+        second.id = [8; 16];
+        second.title = "Artist - Second".to_owned();
+
+        let hash = first.files[0].hash.clone();
+        let sizes = HashMap::from([(hash.clone(), 500)]);
+        let usage_counts = HashMap::from([(hash, 2)]);
+
+        let (mut candidates, _) = classify_set(&library, &first, &sizes, &usage_counts);
+        candidates.extend(classify_set(&library, &second, &sizes, &usage_counts).0);
+        let sets = [first, second];
+        let titles = set_titles(&sets, &candidates);
+        let plan = assemble(
+            candidates,
+            titles,
+            &HashSet::from([Category::Videos]),
+            2,
+            &sizes,
+        );
+
+        let totals = plan.category_totals(Category::Videos);
+        assert_eq!((totals.files, totals.bytes, totals.references), (1, 500, 2));
+        assert_eq!(plan.selected_totals().files, 1);
+        assert_eq!(plan.selected_totals().bytes, 500);
+
+        let report = crate::report::summarise(&plan, "test");
+        let category = report
+            .categories
+            .iter()
+            .find(|group| group.category == "videos")
+            .unwrap();
+        assert_eq!(category.kept_shared, 0);
+        assert_eq!(report.sharing.shared_references, 2);
+
+        assert_eq!(plan.sets_in(Category::Videos).len(), 2);
+        assert_eq!(plan.sets_in(Category::Videos)[0].title, "Artist - First");
+    }
+
+    #[test]
+    fn sets_with_nothing_to_clean_are_not_labelled() {
+        let with_video = set_with(&["intro.mp4"], &[], &[]);
+        let mut without = with_video.clone();
+        without.index = 1;
+        without.id = [8; 16];
+        without.files.clear();
+
+        let candidates = vec![Candidate {
+            set_index: 0,
+            set_id: with_video.id,
+            file_index: 0,
+            filename: "intro.mp4".to_owned(),
+            hash: "a".repeat(64),
+            bytes: 1,
+            category: Category::Videos,
+            usage_count: 1,
+        }];
+
+        let titles = set_titles(&[with_video, without], &candidates);
+        assert_eq!(titles.len(), 1);
+        assert_eq!(titles.get(&[7; 16]).unwrap(), "Artist - First");
+    }
+
+    /// Classifies one set against a library with no blobs on disk.
+    fn classify(set: &cleaner_realm::BeatmapSet) -> Vec<Candidate> {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join(crate::storage::DATABASE_FILENAME),
+            b"stub",
+        )
+        .unwrap();
+        let library = Library::open(directory.path()).unwrap();
+
+        let usage_counts = set.files.iter().map(|f| (f.hash.clone(), 1)).collect();
+        classify_set(&library, set, &HashMap::new(), &usage_counts).0
+    }
+
+    #[test]
+    fn difficulties_and_audio_are_never_candidates() {
+        let set = set_with(
+            &["Map [Easy].osu", "Map [Hard].OSU", "Audio.MP3", "intro.mp4"],
+            &["audio.mp3"],
+            &[],
+        );
+
+        let names: Vec<_> = classify(&set)
+            .into_iter()
+            .map(|candidate| candidate.filename)
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["intro.mp4"],
+            "only the video may be removed; the case of the others must not matter"
+        );
+    }
+
+    #[test]
+    fn a_video_named_as_the_audio_track_is_protected() {
+        // A set whose `AudioFilename` points at the video is unusual and legal. Removing it
+        // would leave the beatmap silent.
+        let set = set_with(&["Map.osu", "intro.mp4"], &["INTRO.MP4"], &[]);
+        assert!(
+            classify(&set).is_empty(),
+            "the audio track is protected however it is spelled"
+        );
+    }
+
+    #[test]
+    fn a_second_level_blob_store_is_walked_directory_by_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let files = directory.path().join("files");
+        for shard in ["a", "b"] {
+            for nested in ["0", "1"] {
+                std::fs::create_dir_all(files.join(shard).join(format!("{shard}{nested}")))
+                    .unwrap();
+            }
+        }
+
+        let shards = blob_shards(&files);
+        assert_eq!(shards.len(), 4, "one unit per second-level directory");
+        assert!(shards.iter().all(|path| path.starts_with(&files)));
+    }
+
+    #[test]
+    fn a_blob_store_lazer_has_not_nested_yet_still_divides() {
+        let directory = tempfile::tempdir().unwrap();
+        let files = directory.path().join("files");
+        std::fs::create_dir_all(files.join("a")).unwrap();
+
+        assert_eq!(blob_shards(&files).len(), 1, "fall back to the first level");
+        assert!(blob_shards(&directory.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn a_set_with_no_samples_stops_before_the_hit_objects() {
+        let mut set = set_with(
+            &["Map.osu", "audio.mp3", "bg.jpg"],
+            &["audio.mp3"],
+            &["bg.jpg"],
+        );
+        assert_eq!(sample_depth(&set), Depth::Events);
+
+        // Its own audio track does not count, whatever case it is written in.
+        set.audio = vec!["AUDIO.MP3".to_owned()];
+        assert_eq!(sample_depth(&set), Depth::Events);
+    }
+
+    #[test]
+    fn a_set_owning_a_sample_is_read_to_the_end() {
+        for sample in ["soft-hitclap.wav", "clap.ogg", "voice.mp3"] {
+            let set = set_with(&["Map.osu", "audio.mp3", sample], &["audio.mp3"], &[]);
+            assert_eq!(
+                sample_depth(&set),
+                Depth::Samples,
+                "{sample} can only be named by a hit object"
+            );
+        }
+    }
+
+    #[test]
+    fn reading_stops_at_the_hit_objects_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Map.osu");
+        std::fs::write(
+            &path,
+            "[General]\nAudioFilename: audio.mp3\n[Events]\n0,0,\"bg.jpg\",0,0\n\
+             [HitObjects]\n256,192,1000,1,0,0:0:0:0:secret.wav\n",
+        )
+        .unwrap();
+
+        let stopped = read_source(&path, true).unwrap();
+        assert!(stopped.contains("bg.jpg"), "the events must survive");
+        assert!(!stopped.contains("secret.wav"), "the hit objects must not");
+        assert!(!stopped.contains("[HitObjects]"));
+
+        let whole = read_source(&path, false).unwrap();
+        assert!(whole.contains("secret.wav"));
+
+        assert!(read_source(&directory.path().join("missing.osu"), true).is_none());
+    }
+
+    #[test]
+    fn a_shorter_read_can_only_leave_files_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join(crate::storage::DATABASE_FILENAME),
+            b"stub",
+        )
+        .unwrap();
+        let library = Library::open(directory.path()).unwrap();
+
+        let set = set_with(
+            &["Map.osu", "audio.mp3", "bg.jpg"],
+            &["audio.mp3"],
+            &["bg.jpg"],
+        );
+        let difficulty = library.blob_path(&set.files[0].hash);
+        std::fs::create_dir_all(difficulty.parent().unwrap()).unwrap();
+        std::fs::write(
+            &difficulty,
+            "[General]\nAudioFilename: audio.mp3\n[Events]\n\
+             Sprite,Background,Centre,\"bg.jpg\",320,240\n\
+             [HitObjects]\n256,192,1000,1,0,0:0:0:0:\n",
+        )
+        .unwrap();
+
+        let owned = set.files.iter().map(|f| f.filename.clone()).collect();
+        let references = read_references(&library, &set, &owned);
+        assert!(
+            references.storyboard.contains("bg.jpg"),
+            "everything before the hit objects is still read"
+        );
+    }
+
     fn refs_with_background(name: &str) -> osu::References {
         let mut references = osu::References::default();
         references.backgrounds.insert(name.to_owned());
@@ -538,6 +861,8 @@ mod tests {
     fn set_with(files: &[&str], audio: &[&str], backgrounds: &[&str]) -> cleaner_realm::BeatmapSet {
         cleaner_realm::BeatmapSet {
             index: 0,
+            id: [7; 16],
+            title: "Artist - First".to_owned(),
             files: files
                 .iter()
                 .enumerate()
@@ -547,7 +872,6 @@ mod tests {
                     hash: format!("{index:064}"),
                 })
                 .collect(),
-            id: [0; 16],
             audio: audio.iter().map(|s| (*s).to_owned()).collect(),
             backgrounds: backgrounds.iter().map(|s| (*s).to_owned()).collect(),
         }

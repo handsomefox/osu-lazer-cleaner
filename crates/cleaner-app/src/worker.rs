@@ -42,6 +42,8 @@ pub(crate) enum Command {
     },
     /// Rewrite the database without its free space.
     Compact,
+    /// Delete the copy of the database the last compaction kept.
+    RemoveDatabaseBackup,
 }
 
 /// What the worker reports back.
@@ -80,12 +82,23 @@ pub(crate) enum Event {
     Snapshots {
         /// Snapshots, newest first.
         entries: Vec<SnapshotSummary>,
+        /// The copy of the database a compaction kept, if there is one.
+        backup: Option<BackupSummary>,
     },
     /// Something went wrong.
     Failed {
         /// Message to show.
         message: String,
     },
+}
+
+/// The copy of `client.realm` a compaction kept.
+#[derive(Debug, Clone)]
+pub(crate) struct BackupSummary {
+    /// Where it is, for the window to show.
+    pub(crate) path: PathBuf,
+    /// How many bytes deleting it would reclaim.
+    pub(crate) bytes: u64,
 }
 
 /// A snapshot, reduced to what the interface displays.
@@ -175,79 +188,28 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
     };
 
     match command {
-        Command::OpenLibrary { path } => {
-            let opened = match path {
-                Some(path) => Library::open(&path),
-                None => Library::discover(),
-            };
+        Command::OpenLibrary { path } => open(library, path.as_deref(), events),
 
-            match opened {
-                Ok(found) => {
-                    report(Event::LibraryOpened {
-                        root: found.root().to_path_buf(),
-                        database_bytes: database_bytes(&found),
-                    });
-                    *library = Some(found);
-                }
-                Err(error) => report(Event::Failed {
-                    message: error.to_string(),
-                }),
-            }
-        }
-
-        Command::Scan { selected } => {
-            let Some(library) = library.as_ref() else {
-                report(Event::Failed {
-                    message: "no library is open".to_owned(),
-                });
-                return;
-            };
-
-            let result = cleaner_core::build_plan(library, &selected, |progress| {
-                let _ = events.send(Event::Progress {
-                    message: describe(&progress),
-                });
-            });
-
-            match result {
-                Ok(plan) => report(Event::Scanned {
-                    plan: Box::new(plan),
-                }),
-                Err(error) => report(Event::Failed {
-                    message: error.to_string(),
-                }),
-            }
-        }
+        Command::Scan { selected } => match library.as_ref() {
+            Some(library) => report(scan(library, &selected, events)),
+            None => report(Event::Failed {
+                message: "no library is open".to_owned(),
+            }),
+        },
 
         Command::Clean { plan } => {
-            let Some(library) = library.as_ref() else {
-                return;
-            };
-
-            let options = Options { dry_run: false };
-            let result = cleaner_core::run(library, &plan, &options, |progress| {
-                let _ = events.send(Event::Progress {
-                    message: describe_clean(progress),
-                });
-            });
-
-            match result {
-                Ok(outcome) => report(Event::Cleaned {
-                    files: outcome.detached,
-                    bytes: outcome.bytes,
-                }),
-                Err(error) => report(Event::Failed {
-                    message: error.to_string(),
-                }),
+            if let Some(library) = library.as_ref() {
+                report(clean(library, &plan, events));
+                // A clean that fails after its commit still leaves a snapshot, and the window
+                // has to offer it rather than showing only the error.
+                report(snapshot_event(library));
             }
         }
 
         Command::ListSnapshots => {
-            let Some(library) = library.as_ref() else {
-                return;
-            };
-
-            report(snapshot_event(library));
+            if let Some(library) = library.as_ref() {
+                report(snapshot_event(library));
+            }
         }
 
         Command::RestoreSnapshot { id } => {
@@ -277,7 +239,86 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
                     message: error.to_string(),
                 },
             });
+            report(snapshot_event(library));
         }
+
+        Command::RemoveDatabaseBackup => {
+            let Some(library) = library.as_ref() else {
+                return;
+            };
+
+            match cleaner_core::remove_database_backup(library) {
+                Ok(()) => report(snapshot_event(library)),
+                Err(error) => report(Event::Failed {
+                    message: error.to_string(),
+                }),
+            }
+        }
+    }
+}
+
+/// Finds a library and keeps it for every command that follows.
+fn open(library: &mut Option<Library>, path: Option<&std::path::Path>, events: &Sender<Event>) {
+    let opened = match path {
+        Some(path) => Library::open(path),
+        None => Library::discover(),
+    };
+
+    match opened {
+        Ok(found) => {
+            let _ = events.send(Event::LibraryOpened {
+                root: found.root().to_path_buf(),
+                database_bytes: database_bytes(&found),
+            });
+            *library = Some(found);
+        }
+        Err(error) => {
+            let _ = events.send(Event::Failed {
+                message: error.to_string(),
+            });
+        }
+    }
+}
+
+/// Scans the library, reporting progress as it goes.
+fn scan(
+    library: &Library,
+    selected: &HashSet<cleaner_core::Category>,
+    events: &Sender<Event>,
+) -> Event {
+    let result = cleaner_core::build_plan(library, selected, |progress| {
+        let _ = events.send(Event::Progress {
+            message: describe(&progress),
+        });
+    });
+
+    match result {
+        Ok(plan) => Event::Scanned {
+            plan: Box::new(plan),
+        },
+        Err(error) => Event::Failed {
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Runs the clean the interface confirmed.
+fn clean(library: &Library, plan: &Plan, events: &Sender<Event>) -> Event {
+    let options = Options { dry_run: false };
+    let result = cleaner_core::run(library, plan, &options, |progress| {
+        let _ = events.send(Event::Progress {
+            message: describe_clean(progress),
+        });
+    });
+
+    match result {
+        Ok(outcome) => Event::Cleaned {
+            files: outcome.detached,
+            bytes: outcome.bytes,
+        },
+        Err(error) => Event::Failed {
+            message: error.to_string(),
+        },
     }
 }
 
@@ -331,6 +372,8 @@ fn snapshot_event(library: &Library) -> Event {
     match snapshot::list(library) {
         Ok(entries) => Event::Snapshots {
             entries: entries.iter().map(SnapshotSummary::from).collect(),
+            backup: cleaner_core::database_backup(library)
+                .map(|(path, bytes)| BackupSummary { path, bytes }),
         },
         Err(error) => Event::Failed {
             message: error.to_string(),
@@ -342,11 +385,17 @@ fn snapshot_event(library: &Library) -> Event {
 fn describe_clean(progress: cleaner_core::CleanProgress) -> String {
     match progress {
         cleaner_core::CleanProgress::UpdatingDatabase => "Updating the database".to_owned(),
-        cleaner_core::CleanProgress::Moving { done, total } => {
-            format!("Moving files: {done} of {total}")
+        cleaner_core::CleanProgress::Preserving { done, total } => {
+            format!("Saving files into the snapshot: {done} of {total}")
+        }
+        cleaner_core::CleanProgress::Removing { done, total } => {
+            format!("Removing files from the library: {done} of {total}")
         }
         cleaner_core::CleanProgress::Reattaching { done, total } => {
             format!("Reattaching files to beatmap sets: {done} of {total}")
+        }
+        cleaner_core::CleanProgress::Restoring { done, total } => {
+            format!("Moving files back: {done} of {total}")
         }
     }
 }

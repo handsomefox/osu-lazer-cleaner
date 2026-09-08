@@ -84,7 +84,8 @@ pub fn summarise(plan: &Plan, library: &str) -> Report {
         .groups
         .iter()
         .map(|group| {
-            let mut seen: HashSet<&str> = HashSet::new();
+            let totals = plan.category_totals(group.category);
+            let freed = crate::plan::freed_hashes(group.candidates.iter());
             let mut examples = Vec::new();
             let mut kept_shared = 0;
 
@@ -92,10 +93,10 @@ pub fn summarise(plan: &Plan, library: &str) -> Report {
                 references += 1;
                 all_hashes.insert(candidate.hash.as_str());
 
-                if candidate.frees_blob {
-                    seen.insert(candidate.hash.as_str());
-                } else {
+                if !freed.contains(candidate.hash.as_str()) {
                     kept_shared += 1;
+                }
+                if candidate.is_shared() {
                     shared_references += 1;
                 }
 
@@ -110,9 +111,9 @@ pub fn summarise(plan: &Plan, library: &str) -> Report {
 
             CategoryReport {
                 category: group.category.slug().to_owned(),
-                files: group.files,
+                files: totals.files,
                 references: group.candidates.len(),
-                bytes: group.bytes,
+                bytes: totals.bytes,
                 kept_shared,
                 examples,
             }
@@ -153,11 +154,10 @@ pub fn render(report: &Report) -> String {
         human_bytes(report.library_totals.bytes)
     );
 
-    let total = report.timings.measure_ms + report.timings.database_ms + report.timings.classify_ms;
     let _ = writeln!(
         out,
         "\nscan took {}: {} measuring files, {} reading the database, {} reading beatmaps",
-        seconds(total),
+        seconds(report.timings.total_ms()),
         seconds(report.timings.measure_ms),
         seconds(report.timings.database_ms),
         seconds(report.timings.classify_ms)
@@ -235,7 +235,10 @@ fn extension_of(filename: &str) -> String {
 /// Exposed for callers that want the totals without the rest of the report.
 #[must_use]
 pub fn files_by_category(plan: &Plan) -> HashMap<Category, usize> {
-    plan.groups.iter().map(|g| (g.category, g.files)).collect()
+    plan.totals_by_category()
+        .into_iter()
+        .map(|(category, totals)| (category, totals.files))
+        .collect()
 }
 
 #[cfg(test)]
@@ -243,16 +246,16 @@ mod tests {
     use super::*;
     use crate::plan::{Candidate, Group};
 
-    fn candidate(hash: &str, name: &str, frees: bool) -> Candidate {
+    fn candidate(hash: &str, name: &str, usages: u32) -> Candidate {
         Candidate {
             set_index: 0,
-            set_id: [0; 16],
+            set_id: [1; 16],
             file_index: 0,
             filename: name.to_owned(),
             hash: hash.to_owned(),
             bytes: 10,
             category: Category::Videos,
-            frees_blob: frees,
+            usage_count: usages,
         }
     }
 
@@ -261,12 +264,7 @@ mod tests {
         let plan = Plan {
             groups: vec![Group {
                 category: Category::Videos,
-                candidates: vec![
-                    candidate("aa", "a.mp4", true),
-                    candidate("bb", "b.mp4", false),
-                ],
-                files: 1,
-                bytes: 10,
+                candidates: vec![candidate("aa", "a.mp4", 1), candidate("bb", "b.mp4", 2)],
                 selected: true,
             }],
             ..Plan::default()
@@ -295,8 +293,6 @@ mod tests {
                 .map(|&category| Group {
                     category,
                     candidates: Vec::new(),
-                    files: 0,
-                    bytes: 0,
                     selected: false,
                 })
                 .collect(),

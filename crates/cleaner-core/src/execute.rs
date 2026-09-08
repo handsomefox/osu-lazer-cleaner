@@ -1,9 +1,13 @@
 //! Running a clean, and undoing one.
 //!
-//! The order is deliberate. The database transaction commits first, then the blobs move. If
-//! the process dies between the two, the library holds blobs nothing references, which lazer
-//! sweeps on its next startup. A manifest is saved before either step so an interrupted clean
-//! can be restored. The reverse order would leave the database pointing at files that are gone.
+//! The order is what makes a clean recoverable. Under the database write lock, the plan is
+//! re-checked, every blob it would orphan is linked into the snapshot, and the manifest is
+//! written. Only then does the transaction commit, and only then does the library give up its
+//! own links. Stop the process at any point and either nothing happened or the snapshot holds
+//! the bytes, so a clean the user interrupts never costs a file.
+//!
+//! A clean that fails before it commits takes its half-built snapshot with it, because those
+//! links would otherwise keep blobs alive that the library still owns.
 
 use crate::error::SnapshotError;
 use crate::plan::{Options, Plan};
@@ -18,6 +22,20 @@ use std::path::PathBuf;
 pub enum CleanProgress {
     /// Updating the database.
     UpdatingDatabase,
+    /// Putting files into the snapshot, before the database changes.
+    Preserving {
+        /// Files saved so far.
+        done: usize,
+        /// Files to save in total.
+        total: usize,
+    },
+    /// Removing files from the library, after the database changed.
+    Removing {
+        /// Files removed so far.
+        done: usize,
+        /// Files to remove in total.
+        total: usize,
+    },
     /// Reattaching files to their beatmap sets.
     ///
     /// Counted in beatmap sets rather than files, because the whole thing commits at once and
@@ -28,8 +46,8 @@ pub enum CleanProgress {
         /// Beatmap sets in total.
         total: usize,
     },
-    /// Moving files into the snapshot.
-    Moving {
+    /// Moving files back out of a snapshot.
+    Restoring {
         /// Files moved so far.
         done: usize,
         /// Files to move in total.
@@ -82,10 +100,62 @@ pub fn run(
     check_database_path(library)?;
     let snapshot_dir = snapshot::begin(library)?;
 
+    // `finalise` renames the directory before the commit, so a failure has to be able to find
+    // it under either name.
+    let finalised = std::cell::Cell::new(None);
+    let prepared = prepare(
+        library,
+        &candidates,
+        &snapshot_dir,
+        &finalised,
+        &mut progress,
+    );
+
+    let (removals, final_dir, blobs) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            // Nothing committed, so the links in there hold blobs the library still owns, and
+            // the manifest describes detachments that never happened.
+            snapshot::abandon(library, &snapshot_dir);
+            if let Some(dir) = finalised.take() {
+                snapshot::abandon(library, &dir);
+            }
+            return Err(error);
+        }
+    };
+
+    release_all(library, &final_dir, &blobs, &mut progress)?;
+
+    Ok(Outcome {
+        detached: removals,
+        stashed: blobs.len(),
+        bytes: blobs.iter().map(|(_, size)| size).sum(),
+        snapshot: Some(final_dir),
+        dry_run: false,
+    })
+}
+
+/// What a committed clean produced: usages detached, where the snapshot went, and what it holds.
+type Prepared = (usize, PathBuf, Vec<(String, u64)>);
+
+/// Re-checks the plan, fills the snapshot, and commits the database, in that order.
+///
+/// Returns how many usages were detached, where the snapshot ended up, and what it holds.
+/// Every step runs under the database write lock, so nothing else can import or delete a
+/// beatmap while the snapshot is being built.
+fn prepare(
+    library: &Library,
+    candidates: &[crate::Candidate],
+    snapshot_dir: &std::path::Path,
+    finalised: &std::cell::Cell<Option<PathBuf>>,
+    progress: &mut impl FnMut(CleanProgress),
+) -> Result<Prepared, SnapshotError> {
+    snapshot::validate_snapshot_dir(library, snapshot_dir)?;
+
     // Orphaned blobs have no usage to detach; they are already unreferenced.
     let removals: Vec<Removal> = candidates
         .iter()
-        .filter(|c| c.set_index != usize::MAX)
+        .filter(|c| c.set_index != crate::plan::NO_SET_INDEX)
         .map(|c| Removal {
             set_index: c.set_index,
             file_index: c.file_index,
@@ -93,58 +163,42 @@ pub fn run(
         .collect();
 
     progress(CleanProgress::UpdatingDatabase);
-    let (final_dir, freed) = {
-        let realm = Realm::open_for_write(&library.database())?;
-        realm.erase_usages_with(|realm| {
-            let current = realm.read_library()?;
-            let freed = validate_candidates(&candidates, &current)?;
-            let manifest = Manifest {
-                format_version: snapshot::FORMAT_VERSION,
-                created: jiff::Timestamp::now(),
-                app_version: env!("CARGO_PKG_VERSION").to_owned(),
-                schema_version: realm.schema_version(),
-                detached: candidates.clone(),
-                blobs: freed
-                    .iter()
-                    .filter(|(hash, _)| library.blob_path(hash).is_file())
-                    .map(|(hash, size)| (hash.clone(), *size))
-                    .collect(),
-            };
-            // Publish recovery data before committing or moving any bytes. An interrupted
-            // clean remains restorable, including blobs that never left the library.
-            let dir = snapshot::finalise(&snapshot_dir, &manifest)?;
-            Ok::<_, SnapshotError>((removals.clone(), (dir, freed)))
-        })?
-    };
+    let realm = Realm::open_for_write(&library.database())?;
+    let (final_dir, blobs) = realm.erase_usages_with(|realm| {
+        let current = realm.read_library()?;
+        let freed = validate_candidates(candidates, &current)?;
 
-    // Only blobs that reach zero usages may move. A file shared with another set, a skin, or a
-    // replay keeps its bytes where they are.
-    //
-    // Sizes go into a map first. Looking each one up by scanning the candidate list meant a
-    // pass over every candidate for every blob, which on a large clean is tens of billions of
-    // string comparisons before a single file moves.
-    let freed = freed
-        .iter()
-        .map(|(hash, size)| (hash.as_str(), *size))
-        .collect();
-    let moved = stash_all(library, &final_dir, &freed, &mut progress)?;
-    let blobs: Vec<(String, u64)> = moved;
-    let bytes = blobs.iter().map(|(_, size)| size).sum();
+        let blobs = each_blob(
+            &freed,
+            |hash, _| snapshot::preserve_blob(library, snapshot_dir, hash),
+            &mut |done, total| progress(CleanProgress::Preserving { done, total }),
+        )?;
 
-    Ok(Outcome {
-        detached: removals.len(),
-        stashed: blobs.len(),
-        bytes,
-        snapshot: Some(final_dir),
-        dry_run: false,
-    })
+        let manifest = Manifest {
+            format_version: snapshot::FORMAT_VERSION,
+            created: jiff::Timestamp::now(),
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            schema_version: realm.schema_version(),
+            detached: candidates.to_vec(),
+            blobs,
+        };
+
+        // Publish recovery data before committing. An interrupted clean stays restorable,
+        // including blobs that never left the library.
+        let dir = snapshot::finalise(snapshot_dir, &manifest)?;
+        finalised.set(Some(dir.clone()));
+        progress(CleanProgress::UpdatingDatabase);
+        Ok::<_, SnapshotError>((removals.clone(), (dir, manifest.blobs)))
+    })?;
+
+    Ok((removals.len(), final_dir, blobs))
 }
 
 /// Rejects shifted indices and recomputes which blobs lose their last owner.
-fn validate_candidates(
-    candidates: &[crate::Candidate],
+fn validate_candidates<'a>(
+    candidates: &'a [crate::Candidate],
     current: &cleaner_realm::Library,
-) -> Result<HashMap<String, u64>, SnapshotError> {
+) -> Result<Vec<(&'a str, u64)>, SnapshotError> {
     let sets: HashMap<_, _> = current
         .beatmap_sets
         .iter()
@@ -156,7 +210,7 @@ fn validate_candidates(
         if candidate.hash.len() != 64 || !candidate.hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(SnapshotError::StalePlan);
         }
-        if candidate.set_index == usize::MAX {
+        if candidate.set_index == crate::plan::NO_SET_INDEX {
             if remaining.get(&candidate.hash).copied().unwrap_or(0) != 0 {
                 return Err(SnapshotError::StalePlan);
             }
@@ -185,17 +239,29 @@ fn validate_candidates(
             .ok_or(SnapshotError::StalePlan)?;
         *count = count.checked_sub(1).ok_or(SnapshotError::StalePlan)?;
     }
-    Ok(candidates
-        .iter()
-        .filter(|candidate| {
-            candidate.frees_blob && remaining.get(&candidate.hash).copied().unwrap_or(0) == 0
-        })
-        .map(|candidate| (candidate.hash.clone(), candidate.bytes))
-        .collect())
+    // A blob leaves only when every usage anywhere is being detached, which is what
+    // `RealmFileStore.Cleanup` expresses as `Usages.@count = 0`. Counting each reference on
+    // its own would keep a file two selected beatmap sets share.
+    let mut freed: Vec<(&str, u64)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for candidate in candidates {
+        if remaining.get(&candidate.hash).copied().unwrap_or(0) == 0
+            && seen.insert(candidate.hash.as_str())
+        {
+            freed.push((candidate.hash.as_str(), candidate.bytes));
+        }
+    }
+    Ok(freed)
 }
 
+/// Name of the copy of `client.realm` taken before a compaction.
+///
+/// One fixed name, so a library holds at most one of these and the user always knows which
+/// compaction it belongs to.
+const DATABASE_BACKUP: &str = "client.realm.backup";
+
 /// What compacting the database did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compaction {
     /// Whether realm-core actually rewrote the file.
     ///
@@ -206,6 +272,8 @@ pub struct Compaction {
     pub before: u64,
     /// Size of the database after.
     pub after: u64,
+    /// Where the copy taken beforehand is kept.
+    pub backup: PathBuf,
 }
 
 impl Compaction {
@@ -220,11 +288,14 @@ impl Compaction {
 ///
 /// Realm never shrinks on its own: deleting rows returns their space to an internal free list
 /// for reuse, so the file stays the same size however much a clean removes. This is the only
-/// operation that makes it smaller.
+/// operation that makes it smaller, and the only one that rewrites the file the whole library
+/// depends on. A copy is taken first and kept afterwards, so a rewrite that produces a database
+/// osu!lazer will not open costs nothing but the time to put the copy back.
 ///
 /// # Errors
 ///
-/// Returns [`SnapshotError`] if the database cannot be opened or measured.
+/// Returns [`SnapshotError`] if the database cannot be copied, opened, or measured. Nothing is
+/// rewritten unless the copy is complete and on disk.
 pub fn compact(library: &Library) -> Result<Compaction, SnapshotError> {
     check_database_path(library)?;
     let path = library.database();
@@ -239,6 +310,7 @@ pub fn compact(library: &Library) -> Result<Compaction, SnapshotError> {
     };
 
     let before = measure("measuring the database")?;
+    let backup = back_up_database(library)?;
     let rewritten = Realm::open_for_write(&path)?.compact()?;
     let after = measure("measuring the database")?;
 
@@ -246,49 +318,151 @@ pub fn compact(library: &Library) -> Result<Compaction, SnapshotError> {
         rewritten,
         before,
         after,
+        backup,
     })
 }
 
-/// Moves every freed blob into the snapshot, in parallel.
+/// Copies `client.realm` beside the snapshots, replacing the previous copy.
 ///
-/// Each rename is an independent filesystem operation, and on Windows they are slow enough
+/// The copy lands under a temporary name and is renamed into place, so an interrupted copy
+/// never replaces a good one with a truncated file.
+fn back_up_database(library: &Library) -> Result<PathBuf, SnapshotError> {
+    let directory = library.snapshots_dir();
+    if !crate::safety::is_safe_path(&directory, &[library.root()]) {
+        return Err(SnapshotError::OutsideLibrary { path: directory });
+    }
+
+    std::fs::create_dir_all(&directory).map_err(|source| SnapshotError::Io {
+        action: "creating the snapshots directory",
+        path: directory.clone(),
+        source,
+    })?;
+
+    let destination = directory.join(DATABASE_BACKUP);
+    let partial = directory.join(format!("{DATABASE_BACKUP}.partial"));
+    let _ = std::fs::remove_file(&partial);
+
+    std::fs::copy(library.database(), &partial).map_err(|source| SnapshotError::Io {
+        action: "copying the database before compacting it",
+        path: partial.clone(),
+        source,
+    })?;
+
+    // Flushing matters here: the whole point is a copy that survives whatever the rewrite does.
+    std::fs::File::open(&partial)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| SnapshotError::Io {
+            action: "flushing the database copy",
+            path: partial.clone(),
+            source,
+        })?;
+
+    std::fs::rename(&partial, &destination).map_err(|source| SnapshotError::Io {
+        action: "saving the database copy",
+        path: destination.clone(),
+        source,
+    })?;
+
+    Ok(destination)
+}
+
+/// The copy of the database a compaction left behind, and its size.
+///
+/// Returns `None` when no compaction has run, or when its copy has been removed.
+#[must_use]
+pub fn database_backup(library: &Library) -> Option<(PathBuf, u64)> {
+    let path = library.snapshots_dir().join(DATABASE_BACKUP);
+    if !crate::safety::is_safe_path(&path, &[library.root()]) {
+        return None;
+    }
+    let bytes = std::fs::symlink_metadata(&path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)?
+        .len();
+    Some((path, bytes))
+}
+
+/// Deletes the copy of the database a compaction left behind.
+///
+/// # Errors
+///
+/// Returns [`SnapshotError::Io`] if the file exists and cannot be removed.
+pub fn remove_database_backup(library: &Library) -> Result<(), SnapshotError> {
+    let Some((path, _)) = database_backup(library) else {
+        return Ok(());
+    };
+
+    std::fs::remove_file(&path).map_err(|source| SnapshotError::Io {
+        action: "deleting the database copy",
+        path,
+        source,
+    })
+}
+
+/// Removes every preserved blob's library link, in parallel.
+///
+/// Each unlink is an independent filesystem operation, and on Windows they are slow enough
 /// individually that doing them one at a time dominates a large clean.
-fn stash_all(
+fn release_all(
     library: &Library,
     snapshot_dir: &std::path::Path,
-    freed: &HashMap<&str, u64>,
+    blobs: &[(String, u64)],
     progress: &mut impl FnMut(CleanProgress),
+) -> Result<(), SnapshotError> {
+    let work: Vec<(&str, u64)> = blobs
+        .iter()
+        .map(|(hash, size)| (hash.as_str(), *size))
+        .collect();
+
+    each_blob(
+        &work,
+        |hash, size| snapshot::release_blob(library, snapshot_dir, hash, size).map(|_| Some(size)),
+        &mut |done, total| progress(CleanProgress::Removing { done, total }),
+    )?;
+    Ok(())
+}
+
+/// Runs one filesystem operation over every blob, across every core.
+///
+/// Reports progress from this thread, so the caller's closure never has to be `Sync`. The
+/// first error stops the other workers rather than letting them finish a queue that can hold
+/// hundreds of thousands of entries.
+fn each_blob(
+    blobs: &[(&str, u64)],
+    operation: impl Fn(&str, u64) -> Result<Option<u64>, SnapshotError> + Sync,
+    progress: &mut impl FnMut(usize, usize),
 ) -> Result<Vec<(String, u64)>, SnapshotError> {
-    let hashes: Vec<(&str, u64)> = freed.iter().map(|(hash, size)| (*hash, *size)).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let done = std::sync::atomic::AtomicUsize::new(0);
+    let stop = std::sync::atomic::AtomicBool::new(false);
     let collected = std::sync::Mutex::new(Vec::new());
     let failure: std::sync::Mutex<Option<SnapshotError>> = std::sync::Mutex::new(None);
 
     std::thread::scope(|scope| {
         let workers = std::thread::available_parallelism()
             .map_or(4, std::num::NonZero::get)
-            .min(hashes.len());
+            .min(blobs.len());
         let mut handles = Vec::with_capacity(workers);
 
         for _ in 0..workers {
             handles.push(scope.spawn(|| {
                 let mut local = Vec::new();
 
-                loop {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(&(hash, size)) = hashes.get(index) else {
+                    let Some(&(hash, size)) = blobs.get(index) else {
                         break;
                     };
 
-                    match snapshot::stash_blob(library, snapshot_dir, hash) {
-                        Ok(true) => local.push((hash.to_owned(), size)),
-                        Ok(false) => {}
+                    match operation(hash, size) {
+                        Ok(Some(size)) => local.push((hash.to_owned(), size)),
+                        Ok(None) => {}
                         Err(error) => {
-                            let mut slot = failure.lock().expect("stash mutex was poisoned");
+                            let mut slot = failure.lock().expect("blob mutex was poisoned");
                             if slot.is_none() {
                                 *slot = Some(error);
                             }
+                            stop.store(true, std::sync::atomic::Ordering::Relaxed);
                             break;
                         }
                     }
@@ -298,28 +472,24 @@ fn stash_all(
 
                 collected
                     .lock()
-                    .expect("stash mutex was poisoned")
+                    .expect("blob mutex was poisoned")
                     .push(local);
             }));
         }
 
-        // Report from this thread, so the caller's closure never has to be `Sync`.
         while handles.iter().any(|handle| !handle.is_finished()) {
-            progress(CleanProgress::Moving {
-                done: done.load(std::sync::atomic::Ordering::Relaxed),
-                total: hashes.len(),
-            });
+            progress(done.load(std::sync::atomic::Ordering::Relaxed), blobs.len());
             std::thread::sleep(std::time::Duration::from_millis(120));
         }
     });
 
-    if let Some(error) = failure.into_inner().expect("stash mutex was poisoned") {
+    if let Some(error) = failure.into_inner().expect("blob mutex was poisoned") {
         return Err(error);
     }
 
     Ok(collected
         .into_inner()
-        .expect("stash mutex was poisoned")
+        .expect("blob mutex was poisoned")
         .into_iter()
         .flatten()
         .collect())
@@ -341,7 +511,7 @@ pub fn restore(
 ) -> Result<usize, SnapshotError> {
     check_database_path(library)?;
     let blobs = snapshot::restore_blobs(library, snapshot, &mut |done, total| {
-        progress(CleanProgress::Moving { done, total });
+        progress(CleanProgress::Restoring { done, total });
     })?;
 
     let restorations: Vec<Restoration> = snapshot
@@ -349,10 +519,9 @@ pub fn restore(
         .detached
         .iter()
         // Orphaned blobs were never attached to anything, so there is nothing to reattach.
-        .filter(|c| c.set_index != usize::MAX)
+        .filter(|c| c.set_index != crate::plan::NO_SET_INDEX)
         .map(|c| Restoration {
             set_id: c.set_id,
-            set_index: c.set_index,
             filename: c.filename.clone(),
             hash: c.hash.clone(),
         })
@@ -407,10 +576,8 @@ mod tests {
                     hash: "a".repeat(64),
                     bytes: 4096,
                     category: Category::Junk,
-                    frees_blob: true,
+                    usage_count: 1,
                 }],
-                files: 1,
-                bytes: 4096,
                 selected: true,
             }],
             ..Plan::default()
@@ -459,6 +626,7 @@ mod tests {
                     filename: candidate.filename.clone(),
                     hash: candidate.hash.clone(),
                 }],
+                title: "Artist - Title".to_owned(),
                 audio: Vec::new(),
                 backgrounds: Vec::new(),
             }],
@@ -495,17 +663,98 @@ mod tests {
     }
 
     #[test]
-    fn stash_errors_do_not_leave_the_progress_loop_running() {
+    fn cleaning_every_reference_to_a_shared_blob_frees_it() {
+        let mut first = plan_with_one_selected().groups[0].candidates[0].clone();
+        first.usage_count = 2;
+        let mut second = first.clone();
+        second.set_index = 1;
+        second.set_id = [1; 16];
+
+        let mut current = current_library(&first, 2);
+        current
+            .beatmap_sets
+            .extend(current_library(&second, 2).beatmap_sets);
+        let candidates = [first.clone(), second];
+
+        assert_eq!(
+            validate_candidates(&candidates, &current).unwrap(),
+            vec![(first.hash.as_str(), 4096)],
+            "detaching both usages leaves the blob unreferenced"
+        );
+
+        // A skin holds the third reference, so the blob has to stay.
+        current.usage_counts.insert(first.hash.clone(), 3);
+        assert!(
+            validate_candidates(&candidates, &current)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_failed_clean_leaves_no_half_built_snapshot() {
+        let (_dir, library) = library();
+        let plan = plan_with_one_selected();
+        // The database is a stub, so opening it for write fails after `begin` created the
+        // temporary directory.
+        assert!(run(&library, &plan, &Options { dry_run: false }, |_| {}).is_err());
+
+        let leftovers: Vec<_> = std::fs::read_dir(library.snapshots_dir())
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+    }
+
+    #[test]
+    fn compacting_keeps_a_copy_of_the_database() {
+        let (_dir, library) = library();
+        assert!(
+            database_backup(&library).is_none(),
+            "nothing to fall back to yet"
+        );
+
+        // The stub is not a real database, so the rewrite fails. The copy must already exist.
+        assert!(compact(&library).is_err());
+
+        let (path, bytes) = database_backup(&library).expect("no copy was kept");
+        assert_eq!(std::fs::read(&path).unwrap(), b"stub");
+        assert_eq!(bytes, 4);
+
+        remove_database_backup(&library).unwrap();
+        assert!(database_backup(&library).is_none());
+        remove_database_backup(&library).expect("removing a missing copy is not an error");
+    }
+
+    #[test]
+    fn a_second_compaction_replaces_the_previous_copy() {
+        let (_dir, library) = library();
+        assert!(compact(&library).is_err());
+
+        std::fs::write(library.database(), b"newer stub").unwrap();
+        assert!(compact(&library).is_err());
+
+        let (path, _) = database_backup(&library).expect("no copy was kept");
+        assert_eq!(std::fs::read(&path).unwrap(), b"newer stub");
+        assert_eq!(
+            std::fs::read_dir(library.snapshots_dir()).unwrap().count(),
+            1,
+            "copies must not accumulate"
+        );
+    }
+
+    #[test]
+    fn blob_errors_do_not_leave_the_progress_loop_running() {
         let (_dir, library) = library();
         let count = std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2 + 1;
         let names: Vec<_> = (0..count).map(|index| format!("invalid-{index}")).collect();
-        let freed = names.iter().map(|name| (name.as_str(), 1)).collect();
+        let blobs: Vec<_> = names.iter().map(|name| (name.clone(), 1)).collect();
         let started = std::time::Instant::now();
+
         assert!(
-            stash_all(&library, library.root(), &freed, &mut |_| {
+            release_all(&library, library.root(), &blobs, &mut |_| {
                 assert!(
                     started.elapsed() < std::time::Duration::from_secs(10),
-                    "stash workers did not finish"
+                    "workers did not finish"
                 );
             })
             .is_err()

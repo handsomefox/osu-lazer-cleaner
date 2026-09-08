@@ -5,6 +5,8 @@
 //! every bump. Discovery via [`Realm::classes`] keeps us working: the sample library is at
 //! schema 51, where `RealmOnlineAsset` does not yet exist, while current lazer is at 52.
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixture;
 pub mod sys;
 mod value;
 
@@ -50,6 +52,11 @@ pub struct BeatmapSet {
     pub id: [u8; 16],
     /// Files the set owns, in list order.
     pub files: Vec<NamedFile>,
+    /// Artist and title, from the first difficulty's `BeatmapMetadata`.
+    ///
+    /// Empty when the set has no difficulty or the metadata names neither. Used to label a set
+    /// in the interface, never to identify one.
+    pub title: String,
     /// Audio tracks its difficulties name, from `BeatmapMetadata.AudioFile`.
     ///
     /// Reading these from the database avoids opening the difficulty files, which is by far
@@ -80,29 +87,27 @@ struct BeatmapSetKeys {
     metadata: sys::realm_property_key_t,
     audio_file: sys::realm_property_key_t,
     background_file: sys::realm_property_key_t,
+    artist: sys::realm_property_key_t,
+    title: sys::realm_property_key_t,
 }
 
-/// How a snapshot names the beatmap set a file belongs to.
-///
-/// Snapshots taken before beatmap sets were recorded by identity name them by position
-/// instead. Those still restore, so long as the library has not had a beatmap imported or
-/// deleted since, which is why newer snapshots record identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum SetRef {
-    /// The set's `Guid` primary key.
-    Id([u8; 16]),
-    /// The set's position in the table.
-    Position(usize),
+/// What one pass over a set's difficulties learned from `BeatmapMetadata`.
+struct SetMetadata {
+    /// Artist and title of the first difficulty that names either.
+    title: String,
+    /// Audio tracks the difficulties name.
+    audio: Vec<String>,
+    /// Background images the difficulties name.
+    backgrounds: Vec<String>,
 }
 
-impl SetRef {
-    /// Picks the best identifier a restoration carries.
-    fn of(restoration: &Restoration) -> Self {
-        if restoration.set_id == [0; 16] {
-            Self::Position(restoration.set_index)
-        } else {
-            Self::Id(restoration.set_id)
-        }
+/// Joins an artist and a title the way osu!lazer shows them, skipping either when it is empty.
+fn join_title(artist: &str, title: &str) -> String {
+    match (artist.is_empty(), title.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => title.to_owned(),
+        (false, true) => artist.to_owned(),
+        (false, false) => format!("{artist} - {title}"),
     }
 }
 
@@ -113,12 +118,7 @@ pub struct Restoration {
     ///
     /// Named by identity rather than position, because a restore can happen long after the
     /// clean that produced it, and importing or deleting a beatmap shifts every position.
-    ///
-    /// All zeroes for snapshots written before identity was recorded, which fall back to
-    /// [`Restoration::set_index`].
     pub set_id: [u8; 16],
-    /// The owning set's position, used only when [`Restoration::set_id`] is absent.
-    pub set_index: usize,
     /// Name the file had inside the set.
     pub filename: String,
     /// SHA-256 of the file's contents.
@@ -444,6 +444,8 @@ impl Realm {
                         .property_key(self.class_key("BeatmapMetadata")?, "AudioFile")?,
                     background_file: self
                         .property_key(self.class_key("BeatmapMetadata")?, "BackgroundFile")?,
+                    artist: self.property_key(self.class_key("BeatmapMetadata")?, "Artist")?,
+                    title: self.property_key(self.class_key("BeatmapMetadata")?, "Title")?,
                 })
             } else {
                 None
@@ -462,13 +464,14 @@ impl Realm {
                     && !object.boolean(keys.delete_pending)?
                     && !object.boolean(keys.protected)?
                 {
-                    let (audio, backgrounds) = Self::read_metadata(&object, keys)?;
+                    let metadata = Self::read_metadata(&object, keys)?;
                     sets.push(BeatmapSet {
                         index,
                         id: object.uuid(keys.id)?.unwrap_or_default(),
                         files,
-                        audio,
-                        backgrounds,
+                        title: metadata.title,
+                        audio: metadata.audio,
+                        backgrounds: metadata.backgrounds,
                     });
                 }
             }
@@ -497,13 +500,15 @@ impl Realm {
     /// Reads the audio and background filenames every difficulty in a set names.
     ///
     /// `BeatmapMetadata` holds both, so a scan can learn what a set's audio track and
-    /// background are without opening a single difficulty file.
+    /// background are without opening a single difficulty file. The same object carries the
+    /// artist and title, which label the set in the interface.
     fn read_metadata(
         owner: &value::Object,
         keys: BeatmapSetKeys,
-    ) -> Result<(Vec<String>, Vec<String>), RealmError> {
+    ) -> Result<SetMetadata, RealmError> {
         let mut audio = Vec::new();
         let mut backgrounds = Vec::new();
+        let mut title = String::new();
 
         // SAFETY: `owner` is live and `beatmaps` names a list property on its class.
         let list = unsafe { sys::realm_get_list(owner.ptr, keys.beatmaps) };
@@ -531,16 +536,21 @@ impl Realm {
                 Ok::<_, RealmError>((
                     metadata.string(keys.audio_file)?,
                     metadata.string(keys.background_file)?,
+                    metadata.string(keys.artist)?,
+                    metadata.string(keys.title)?,
                 ))
             })();
 
             match read {
-                Ok((track, background)) => {
+                Ok((track, background, artist, name)) => {
                     if !track.is_empty() && !audio.contains(&track) {
                         audio.push(track);
                     }
                     if !background.is_empty() && !backgrounds.contains(&background) {
                         backgrounds.push(background);
+                    }
+                    if title.is_empty() {
+                        title = join_title(&artist, &name);
                     }
                 }
                 Err(error) => {
@@ -553,7 +563,11 @@ impl Realm {
 
         // SAFETY: released exactly once, after the loop.
         unsafe { sys::realm_release(list.cast()) };
-        Ok((audio, backgrounds))
+        Ok(SetMetadata {
+            title,
+            audio,
+            backgrounds,
+        })
     }
 
     /// Removes the named usages from their beatmap sets, in one transaction.
@@ -667,10 +681,10 @@ impl Realm {
 
         // Group by set so each one is located once and its file list read once. Doing that per
         // usage meant a fresh query and a full list read for every file being restored.
-        let mut by_set: HashMap<SetRef, Vec<&Restoration>> = HashMap::new();
+        let mut by_set: HashMap<[u8; 16], Vec<&Restoration>> = HashMap::new();
         for restoration in restorations {
             by_set
-                .entry(SetRef::of(restoration))
+                .entry(restoration.set_id)
                 .or_default()
                 .push(restoration);
         }
@@ -683,7 +697,7 @@ impl Realm {
         let total = by_set.len();
         let mut restored = 0;
 
-        for (done, (set_ref, entries)) in by_set.into_iter().enumerate() {
+        for (done, (set_id, entries)) in by_set.into_iter().enumerate() {
             if done % 64 == 0 {
                 progress(done, total);
             }
@@ -694,7 +708,7 @@ impl Realm {
                 filename_key,
                 target_key,
                 file_class,
-                set_ref,
+                set_id,
                 &entries,
             );
 
@@ -730,10 +744,10 @@ impl Realm {
         filename_key: sys::realm_property_key_t,
         target_key: sys::realm_property_key_t,
         file_class: sys::realm_class_key_t,
-        set_ref: SetRef,
+        set_id: [u8; 16],
         entries: &[&Restoration],
     ) -> Result<usize, RealmError> {
-        let Some(object) = self.find_set(class, set_ref)? else {
+        let Some(object) = self.find_set_by_id(class, set_id)? else {
             return Err(RealmError::Core {
                 code: 0,
                 message: "the snapshot's beatmap set no longer exists".to_owned(),
@@ -845,26 +859,10 @@ impl Realm {
         Ok(())
     }
 
-    /// Locates a beatmap set, by identity when the snapshot recorded one and by position
-    /// otherwise.
+    /// Finds a beatmap set by its `Guid` primary key.
     ///
     /// Returns `None` when no set matches, which means the beatmap was deleted since the
     /// snapshot was taken.
-    fn find_set(
-        &self,
-        class: sys::realm_class_key_t,
-        set_ref: SetRef,
-    ) -> Result<Option<value::Object>, RealmError> {
-        match set_ref {
-            SetRef::Id(id) => self.find_set_by_id(class, id),
-            // Snapshots written before identity was recorded name sets by position. Those
-            // positions were valid when the snapshot was taken, and stay valid as long as no
-            // beatmap has been imported or deleted since.
-            SetRef::Position(index) => self.object_at(class, index).map(Some),
-        }
-    }
-
-    /// Finds a beatmap set by its `Guid` primary key.
     fn find_set_by_id(
         &self,
         class: sys::realm_class_key_t,
@@ -1166,137 +1164,26 @@ pub struct ClassInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn property(
-        name: &'static CStr,
-        kind: sys::realm_property_type_e,
-    ) -> sys::realm_property_info_t {
-        sys::realm_property_info_t {
-            name: name.as_ptr(),
-            public_name: c"".as_ptr(),
-            link_target: c"".as_ptr(),
-            link_origin_property_name: c"".as_ptr(),
-            type_: kind,
-            ..Default::default()
-        }
-    }
-
-    fn link(name: &'static CStr, target: &'static CStr, list: bool) -> sys::realm_property_info_t {
-        sys::realm_property_info_t {
-            link_target: target.as_ptr(),
-            collection_type: if list {
-                sys::realm_collection_type_RLM_COLLECTION_TYPE_LIST
-            } else {
-                sys::realm_collection_type_RLM_COLLECTION_TYPE_NONE
-            },
-            flags: i32::from(!list), // Single object links are nullable.
-            ..property(name, sys::realm_property_type_RLM_PROPERTY_TYPE_OBJECT)
-        }
-    }
-
-    /// Builds a small library through the C API. No personal data or schema migration is used.
-    #[expect(
-        clippy::multiple_unsafe_ops_per_block,
-        reason = "test fixture setup owns and releases every C API handle in one sequence"
-    )]
-    fn synthetic_realm(path: &Path) -> Realm {
-        let string = sys::realm_property_type_RLM_PROPERTY_TYPE_STRING;
-        let boolean = sys::realm_property_type_RLM_PROPERTY_TYPE_BOOL;
-        let uuid = sys::realm_property_type_RLM_PROPERTY_TYPE_UUID;
-        let properties = [
-            vec![sys::realm_property_info_t {
-                flags: 2,
-                ..property(c"Hash", string)
-            }],
-            vec![property(c"Filename", string), link(c"File", c"File", false)],
-            vec![
-                sys::realm_property_info_t {
-                    flags: 2,
-                    ..property(c"ID", uuid)
-                },
-                property(c"DeletePending", boolean),
-                property(c"Protected", boolean),
-                link(c"Files", c"RealmNamedFileUsage", true),
-                link(c"Beatmaps", c"Beatmap", true),
-            ],
-            vec![link(c"Metadata", c"BeatmapMetadata", false)],
-            vec![
-                property(c"AudioFile", string),
-                property(c"BackgroundFile", string),
-            ],
-            vec![link(c"File", c"RealmNamedFileUsage", false)],
-        ];
-        let names = [
-            c"File",
-            c"RealmNamedFileUsage",
-            c"BeatmapSet",
-            c"Beatmap",
-            c"BeatmapMetadata",
-            c"RealmOnlineAsset",
-        ];
-        let classes: Vec<_> = names
-            .iter()
-            .zip(&properties)
-            .enumerate()
-            .map(|(index, (name, props))| sys::realm_class_info_t {
-                name: name.as_ptr(),
-                primary_key: match index {
-                    0 => c"Hash".as_ptr(),
-                    2 => c"ID".as_ptr(),
-                    _ => c"".as_ptr(),
-                },
-                num_properties: props.len(),
-                flags: i32::from(index == 1),
-                ..Default::default()
-            })
-            .collect();
-        let mut pointers: Vec<_> = properties.iter().map(Vec::as_ptr).collect();
-        let raw_path = CString::new(path.to_str().unwrap()).unwrap();
-        // SAFETY: all schema names and arrays outlive these calls. This creates a new scratch
-        // database with a declared schema. Production opens never use this schema mode.
-        let realm = unsafe {
-            let schema =
-                sys::realm_schema_new(classes.as_ptr(), classes.len(), pointers.as_mut_ptr());
-            assert!(!schema.is_null());
-            let config = sys::realm_config_new();
-            let scheduler = make_noop_scheduler();
-            sys::realm_config_set_path(config, raw_path.as_ptr());
-            sys::realm_config_set_schema(config, schema);
-            sys::realm_config_set_schema_version(config, 52);
-            sys::realm_config_set_scheduler(config, scheduler);
-            let ptr = sys::realm_open(config);
-            sys::realm_release(config.cast());
-            sys::realm_release(schema.cast());
-            sys::realm_release(scheduler.cast());
-            assert!(!ptr.is_null(), "{}", last_error());
-            Realm { ptr }
-        };
-        let class = realm.class_key("BeatmapSet").unwrap();
-        let key = sys::realm_value_t {
-            type_: sys::realm_value_type_RLM_TYPE_UUID,
-            __bindgen_anon_1: sys::realm_value__bindgen_ty_1 {
-                uuid: sys::realm_uuid_t { bytes: [1; 16] },
-            },
-        };
-        // SAFETY: the realm and class are live, and the object handle is released after commit.
-        unsafe {
-            assert!(sys::realm_begin_write(realm.ptr));
-            let object = sys::realm_object_create_with_primary_key(realm.ptr, class, key);
-            assert!(!object.is_null(), "{}", last_error());
-            assert!(sys::realm_commit(realm.ptr));
-            sys::realm_release(object.cast());
-        }
-        realm.restore_usages(&[restoration()], |_, _| {}).unwrap();
-        realm
-    }
+    use crate::fixture::{SetFixture, synthetic_realm};
 
     fn restoration() -> Restoration {
         Restoration {
             set_id: [1; 16],
-            set_index: 0,
             filename: "Thumbs.db".to_owned(),
             hash: "a".repeat(64),
         }
+    }
+
+    /// The one-set library the shared fixture builds for these tests.
+    fn synthetic(path: &Path) -> Realm {
+        synthetic_realm(
+            path,
+            &[SetFixture::new(
+                [1; 16],
+                "Title",
+                &[("Thumbs.db", &"a".repeat(64))],
+            )],
+        )
     }
 
     #[test]
@@ -1306,7 +1193,7 @@ mod tests {
     )]
     fn synthetic_online_asset_keeps_its_reference() {
         let dir = tempfile::tempdir().unwrap();
-        let realm = synthetic_realm(&dir.path().join("client.realm"));
+        let realm = synthetic(&dir.path().join("client.realm"));
         let asset_class = realm.class_key("RealmOnlineAsset").unwrap();
         let asset_file = realm.property_key(asset_class, "File").unwrap();
         let target = realm
@@ -1355,7 +1242,7 @@ mod tests {
     )]
     fn synthetic_restore_recreates_a_swept_file_row() {
         let dir = tempfile::tempdir().unwrap();
-        let realm = synthetic_realm(&dir.path().join("client.realm"));
+        let realm = synthetic(&dir.path().join("client.realm"));
         realm
             .erase_usages(&[Removal {
                 set_index: 0,
@@ -1389,7 +1276,7 @@ mod tests {
     #[test]
     fn synthetic_failed_preparation_rolls_back() {
         let dir = tempfile::tempdir().unwrap();
-        let realm = synthetic_realm(&dir.path().join("client.realm"));
+        let realm = synthetic(&dir.path().join("client.realm"));
         let error = realm.erase_usages_with::<(), RealmError>(|_| {
             Err(RealmError::InvalidPath("test".to_owned()))
         });
@@ -1410,7 +1297,7 @@ mod tests {
     #[test]
     fn synthetic_restore_rejects_conflicting_content() {
         let dir = tempfile::tempdir().unwrap();
-        let realm = synthetic_realm(&dir.path().join("client.realm"));
+        let realm = synthetic(&dir.path().join("client.realm"));
         let mut entry = restoration();
         entry.hash = "b".repeat(64);
         assert!(realm.restore_usages(&[entry], |_, _| {}).is_err());
@@ -1431,27 +1318,32 @@ mod tests {
     /// The sample library is reference data we must not alter, so every test works on a copy.
     /// Production code has the same obligation when scanning a live library, and solves it the
     /// same way.
+    /// Copies whichever real library is available into `scratch`.
+    ///
+    /// `ref/client-slim.realm` comes first: every one of these tests copies the file before it
+    /// opens it, and the slim one is a fraction of the size. Make it with
+    /// `cargo run -p cleaner-realm --features test-support --example slim`.
     fn sample_realm(scratch: &tempfile::TempDir) -> Option<std::path::PathBuf> {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ref/client.realm");
-        if !source.is_file() {
-            return None;
-        }
+        let reference = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ref");
+        let source = ["client-slim.realm", "client.realm"]
+            .iter()
+            .map(|name| reference.join(name))
+            .find(|path| path.is_file())?;
 
         let copy = scratch.path().join("client.realm");
         std::fs::copy(&source, &copy).expect("failed to copy sample database");
         Some(copy)
     }
 
-    /// Wraps a test body that needs the sample database, skipping it when absent.
+    /// Wraps a test body that needs a real library, skipping it when there is none.
     ///
-    /// `ref/client.realm` is a real personal osu!lazer library, so it is gitignored and never
-    /// present in CI. These tests therefore cover what only a developer with a real library
-    /// can reach. Building a committable synthetic fixture through realm-core would let CI
-    /// run them too, and is worth doing once the schema we depend on has settled.
+    /// A real library is someone's personal data, so `ref/` is gitignored and never present in
+    /// CI. What must run everywhere is covered by the synthetic database in `crate::fixture`
+    /// instead; these tests add what only a library osu!lazer itself wrote can show.
     fn with_sample(body: impl FnOnce(&Path)) {
         let scratch = tempfile::tempdir().expect("failed to create scratch dir");
         let Some(path) = sample_realm(&scratch) else {
-            tracing::warn!("skipping: ref/client.realm not present");
+            tracing::warn!("skipping: no library in ref/");
             return;
         };
         body(&path);
@@ -1678,7 +1570,6 @@ mod tests {
                     .iter()
                     .map(|(filename, hash)| Restoration {
                         set_id,
-                        set_index,
                         filename: filename.clone(),
                         hash: hash.clone(),
                     })
@@ -1728,7 +1619,6 @@ mod tests {
 
             let restoration = Restoration {
                 set_id: set.id,
-                set_index: set.index,
                 filename: set.files[0].filename.clone(),
                 hash: set.files[0].hash.clone(),
             };
@@ -1743,59 +1633,34 @@ mod tests {
         });
     }
 
-    /// A snapshot written before beatmap sets were recorded by identity must still restore.
+    /// A restoration naming a set that is gone must fail rather than pick a different one.
     ///
-    /// Those manifests name sets by position, and reading them as an absent identity would
-    /// silently reattach nothing while reporting success.
+    /// Identity is the only way a snapshot names a set. Falling back to a position would
+    /// reattach the files to whichever beatmap happens to sit there now.
     #[test]
-    fn restores_a_snapshot_that_names_sets_by_position() {
+    fn refuses_to_restore_into_an_unknown_beatmap_set() {
         with_sample(|path| {
-            let (set_index, removed) = {
-                let realm = Realm::open_for_write(path).expect("failed to open for write");
-                let sets = realm
-                    .read_library()
-                    .expect("failed to read library")
-                    .beatmap_sets;
-                let set = sets
-                    .iter()
-                    .find(|s| s.files.len() >= 2)
-                    .expect("no set with two files");
+            let realm = Realm::open_for_write(path).expect("failed to open for write");
+            let set = realm
+                .read_library()
+                .expect("failed to read library")
+                .beatmap_sets
+                .into_iter()
+                .find(|s| !s.files.is_empty())
+                .expect("no set with files");
 
-                let removed: Vec<_> = set.files[..2]
-                    .iter()
-                    .map(|f| (f.filename.clone(), f.hash.clone()))
-                    .collect();
-
-                let removals: Vec<_> = set.files[..2]
-                    .iter()
-                    .map(|f| Removal {
-                        set_index: set.index,
-                        file_index: f.index,
-                    })
-                    .collect();
-                realm.erase_usages(&removals).expect("failed to erase");
-                (set.index, removed)
+            let restoration = Restoration {
+                set_id: [0; 16],
+                filename: set.files[0].filename.clone(),
+                hash: set.files[0].hash.clone(),
             };
 
-            let realm = Realm::open_for_write(path).expect("failed to reopen for write");
-
-            // An all-zero identity is what an older manifest deserialises to.
-            let restorations: Vec<_> = removed
-                .iter()
-                .map(|(filename, hash)| Restoration {
-                    set_id: [0; 16],
-                    set_index,
-                    filename: filename.clone(),
-                    hash: hash.clone(),
-                })
-                .collect();
-
-            assert_eq!(
-                realm
-                    .restore_usages(&restorations, |_, _| {})
-                    .expect("failed to restore"),
-                2,
-                "a position-only snapshot must still reattach its files"
+            let error = realm
+                .restore_usages(std::slice::from_ref(&restoration), |_, _| {})
+                .expect_err("an unknown set must not restore");
+            assert!(
+                error.to_string().contains("no longer exists"),
+                "unexpected error: {error}"
             );
         });
     }

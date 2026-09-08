@@ -1,9 +1,13 @@
 //! Snapshots, which make a clean reversible.
 //!
-//! A clean never deletes anything. It detaches usages from the database and moves the orphaned
-//! blobs into a snapshot directory. Moving is a rename, so it is atomic and costs no extra
-//! disk, which matters when a clean displaces tens of gigabytes. The bytes come back on
-//! restore, and the space is reclaimed when the user deletes the snapshot.
+//! A clean puts every blob it is about to orphan into a snapshot directory before it touches
+//! the database. A hard link does that without copying the contents, so displacing tens of
+//! gigabytes costs no extra disk. Only once the snapshot holds the bytes does the clean remove
+//! the library's own link. The bytes come back on restore, and the space is reclaimed when the
+//! user deletes the snapshot.
+//!
+//! On a filesystem with no hard links the snapshot gets a copy instead, which needs the space
+//! twice until the snapshot is deleted.
 
 use crate::error::SnapshotError;
 use crate::plan::Candidate;
@@ -40,15 +44,19 @@ fn validate_directory(library: &Library, dir: &Path) -> Result<(), SnapshotError
     guard(library, dir)
 }
 
-fn regular_file(path: &Path) -> Result<bool, SnapshotError> {
+/// Size of a regular file, or `None` when nothing is there.
+///
+/// A symlink where a blob should be is an error rather than a miss: following it would move
+/// or delete something outside the library.
+fn file_len(path: &Path) -> Result<Option<u64>, SnapshotError> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
         Ok(_) => Err(SnapshotError::Io {
             action: "checking a blob",
             path: path.to_path_buf(),
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, "expected a regular file"),
         }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(SnapshotError::Io {
             action: "checking a blob",
             path: path.to_path_buf(),
@@ -192,65 +200,158 @@ fn read_manifest(dir: &Path) -> Result<Manifest, SnapshotError> {
 /// [`SnapshotError::CrossVolume`] if a rename from the library would cross a filesystem
 /// boundary.
 pub fn begin(library: &Library) -> Result<PathBuf, SnapshotError> {
-    let root = library.snapshots_dir();
-    let blobs = root.join(format!(
+    let dir = library.snapshots_dir().join(format!(
         "{TEMP_PREFIX}{}",
         jiff::Timestamp::now().as_nanosecond()
     ));
 
-    guard(library, &blobs.join(BLOBS_DIR))?;
+    guard(library, &dir.join(BLOBS_DIR))?;
     guard(library, &library.files_dir())?;
 
-    std::fs::create_dir_all(blobs.join(BLOBS_DIR)).map_err(|source| SnapshotError::Io {
+    std::fs::create_dir_all(dir.join(BLOBS_DIR)).map_err(|source| SnapshotError::Io {
         action: "creating a snapshot directory",
-        path: blobs.clone(),
+        path: dir.clone(),
         source,
     })?;
 
-    ensure_same_volume(library, &blobs)?;
-    Ok(blobs)
+    ensure_same_volume(library, &dir)?;
+    Ok(dir)
 }
 
-/// Moves a blob out of the library and into a snapshot.
+/// Removes a snapshot directory that a failed clean left behind.
 ///
-/// Uses a rename, so the move is atomic and frees no space until the snapshot is deleted.
+/// A clean that gives up before it commits leaves hard links to blobs the library still owns.
+/// Those are invisible to [`list`], so nothing would ever offer to remove them.
+pub(crate) fn abandon(library: &Library, dir: &Path) {
+    if validate_directory(library, dir).is_err() {
+        return;
+    }
+    if let Err(error) = std::fs::remove_dir_all(dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %dir.display(), %error, "could not remove an abandoned snapshot");
+    }
+}
+
+/// Copies a blob into a snapshot before its database references are detached.
+///
+/// Returns the blob's size, or `None` when it is already gone from the library. A hard link
+/// costs nothing and keeps the bytes alive even if osu!lazer sweeps the library entry a moment
+/// later. Where the filesystem has no hard links, the contents are copied and flushed to disk
+/// before this returns, so the caller may commit as soon as it does.
+///
+/// `snapshot_dir` must already have passed [`validate_snapshot_dir`].
 ///
 /// # Errors
 ///
-/// Returns [`SnapshotError::OutsideLibrary`] if the blob is not inside the library's `files/`
-/// tree, or [`SnapshotError::Io`] if the rename fails for a reason other than the blob having
-/// already gone.
-pub fn stash_blob(
+/// Returns [`SnapshotError::OutsideLibrary`] if the hash is malformed or the blob is not inside
+/// the library's `files/` tree, or [`SnapshotError::Io`] if the copy fails.
+pub(crate) fn preserve_blob(
     library: &Library,
     snapshot_dir: &Path,
     hash: &str,
-) -> Result<bool, SnapshotError> {
-    validate_hash(hash)?;
-    validate_directory(library, snapshot_dir)?;
-    let source = library.blob_path(hash);
-    let files_dir = library.files_dir();
-
-    // Re-check immediately before moving, independently of the scan-time check. The plan may
-    // be minutes old by now.
-    if !is_safe_path(&source, &[&files_dir]) {
-        return Err(SnapshotError::OutsideLibrary { path: source });
-    }
-
-    if !regular_file(&source)? {
-        // Already gone: lazer's own cleanup, or a previous run, got there first.
-        return Ok(false);
-    }
+) -> Result<Option<u64>, SnapshotError> {
+    let source = blob_source(library, hash)?;
+    let Some(bytes) = file_len(&source)? else {
+        return Ok(None);
+    };
 
     let destination = snapshot_dir.join(BLOBS_DIR).join(hash);
-    guard(library, &source)?;
-    guard(library, &destination)?;
-    std::fs::rename(&source, &destination).map_err(|error| SnapshotError::Io {
-        action: "moving a file into the snapshot",
-        path: source,
-        source: error,
-    })?;
+    match std::fs::hard_link(&source, &destination) {
+        Ok(()) => Ok(Some(bytes)),
+        // The blob went away between the check above and the link.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => {
+            // Every other failure is treated as "this filesystem has no hard links". Copying
+            // refuses an existing destination, so a substituted symlink cannot be written
+            // through.
+            copy_blob(&source, &destination).map_err(|source| SnapshotError::Io {
+                action: "copying a blob into the snapshot",
+                path: destination,
+                source,
+            })?;
+            Ok(Some(bytes))
+        }
+    }
+}
 
-    Ok(true)
+/// Copies one blob, flushing it to disk before returning.
+fn copy_blob(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let mut input = std::fs::File::open(source)?;
+    let mut output = std::fs::File::create_new(destination)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.sync_all()
+}
+
+/// Removes the library's link to a blob the snapshot already holds.
+///
+/// Returns whether a link was removed. Nothing is destroyed here: the snapshot holds the same
+/// bytes, and deleting the snapshot is what finally reclaims the space.
+///
+/// `snapshot_dir` must already have passed [`validate_snapshot_dir`].
+///
+/// # Errors
+///
+/// Returns [`SnapshotError::OutsideLibrary`] if the hash is malformed, the blob is not inside
+/// the library's `files/` tree, or the snapshot does not hold `bytes` of this blob.
+pub(crate) fn release_blob(
+    library: &Library,
+    snapshot_dir: &Path,
+    hash: &str,
+    bytes: u64,
+) -> Result<bool, SnapshotError> {
+    let source = blob_source(library, hash)?;
+
+    // Never unlink until the snapshot demonstrably holds the same file. This is the one check
+    // standing between a clean and a file the user cannot get back.
+    let preserved = snapshot_dir.join(BLOBS_DIR).join(hash);
+    if file_len(&preserved)? != Some(bytes) {
+        return Err(SnapshotError::NotPreserved {
+            path: preserved,
+            bytes,
+        });
+    }
+
+    match std::fs::remove_file(&source) {
+        Ok(()) => Ok(true),
+        // Already gone: lazer's own cleanup, or a previous run, got there first.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(SnapshotError::Io {
+            action: "removing a file from the library",
+            path: source,
+            source: error,
+        }),
+    }
+}
+
+/// Resolves a blob's path and re-checks that it is inside the library.
+///
+/// The check is repeated immediately before every touch, independently of the one made while
+/// scanning, because a plan can be minutes old by the time it runs.
+fn blob_source(library: &Library, hash: &str) -> Result<PathBuf, SnapshotError> {
+    validate_hash(hash)?;
+    let source = library.blob_path(hash);
+
+    // Rooted at the library so that `files/` itself is checked for a symlink, and confined to
+    // `files/` so that no other part of the library can be reached.
+    if !source.starts_with(library.files_dir()) || !is_safe_path(&source, &[library.root()]) {
+        return Err(SnapshotError::OutsideLibrary { path: source });
+    }
+    Ok(source)
+}
+
+/// Checks that a directory is a snapshot of this library, once per clean.
+///
+/// Blob operations take this as given, so that a clean moving hundreds of thousands of files
+/// does not walk the same directory chain hundreds of thousands of times.
+///
+/// # Errors
+///
+/// Returns [`SnapshotError::OutsideLibrary`] if the directory is not directly inside the
+/// library's snapshots directory.
+pub(crate) fn validate_snapshot_dir(library: &Library, dir: &Path) -> Result<(), SnapshotError> {
+    validate_directory(library, dir)?;
+    guard(library, &dir.join(BLOBS_DIR))
 }
 
 /// Writes the manifest and makes the snapshot visible.
@@ -310,7 +411,7 @@ pub fn restore_blobs(
     snapshot: &Snapshot,
     progress: &mut impl FnMut(usize, usize),
 ) -> Result<usize, SnapshotError> {
-    validate_directory(library, &snapshot.dir)?;
+    validate_snapshot_dir(library, &snapshot.dir)?;
     for (hash, _) in &snapshot.manifest.blobs {
         validate_hash(hash)?;
     }
@@ -364,15 +465,14 @@ pub fn restore_blobs(
 }
 
 /// Moves one blob out of a snapshot and back into the library.
+///
+/// `snapshot_dir` must already have passed [`validate_snapshot_dir`].
 fn restore_one(library: &Library, snapshot_dir: &Path, hash: &str) -> Result<(), SnapshotError> {
-    validate_hash(hash)?;
-    validate_directory(library, snapshot_dir)?;
+    let destination = blob_source(library, hash)?;
     let source = snapshot_dir.join(BLOBS_DIR).join(hash);
-    let destination = library.blob_path(hash);
-    guard(library, &source)?;
-    guard(library, &destination)?;
-    if !regular_file(&source)? {
-        if regular_file(&destination)? {
+
+    if file_len(&source)?.is_none() {
+        if file_len(&destination)?.is_some() {
             return Ok(());
         }
         return Err(SnapshotError::Io {
@@ -382,7 +482,7 @@ fn restore_one(library: &Library, snapshot_dir: &Path, hash: &str) -> Result<(),
         });
     }
 
-    if regular_file(&destination)? {
+    if file_len(&destination)?.is_some() {
         // The blob came back another way, most likely a re-import. Ours is redundant.
         return Ok(());
     }
@@ -517,26 +617,167 @@ mod tests {
         }
     }
 
+    /// Preserving then releasing is the whole clean, minus the database.
+    fn clean_one(library: &Library, hash: &str, bytes: u64) -> PathBuf {
+        let temp = begin(library).unwrap();
+        assert_eq!(preserve_blob(library, &temp, hash).unwrap(), Some(bytes));
+        let dir = finalise(&temp, &manifest(vec![(hash.to_owned(), bytes)])).unwrap();
+        release_blob(library, &dir, hash, bytes).unwrap();
+        dir
+    }
+
     #[test]
-    fn stashing_moves_the_blob_out_of_the_library() {
+    fn a_clean_takes_the_blob_out_of_the_library_and_keeps_the_bytes() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+
+        let snapshot_dir = clean_one(&library, &hash, 7);
+
+        assert!(
+            !library.blob_path(&hash).exists(),
+            "the library must give up its link"
+        );
+        assert_eq!(
+            std::fs::read(snapshot_dir.join(BLOBS_DIR).join(&hash)).unwrap(),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn preserving_keeps_the_library_copy_in_place() {
         let hash = "a".repeat(64);
         let (_dir, library) = library_with_blob(&hash, b"payload");
 
         let temp = begin(&library).unwrap();
-        assert!(stash_blob(&library, &temp, &hash).unwrap());
+        assert_eq!(preserve_blob(&library, &temp, &hash).unwrap(), Some(7));
 
-        assert!(!library.blob_path(&hash).exists(), "blob should have moved");
-        assert!(temp.join(BLOBS_DIR).join(&hash).exists());
+        assert!(
+            library.blob_path(&hash).is_file(),
+            "nothing may leave the library before the database commits"
+        );
+        assert_eq!(
+            std::fs::read(temp.join(BLOBS_DIR).join(&hash)).unwrap(),
+            b"payload"
+        );
     }
 
     #[test]
-    fn stashing_a_missing_blob_is_not_an_error() {
+    fn preserving_a_missing_blob_is_not_an_error() {
         let hash = "b".repeat(64);
         let (_dir, library) = library_with_blob(&hash, b"payload");
         let temp = begin(&library).unwrap();
 
         std::fs::remove_file(library.blob_path(&hash)).unwrap();
-        assert!(!stash_blob(&library, &temp, &hash).unwrap());
+        assert_eq!(preserve_blob(&library, &temp, &hash).unwrap(), None);
+    }
+
+    #[test]
+    fn releasing_a_blob_the_game_already_swept_is_not_an_error() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+
+        let temp = begin(&library).unwrap();
+        preserve_blob(&library, &temp, &hash).unwrap();
+        let dir = finalise(&temp, &manifest(vec![(hash.clone(), 7)])).unwrap();
+
+        // This is what `RealmFileStore.Cleanup` does once our transaction commits.
+        std::fs::remove_file(library.blob_path(&hash)).unwrap();
+        assert!(!release_blob(&library, &dir, &hash, 7).unwrap());
+
+        let snapshot = list(&library).unwrap().remove(0);
+        restore_blobs(&library, &snapshot, &mut |_, _| {}).unwrap();
+        delete(&library, &snapshot).unwrap();
+        assert_eq!(std::fs::read(library.blob_path(&hash)).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn a_blob_the_snapshot_does_not_hold_is_never_released() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+        let temp = begin(&library).unwrap();
+
+        // Nothing was preserved, so nothing may be removed.
+        assert!(matches!(
+            release_blob(&library, &temp, &hash, 7),
+            Err(SnapshotError::NotPreserved { .. })
+        ));
+
+        // A truncated copy does not count either.
+        std::fs::write(temp.join(BLOBS_DIR).join(&hash), b"pay").unwrap();
+        assert!(matches!(
+            release_blob(&library, &temp, &hash, 7),
+            Err(SnapshotError::NotPreserved { .. })
+        ));
+
+        assert_eq!(std::fs::read(library.blob_path(&hash)).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn a_clean_survives_the_game_deleting_the_library_copy() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+
+        let snapshot_dir = clean_one(&library, &hash, 7);
+        assert!(snapshot_dir.join(BLOBS_DIR).join(&hash).is_file());
+
+        let snapshot = list(&library).unwrap().remove(0);
+        restore_blobs(&library, &snapshot, &mut |_, _| {}).unwrap();
+        delete(&library, &snapshot).unwrap();
+        assert_eq!(std::fs::read(library.blob_path(&hash)).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn preserving_refuses_to_overwrite_an_existing_snapshot_entry() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+        let temp = begin(&library).unwrap();
+
+        let destination = temp.join(BLOBS_DIR).join(&hash);
+        std::fs::write(&destination, b"older").unwrap();
+
+        assert!(preserve_blob(&library, &temp, &hash).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"older");
+        assert_eq!(std::fs::read(library.blob_path(&hash)).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn copying_is_used_where_hard_links_are_not_available() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+        let temp = begin(&library).unwrap();
+
+        let destination = temp.join(BLOBS_DIR).join(&hash);
+        copy_blob(&library.blob_path(&hash), &destination).unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"payload");
+        assert!(release_blob(&library, &temp, &hash, 7).unwrap());
+        assert!(!library.blob_path(&hash).exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"payload");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserving_rejects_a_substituted_blob_store() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+        let temp = begin(&library).unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"secret").unwrap();
+        let shard = library.blob_path(&hash);
+        let shard = shard.parent().unwrap();
+        std::fs::remove_dir_all(shard).unwrap();
+        std::os::unix::fs::symlink(outside.path(), shard).unwrap();
+
+        assert!(matches!(
+            preserve_blob(&library, &temp, &hash),
+            Err(SnapshotError::OutsideLibrary { .. })
+        ));
+        assert!(matches!(
+            release_blob(&library, &temp, &hash, 6),
+            Err(SnapshotError::OutsideLibrary { .. })
+        ));
+        assert!(outside.path().join("secret").is_file());
     }
 
     #[test]
@@ -544,9 +785,7 @@ mod tests {
         let hash = "c".repeat(64);
         let (_dir, library) = library_with_blob(&hash, b"payload");
 
-        let temp = begin(&library).unwrap();
-        stash_blob(&library, &temp, &hash).unwrap();
-        finalise(&temp, &manifest(vec![(hash.clone(), 7)])).unwrap();
+        clean_one(&library, &hash, 7);
 
         let snapshots = list(&library).unwrap();
         assert_eq!(snapshots.len(), 1);
@@ -567,9 +806,7 @@ mod tests {
         let hash = "d".repeat(64);
         let (_dir, library) = library_with_blob(&hash, b"payload");
 
-        let temp = begin(&library).unwrap();
-        stash_blob(&library, &temp, &hash).unwrap();
-        finalise(&temp, &manifest(vec![(hash, 7)])).unwrap();
+        clean_one(&library, &hash, 7);
 
         let snapshots = list(&library).unwrap();
         delete(&library, &snapshots[0]).unwrap();
@@ -605,7 +842,8 @@ mod tests {
         let (_dir, library) = library_with_blob(&hash, b"payload");
         let temp = begin(&library).unwrap();
         for invalid in ["../escape", "/absolute", "é", "a\\..\\escape"] {
-            assert!(stash_blob(&library, &temp, invalid).is_err());
+            assert!(preserve_blob(&library, &temp, invalid).is_err());
+            assert!(release_blob(&library, &temp, invalid, 1).is_err());
             let snapshot = Snapshot {
                 dir: temp.clone(),
                 manifest: manifest(vec![(invalid.to_owned(), 1)]),
@@ -620,8 +858,7 @@ mod tests {
     fn restore_rechecks_the_blob_store_ancestor() {
         let hash = "a".repeat(64);
         let (_dir, library) = library_with_blob(&hash, b"payload");
-        let temp = begin(&library).unwrap();
-        stash_blob(&library, &temp, &hash).unwrap();
+        let temp = clean_one(&library, &hash, 7);
         let outside = tempfile::tempdir().unwrap();
         std::fs::remove_dir_all(library.files_dir()).unwrap();
         std::os::unix::fs::symlink(outside.path(), library.files_dir()).unwrap();

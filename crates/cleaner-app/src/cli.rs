@@ -1,7 +1,7 @@
 //! Command-line interface for osu-lazer-cleaner.
 //!
-//! Everything the desktop application does is available here, which makes the tool scriptable
-//! and lets a scan be checked against a real library without a graphical session.
+//! Everything the window does is available here. The same executable runs both: arguments pick
+//! this interface, and no arguments open the window.
 
 #![expect(
     clippy::print_stdout,
@@ -17,8 +17,8 @@ use std::process::ExitCode;
 
 /// Removes unwanted beatmap content from an osu!lazer library.
 #[derive(Debug, Parser)]
-#[command(name = "osu-lazer-cleaner-cli", version, about)]
-struct Cli {
+#[command(name = "osu-lazer-cleaner", version, about, after_help = NO_ARGUMENTS)]
+pub(crate) struct Cli {
     /// Path to the osu!lazer data directory. Found automatically when omitted.
     #[arg(long, global = true)]
     library: Option<PathBuf>,
@@ -103,7 +103,11 @@ fn parse_category(value: &str) -> Result<Category, String> {
     })
 }
 
-fn main() -> ExitCode {
+/// Shown at the end of `--help`, where someone looking for the window will find it.
+const NO_ARGUMENTS: &str = "Run osu-lazer-cleaner with no arguments to open the window.";
+
+/// Runs the command-line interface and returns the process exit code.
+pub(crate) fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
@@ -147,7 +151,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else if *verbose {
                 print!("{}", cleaner_core::report::render(&report));
             } else {
-                report_scan(&library, &plan, false);
+                report_scan(&library, &plan);
             }
 
             Ok(())
@@ -215,12 +219,10 @@ fn list_categories(json: bool) {
 }
 
 /// Prints what a scan found.
-fn report_scan(library: &Library, plan: &Plan, json: bool) {
-    if json {
-        println!("{}", serde_json::to_string_pretty(plan).unwrap_or_default());
-        return;
-    }
-
+///
+/// `--json` goes through the report rather than here, because that is the shape worth
+/// promising to a script.
+fn report_scan(library: &Library, plan: &Plan) {
     println!("library: {}", library.root().display());
     println!(
         "{} beatmap sets, {} files, {}\n",
@@ -230,29 +232,52 @@ fn report_scan(library: &Library, plan: &Plan, json: bool) {
     );
 
     println!("{:<16} {:>9} {:>12}", "category", "files", "reclaimable");
-    for group in &plan.groups {
+    for (category, totals) in plan.totals_by_category() {
         println!(
             "{:<16} {:>9} {:>12}",
-            group.category.slug(),
-            group.files,
-            human_bytes(group.bytes)
+            category.slug(),
+            totals.files,
+            human_bytes(totals.bytes)
         );
     }
 
     println!(
-        "\nscan took {:.1}s: {:.1}s measuring files, {:.1}s reading the database, \
-         {:.1}s reading beatmaps",
-        f64::from(
-            u32::try_from(
-                plan.timings.measure_ms + plan.timings.database_ms + plan.timings.classify_ms
-            )
-            .unwrap_or(u32::MAX)
-        ) / 1000.0,
-        f64::from(u32::try_from(plan.timings.measure_ms).unwrap_or(u32::MAX)) / 1000.0,
-        f64::from(u32::try_from(plan.timings.database_ms).unwrap_or(u32::MAX)) / 1000.0,
-        f64::from(u32::try_from(plan.timings.classify_ms).unwrap_or(u32::MAX)) / 1000.0,
+        "\nscan took {}: {} measuring files, {} reading the database, {} reading beatmaps",
+        seconds(plan.timings.total_ms()),
+        seconds(plan.timings.measure_ms),
+        seconds(plan.timings.database_ms),
+        seconds(plan.timings.classify_ms),
     );
-    println!("\nRemove a category with: osu-lazer-cleaner-cli clean <category> --confirm");
+    println!("\nRemove a category with: osu-lazer-cleaner clean <category> --confirm");
+}
+
+/// Reports what a clean or a restore is doing, on stderr so stdout stays machine-readable.
+fn report_clean(progress: cleaner_core::CleanProgress) {
+    match progress {
+        cleaner_core::CleanProgress::UpdatingDatabase => eprint!("\rupdating the database"),
+        cleaner_core::CleanProgress::Preserving { done, total } => {
+            eprint!("\rsaving files into the snapshot: {done}/{total}");
+        }
+        cleaner_core::CleanProgress::Removing { done, total } => {
+            eprint!("\rremoving files from the library: {done}/{total}");
+        }
+        cleaner_core::CleanProgress::Restoring { done, total } => {
+            eprint!("\rmoving files back: {done}/{total}");
+        }
+        cleaner_core::CleanProgress::Reattaching { done, total } => {
+            eprint!("\rreattaching files to beatmap sets: {done}/{total}");
+        }
+    }
+}
+
+/// Formats milliseconds as seconds with one decimal.
+fn seconds(ms: u64) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "display-only approximation of a duration"
+    )]
+    let value = ms as f64 / 1000.0;
+    format!("{value:.1}s")
 }
 
 /// Removes the selected categories.
@@ -266,15 +291,7 @@ fn clean(
     let plan = scan(&library, &selected)?;
 
     let options = Options { dry_run: !confirm };
-    let outcome = cleaner_core::run(&library, &plan, &options, |progress| match progress {
-        cleaner_core::CleanProgress::UpdatingDatabase => eprint!("\rupdating the database"),
-        cleaner_core::CleanProgress::Moving { done, total } => {
-            eprint!("\rmoving files into the snapshot: {done}/{total}");
-        }
-        cleaner_core::CleanProgress::Reattaching { done, total } => {
-            eprint!("\rreattaching files to beatmap sets: {done}/{total}");
-        }
-    })?;
+    let outcome = cleaner_core::run(&library, &plan, &options, report_clean)?;
     eprintln!("\r                                                   ");
 
     if cli.json {
@@ -317,8 +334,8 @@ fn clean(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         println!("\nNothing is deleted yet. Start osu!lazer and check your beatmaps.");
-        println!("To reclaim the space: osu-lazer-cleaner-cli snapshot delete {id} --confirm");
-        println!("To undo instead:      osu-lazer-cleaner-cli snapshot restore {id}");
+        println!("To reclaim the space: osu-lazer-cleaner snapshot delete {id} --confirm");
+        println!("To undo instead:      osu-lazer-cleaner snapshot restore {id}");
     }
 
     Ok(())
@@ -364,114 +381,125 @@ fn snapshots(cli: &Cli, command: &SnapshotCommand) -> Result<(), Box<dyn std::er
 
     match command {
         SnapshotCommand::List => {
-            if cli.json {
-                let entries: Vec<_> = available
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "id": s.id(),
-                            "created": s.manifest.created.to_string(),
-                            "files": s.manifest.blobs.len(),
-                            "bytes": s.manifest.bytes(),
-                        })
-                    })
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&entries).unwrap_or_default()
-                );
-                return Ok(());
-            }
-
-            if available.is_empty() {
-                println!("no snapshots");
-                return Ok(());
-            }
-
-            println!("Newest first. Restore in this order.\n");
-            println!("{:<24} {:>8} {:>12}  created", "id", "files", "size");
-            for entry in &available {
-                println!(
-                    "{:<24} {:>8} {:>12}  {}",
-                    entry.id(),
-                    entry.manifest.blobs.len(),
-                    human_bytes(entry.manifest.bytes()),
-                    entry
-                        .manifest
-                        .created
-                        .to_zoned(jiff::tz::TimeZone::system())
-                        .strftime("%Y-%m-%d %H:%M")
-                );
-            }
+            list_snapshots(&available, cli.json);
             Ok(())
         }
-
         SnapshotCommand::Restore { id, confirm } => {
-            let entry = find(&available, id)?;
-
-            // Snapshots are listed newest first, and each was taken against the library as the
-            // one before it left it. Restoring an older one on its own would leave the database
-            // pointing at files a newer snapshot still holds.
-            if available.first().map(cleaner_core::Snapshot::id).as_deref() != Some(id) {
-                return Err(format!(
-                    "restore snapshots newest first; start with {}",
-                    available
-                        .first()
-                        .map(cleaner_core::Snapshot::id)
-                        .unwrap_or_default()
-                )
-                .into());
-            }
-
-            if !confirm {
-                println!(
-                    "would put {} files ({}) back and remove snapshot {id}",
-                    entry.manifest.blobs.len(),
-                    human_bytes(entry.manifest.bytes())
-                );
-                println!("re-run with --confirm to do it");
-                return Ok(());
-            }
-
-            let restored = cleaner_core::restore(&library, entry, |progress| match progress {
-                cleaner_core::CleanProgress::UpdatingDatabase => {
-                    eprint!("\rupdating the database");
-                }
-                cleaner_core::CleanProgress::Moving { done, total } => {
-                    eprint!("\rmoving files back: {done}/{total}");
-                }
-                cleaner_core::CleanProgress::Reattaching { done, total } => {
-                    eprint!("\rreattaching files to beatmap sets: {done}/{total}");
-                }
-            })?;
-            eprintln!("\r                                             ");
-            println!("restored {restored} files into the library");
-            println!("snapshot {id} is gone; its files are back where they were");
-            Ok(())
+            restore_snapshot(&library, &available, id, *confirm)
         }
-
         SnapshotCommand::Delete { id, confirm } => {
-            let entry = find(&available, id)?;
-
-            if !confirm {
-                println!(
-                    "would delete snapshot {} and reclaim {}",
-                    entry.id(),
-                    human_bytes(entry.manifest.bytes())
-                );
-                println!("re-run with --confirm to do it; this cannot be undone");
-                return Ok(());
-            }
-
-            let reclaimed = entry.manifest.bytes();
-            snapshot::delete(&library, entry)?;
-            println!(
-                "deleted snapshot {id} and reclaimed {}",
-                human_bytes(reclaimed)
-            );
-            Ok(())
+            delete_snapshot(&library, &available, id, *confirm)
         }
     }
+}
+
+/// Prints the snapshots, newest first.
+fn list_snapshots(available: &[cleaner_core::Snapshot], json: bool) {
+    if json {
+        let entries: Vec<_> = available
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id(),
+                    "created": s.manifest.created.to_string(),
+                    "files": s.manifest.blobs.len(),
+                    "bytes": s.manifest.bytes(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&entries).unwrap_or_default()
+        );
+        return;
+    }
+
+    if available.is_empty() {
+        println!("no snapshots");
+        return;
+    }
+
+    println!("Newest first. Restore in this order.\n");
+    println!("{:<24} {:>8} {:>12}  created", "id", "files", "size");
+    for entry in available {
+        println!(
+            "{:<24} {:>8} {:>12}  {}",
+            entry.id(),
+            entry.manifest.blobs.len(),
+            human_bytes(entry.manifest.bytes()),
+            entry
+                .manifest
+                .created
+                .to_zoned(jiff::tz::TimeZone::system())
+                .strftime("%Y-%m-%d %H:%M")
+        );
+    }
+}
+
+/// Moves one snapshot's files back into the library.
+fn restore_snapshot(
+    library: &Library,
+    available: &[cleaner_core::Snapshot],
+    id: &str,
+    confirm: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entry = find(available, id)?;
+
+    // Snapshots are listed newest first, and each was taken against the library as the one
+    // before it left it. Restoring an older one on its own would leave the database pointing
+    // at files a newer snapshot still holds.
+    let newest = available.first().map(cleaner_core::Snapshot::id);
+    if newest.as_deref() != Some(id) {
+        return Err(format!(
+            "restore snapshots newest first; start with {}",
+            newest.unwrap_or_default()
+        )
+        .into());
+    }
+
+    if !confirm {
+        println!(
+            "would put {} files ({}) back and remove snapshot {id}",
+            entry.manifest.blobs.len(),
+            human_bytes(entry.manifest.bytes())
+        );
+        println!("re-run with --confirm to do it");
+        return Ok(());
+    }
+
+    let restored = cleaner_core::restore(library, entry, report_clean)?;
+    eprintln!("\r                                             ");
+    println!("restored {restored} files into the library");
+    println!("snapshot {id} is gone; its files are back where they were");
+    Ok(())
+}
+
+/// Deletes one snapshot, which is the only operation that destroys anything.
+fn delete_snapshot(
+    library: &Library,
+    available: &[cleaner_core::Snapshot],
+    id: &str,
+    confirm: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entry = find(available, id)?;
+
+    if !confirm {
+        println!(
+            "would delete snapshot {} and reclaim {}",
+            entry.id(),
+            human_bytes(entry.manifest.bytes())
+        );
+        println!("re-run with --confirm to do it; this cannot be undone");
+        return Ok(());
+    }
+
+    let reclaimed = entry.manifest.bytes();
+    snapshot::delete(library, entry)?;
+    println!(
+        "deleted snapshot {id} and reclaimed {}",
+        human_bytes(reclaimed)
+    );
+    Ok(())
 }
 
 /// Finds a snapshot by identifier.

@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "crates/cleaner-app",
-    "crates/cleaner-cli",
     "crates/cleaner-core",
     "crates/cleaner-realm",
 ]
@@ -28,6 +27,12 @@ thiserror = "=2.0.20"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 walkdir = "=2.5.0"
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
 
 [profile.release]
 lto = "thin"

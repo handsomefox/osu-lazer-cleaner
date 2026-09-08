@@ -1,10 +1,13 @@
-//! Desktop interface for osu-lazer-cleaner.
-
-// The window subsystem keeps a console from appearing behind the application on Windows.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//! osu-lazer-cleaner: one executable holding both interfaces.
+//!
+//! Run it with no arguments and it opens the window. Give it a subcommand and it runs
+//! headless, which is what makes the tool scriptable and lets a scan be checked against a real
+//! library without a graphical session.
 
 use eframe::egui;
 mod app;
+mod cli;
+mod console;
 mod diagnostics;
 mod theme;
 mod worker;
@@ -12,8 +15,19 @@ mod worker;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    diagnostics::install();
+    // `args_os().len() > 1` rather than clap's own detection: clap cannot tell "no arguments"
+    // from "arguments it rejects", and a typo must print an error rather than open a window.
+    if std::env::args_os().len() > 1 {
+        return cli::main();
+    }
 
+    console::release();
+    diagnostics::install();
+    gui()
+}
+
+/// Opens the window.
+fn gui() -> ExitCode {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1024.0, 680.0])

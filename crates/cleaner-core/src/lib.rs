@@ -14,13 +14,16 @@
 //! - Removing any other file leaves `BeatmapSetInfo.Hash` alone. osu!lazer does the same in
 //!   `BeatmapManager.DeleteVideos`, which detaches a video without recomputing the set hash.
 
+mod bench;
 pub mod catalog;
+mod end_to_end;
 pub mod error;
 pub mod execute;
 pub mod format;
 pub mod osu;
 pub mod plan;
 pub mod report;
+pub mod running;
 pub mod safety;
 pub mod scan;
 pub mod skin;
@@ -29,10 +32,14 @@ pub mod storage;
 
 pub use catalog::Category;
 pub use error::{ScanError, SnapshotError, StorageError};
-pub use execute::{CleanProgress, Compaction, Outcome, compact, restore, run};
+pub use execute::{
+    CleanProgress, Compaction, Outcome, compact, database_backup, remove_database_backup, restore,
+    run,
+};
 pub use format::human_bytes;
-pub use plan::{Candidate, Group, Options, Plan, Progress, Timings};
+pub use plan::{Candidate, Group, Options, Plan, Progress, SetEntry, SetId, Timings, Totals};
 pub use report::Report;
+pub use running::lazer_is_running;
 pub use safety::is_safe_path;
 pub use scan::build_plan;
 pub use snapshot::{Manifest, Snapshot};

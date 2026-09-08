@@ -26,8 +26,6 @@ env:
   CARGO_EXECUTABLE: osu-lazer-cleaner.exe
   RELEASE_EXECUTABLE: "osu!lazer Cleaner.exe"
   RELEASE_ARCHIVE: osu-lazer-cleaner-windows-x86_64.zip
-  CARGO_CLI_EXECUTABLE: osu-lazer-cleaner-cli.exe
-  RELEASE_CLI_EXECUTABLE: "osu!lazer Cleaner CLI.exe"
 
 defaults:
   run:
@@ -125,21 +123,18 @@ jobs:
           if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
           New-Item -ItemType Directory -Path $dist | Out-Null
           $exe = $env:RELEASE_EXECUTABLE
-          $cli = $env:RELEASE_CLI_EXECUTABLE
           $zip = $env:RELEASE_ARCHIVE
           $artifact = Join-Path $PWD "target/release/$env:CARGO_EXECUTABLE"
-          $cliArtifact = Join-Path $PWD "target/release/$env:CARGO_CLI_EXECUTABLE"
           Copy-Item -LiteralPath $artifact -Destination (Join-Path $dist $exe)
-          Copy-Item -LiteralPath $cliArtifact -Destination (Join-Path $dist $cli)
-          Compress-Archive -CompressionLevel Optimal -LiteralPath @((Join-Path $dist $exe), (Join-Path $dist $cli)) -DestinationPath (Join-Path $dist $zip)
-          $hashAssets = @($exe, $cli, $zip)
+          Compress-Archive -CompressionLevel Optimal -LiteralPath (Join-Path $dist $exe) -DestinationPath (Join-Path $dist $zip)
+          $hashAssets = @($exe, $zip)
           $checksumLines = @($hashAssets | ForEach-Object {
             $hash = (Get-FileHash (Join-Path $dist $_) -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $_"
           })
           $checksumText = ($checksumLines -join "`n") + "`n"
           [IO.File]::WriteAllText((Join-Path $dist 'SHA256SUMS'), $checksumText, [Text.Encoding]::ASCII)
-          $expectedFiles = @('SHA256SUMS', $exe, $cli, $zip) | Sort-Object
+          $expectedFiles = @('SHA256SUMS', $exe, $zip) | Sort-Object
           $actualFiles = @(Get-ChildItem $dist -File | Select-Object -ExpandProperty Name | Sort-Object)
           if (@(Compare-Object $expectedFiles $actualFiles).Count -ne 0) { throw 'Release asset set is incorrect' }
           foreach ($line in Get-Content (Join-Path $dist 'SHA256SUMS')) {
@@ -151,9 +146,7 @@ jobs:
           $archive = [IO.Compression.ZipFile]::OpenRead((Join-Path $dist $zip))
           try {
             $entries = @($archive.Entries | ForEach-Object FullName)
-            $expectedEntries = @($exe, $cli) | Sort-Object
-            $actualEntries = @($entries | Sort-Object)
-            if (@(Compare-Object $expectedEntries $actualEntries).Count -ne 0) { throw 'ZIP must contain exactly the two executables' }
+            if ($entries.Count -ne 1 -or $entries[0] -cne $exe) { throw "ZIP must contain exactly $exe" }
           } finally {
             $archive.Dispose()
           }
@@ -163,7 +156,6 @@ jobs:
           name: osu-lazer-cleaner-release-assets
           path: |
             dist/${{ env.RELEASE_EXECUTABLE }}
-            dist/${{ env.RELEASE_CLI_EXECUTABLE }}
             dist/${{ env.RELEASE_ARCHIVE }}
             dist/SHA256SUMS
           if-no-files-found: error
@@ -186,20 +178,18 @@ jobs:
       - name: Independently verify release assets
         run: |
           exe="$RELEASE_EXECUTABLE"
-          cli="$RELEASE_CLI_EXECUTABLE"
           zip="$RELEASE_ARCHIVE"
-          mapfile -t expected_assets < <(printf '%s\n' SHA256SUMS "$exe" "$cli" "$zip" | sort)
+          mapfile -t expected_assets < <(printf '%s\n' SHA256SUMS "$exe" "$zip" | sort)
           mapfile -t actual_assets < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
           [[ "${actual_assets[*]}" == "${expected_assets[*]}" ]]
-          mapfile -t expected_hash_assets < <(printf '%s\n' "$exe" "$cli" "$zip" | sort)
+          mapfile -t expected_hash_assets < <(printf '%s\n' "$exe" "$zip" | sort)
           mapfile -t actual_hash_assets < <(cut -c67- dist/SHA256SUMS | sort)
           [[ "${actual_hash_assets[*]}" == "${expected_hash_assets[*]}" ]]
-          awk 'length($1) != 64 || $1 !~ /^[0-9a-f]+$/ { exit 1 } END { if (NR != 3) exit 1 }' dist/SHA256SUMS
+          awk 'length($1) != 64 || $1 !~ /^[0-9a-f]+$/ { exit 1 } END { if (NR != 2) exit 1 }' dist/SHA256SUMS
           (cd dist && sha256sum --check --strict SHA256SUMS)
           unzip -tq "dist/$zip"
-          mapfile -t entries < <(unzip -Z1 "dist/$zip" | sort)
-          mapfile -t expected_entries < <(printf '%s\n' "$exe" "$cli" | sort)
-          [[ "${entries[*]}" == "${expected_entries[*]}" ]]
+          mapfile -t entries < <(unzip -Z1 "dist/$zip")
+          [[ ${#entries[@]} -eq 1 && "${entries[0]}" == "$exe" ]]
       - name: Attest release assets
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
@@ -212,7 +202,6 @@ jobs:
         run: >-
           gh release create "$TAG_NAME"
           "dist/$RELEASE_EXECUTABLE"
-          "dist/$RELEASE_CLI_EXECUTABLE"
           "dist/$RELEASE_ARCHIVE"
           dist/SHA256SUMS
           --verify-tag

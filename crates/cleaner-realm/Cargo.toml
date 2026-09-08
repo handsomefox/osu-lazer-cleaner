@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "Safe Rust bindings to realm-core's C API, scoped to what an osu!lazer library cleaner needs"
 
+[features]
+# Exposes `fixture`, which builds a scratch database. Tests only, never a release build.
+test-support = []
+
 [lints]
 workspace = true
 

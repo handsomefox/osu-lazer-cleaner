@@ -88,8 +88,8 @@ pub enum SnapshotError {
 
     /// The snapshot directory and the library are on different volumes.
     #[error(
-        "snapshots must sit on the same volume as {library}, so that blobs can be moved \
-         instead of copied"
+        "snapshots must sit on the same volume as {library}, because a snapshot holds links to \
+         the library's own files rather than copies of them"
     )]
     CrossVolume {
         /// The library root.
@@ -101,6 +101,15 @@ pub enum SnapshotError {
     OutsideLibrary {
         /// Offending path.
         path: PathBuf,
+    },
+
+    /// The snapshot does not hold the file the library is about to give up.
+    #[error("refusing to remove a file the snapshot does not hold: {path} should be {bytes} bytes")]
+    NotPreserved {
+        /// Where the snapshot should hold the file.
+        path: PathBuf,
+        /// Size the snapshot's copy must have.
+        bytes: u64,
     },
 }
 

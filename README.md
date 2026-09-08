@@ -16,7 +16,8 @@ take that file away from every beatmap using it.
 ## What it does
 
 Scan a library and you get a table: how many files each category holds and how much space
-removing it would return.
+removing it would return. Open **Browse sets** on any row to see which beatmaps make up that
+number and untick the ones you want left alone.
 
 | Category | What it removes |
 |---|---|
@@ -30,6 +31,9 @@ removing it would return.
 
 Junk and unreferenced files are selected by default, because neither can change how a beatmap
 plays. The rest are opt-in.
+
+A file two beatmap sets share only leaves when the clean gives up both references. Hold one of
+the sets back in the browse list and the file stays where it is, and the totals say so.
 
 ## Safety model
 
@@ -54,9 +58,17 @@ schema on disk rather than reconciling it against a declared one.
 
 ### Nothing is deleted in one step
 
-A clean saves its recovery manifest, detaches files from the database, and moves them into a
-snapshot. Moving uses renames and does not copy the file contents. A failed or interrupted
-clean keeps its manifest so that you can restore files already moved.
+A clean puts every file it is about to orphan into the snapshot before it touches the database,
+using hard links, which need no extra space for the contents. It writes the recovery manifest,
+commits the database, and only then removes the library's own links. Stop it at any point and
+either nothing happened or the snapshot holds the bytes.
+
+A file is never removed from the library until the snapshot demonstrably holds a copy of the
+same size. A clean that fails before it commits deletes its half-built snapshot, because those
+links would otherwise pin files the library still owns.
+
+On a filesystem with no hard links the snapshot gets a copy instead, which needs the space
+twice until you delete the snapshot.
 
 Before detaching files, the tool checks their identities and current reference counts under
 the database write lock. If a set or file changed since the scan, the clean stops and asks you
@@ -79,22 +91,28 @@ Download the latest release from the
 `osu-lazer-cleaner.exe`. It finds your library automatically, including when `storage.ini`
 points somewhere other than the default location.
 
-Close osu!lazer before cleaning, restoring, or compacting the database.
+Close osu!lazer before cleaning, restoring, or compacting the database. The window watches for
+the game and says so while it is open.
+
+Keyboard: `Ctrl+Tab` switches screens, `Ctrl+1` and `Ctrl+2` go straight to one, `F5` scans
+again, and `Esc` closes whatever is open.
 
 The **Snapshots** screen shows the database size and a **Compact database** button. Compaction
 reclaims the space left by removed database rows. It reports when another open handle prevents
-the rewrite.
+the rewrite. A copy of `client.realm` is taken first and kept until you delete it, so a rewrite
+osu!lazer will not open costs nothing but the time to rename the copy back.
 
 ## Command line
 
-The same operations are available from `osu-lazer-cleaner-cli`, which is useful for scripting
-and for checking a scan without a desktop session.
+One executable holds both interfaces. Run it with no arguments and the window opens; give it a
+subcommand and it runs headless, which is useful for scripting and for checking a scan without
+a desktop session.
 
 ```
-osu-lazer-cleaner-cli scan
-osu-lazer-cleaner-cli clean videos storyboards --confirm
-osu-lazer-cleaner-cli snapshot list
-osu-lazer-cleaner-cli snapshot delete 20260907-215337 --confirm
+osu-lazer-cleaner scan
+osu-lazer-cleaner clean videos storyboards --confirm
+osu-lazer-cleaner snapshot list
+osu-lazer-cleaner snapshot delete 20260907-215337 --confirm
 ```
 
 Every command takes `--library <path>` to point at a specific directory and `--json` for
@@ -116,8 +134,8 @@ The workspace is layered so that everything portable stays testable on Linux:
   `git clone --recurse-submodules`.
 - `cleaner-core` holds storage discovery, `.osu` and `.osb` parsing, scanning, and snapshots.
   It has no platform or interface dependencies.
-- `cleaner-app` is the desktop interface. It is the only crate that depends on egui.
-- `cleaner-cli` is the command-line interface.
+- `cleaner-app` holds both interfaces and builds the one executable. It is the only crate that
+  depends on egui.
 
 Building realm-core needs `cmake` and a C++17 compiler. A cold build takes about two minutes.
 
