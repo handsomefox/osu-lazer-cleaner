@@ -5,6 +5,14 @@
 
 use std::collections::BTreeSet;
 
+/// Key for a filename lookup, independent of case and path separators.
+///
+/// `RealmBackedResourceStore` standardises paths and lowercases both lookup names and owned
+/// filenames. `BeatmapSetInfoExtensions.GetFile` also compares without regard to case.
+pub(crate) fn filename_key(name: &str) -> String {
+    name.replace('\\', "/").to_lowercase()
+}
+
 /// Video container extensions lazer recognises.
 ///
 /// From `SupportedExtensions.VIDEO_EXTENSIONS`.
@@ -346,9 +354,10 @@ fn lookup(name: &str, known_files: &BTreeSet<String>) -> Option<String> {
         return Some(name.to_owned());
     }
 
+    let key = filename_key(name);
     known_files
         .iter()
-        .find(|owned| owned.eq_ignore_ascii_case(name))
+        .find(|owned| filename_key(owned) == key)
         .cloned()
 }
 

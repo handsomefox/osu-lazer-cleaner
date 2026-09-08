@@ -20,6 +20,29 @@ const DIFFICULTY_EXTENSION: &str = ".osu";
 /// Extension of a storyboard script.
 const STORYBOARD_EXTENSION: &str = ".osb";
 
+/// Case-folded names for classification. Keep the original spellings in the parser and plan.
+struct ReferenceIndex {
+    audio: HashSet<String>,
+    backgrounds: HashSet<String>,
+    videos: HashSet<String>,
+    storyboard: HashSet<String>,
+    hitsounds: HashSet<String>,
+}
+
+impl From<&osu::References> for ReferenceIndex {
+    fn from(references: &osu::References) -> Self {
+        let keys =
+            |names: &BTreeSet<String>| names.iter().map(|name| osu::filename_key(name)).collect();
+        Self {
+            audio: keys(&references.audio),
+            backgrounds: keys(&references.backgrounds),
+            videos: keys(&references.videos),
+            storyboard: keys(&references.storyboard),
+            hitsounds: keys(&references.hitsounds),
+        }
+    }
+}
+
 /// Scans `library` and returns what could be removed.
 ///
 /// `selected` decides which categories start selected; everything is classified either way, so
@@ -170,7 +193,7 @@ fn classify_set(
     // sets are just difficulties, one audio track, and one background, and reading those
     // files was over 99% of a scan's time on a large library. Building the name index costs
     // one allocation per file, so it waits until something is going to use it.
-    let parsed = needs_parsing(set, &references);
+    let parsed = needs_parsing(set, &ReferenceIndex::from(&references));
     if parsed {
         let owned: BTreeSet<String> = set.files.iter().map(|f| f.filename.clone()).collect();
         references.absorb(read_references(library, set, &owned));
@@ -180,22 +203,19 @@ fn classify_set(
     // they might match. Names go into a set folded the way lazer folds them, because comparing
     // each file against each protected name in turn is quadratic in a set of thirty
     // difficulties.
-    let mut protected: HashSet<String> = references
-        .audio
-        .iter()
-        .map(|name| name.to_ascii_lowercase())
-        .collect();
+    let references = ReferenceIndex::from(&references);
+    let mut protected = references.audio.clone();
     protected.extend(
         set.files
             .iter()
             .filter(|f| has_extension(&f.filename, DIFFICULTY_EXTENSION))
-            .map(|f| f.filename.to_ascii_lowercase()),
+            .map(|f| osu::filename_key(&f.filename)),
     );
 
     let candidates = set
         .files
         .iter()
-        .filter(|file| !protected.contains(&file.filename.to_ascii_lowercase()))
+        .filter(|file| !protected.contains(&osu::filename_key(&file.filename)))
         .filter_map(|file| {
             let category = categorise(&file.filename, &references)?;
 
@@ -225,17 +245,18 @@ fn classify_set(
 /// A set therefore needs parsing only when it owns a file that none of those explain. When it
 /// owns nothing but difficulties, its audio track, and its background, there is nothing left
 /// for parsing to find.
-fn needs_parsing(set: &cleaner_realm::BeatmapSet, known: &osu::References) -> bool {
+fn needs_parsing(set: &cleaner_realm::BeatmapSet, known: &ReferenceIndex) -> bool {
     set.files.iter().any(|file| {
         let name = &file.filename;
+        let key = osu::filename_key(name);
 
         if has_extension(name, STORYBOARD_EXTENSION) {
             return true;
         }
 
         let explained = has_extension(name, DIFFICULTY_EXTENSION)
-            || known.audio.contains(name)
-            || known.backgrounds.contains(name)
+            || known.audio.contains(&key)
+            || known.backgrounds.contains(&key)
             || catalog::is_junk(name)
             || skin::is_skin_element(name)
             || osu::VIDEO_EXTENSIONS
@@ -252,7 +273,8 @@ fn needs_parsing(set: &cleaner_realm::BeatmapSet, known: &osu::References) -> bo
 /// matched by extension, which is how `BeatmapManager.DeleteVideos` classifies them. Skin
 /// elements are checked before hitsounds so a file matching both lands in the more specific
 /// category.
-fn categorise(filename: &str, references: &osu::References) -> Option<Category> {
+fn categorise(filename: &str, references: &ReferenceIndex) -> Option<Category> {
+    let key = osu::filename_key(filename);
     if catalog::is_junk(filename) {
         return Some(Category::Junk);
     }
@@ -260,7 +282,7 @@ fn categorise(filename: &str, references: &osu::References) -> Option<Category> 
     if osu::VIDEO_EXTENSIONS
         .iter()
         .any(|extension| has_extension(filename, extension))
-        || references.videos.contains(filename)
+        || references.videos.contains(&key)
     {
         return Some(Category::Videos);
     }
@@ -271,11 +293,11 @@ fn categorise(filename: &str, references: &osu::References) -> Option<Category> 
 
     // A background that a storyboard also draws stays a background, so that removing
     // storyboards does not take the backdrop with it.
-    if references.backgrounds.contains(filename) {
+    if references.backgrounds.contains(&key) {
         return Some(Category::Backgrounds);
     }
 
-    if references.storyboard.contains(filename) {
+    if references.storyboard.contains(&key) {
         return Some(Category::Storyboards);
     }
 
@@ -283,7 +305,7 @@ fn categorise(filename: &str, references: &osu::References) -> Option<Category> 
         return Some(Category::SkinElements);
     }
 
-    if references.hitsounds.contains(filename) {
+    if references.hitsounds.contains(&key) {
         return Some(Category::Hitsounds);
     }
 
@@ -353,7 +375,7 @@ fn sample_depth(set: &cleaner_realm::BeatmapSet) -> Depth {
             && !set
                 .audio
                 .iter()
-                .any(|track| track.eq_ignore_ascii_case(&file.filename))
+                .any(|track| osu::filename_key(track) == osu::filename_key(&file.filename))
     });
 
     if owns_a_sample {
@@ -877,12 +899,12 @@ mod tests {
         }
     }
 
-    fn known(set: &cleaner_realm::BeatmapSet) -> osu::References {
-        osu::References {
+    fn known(set: &cleaner_realm::BeatmapSet) -> ReferenceIndex {
+        ReferenceIndex::from(&osu::References {
             audio: set.audio.iter().cloned().collect(),
             backgrounds: set.backgrounds.iter().cloned().collect(),
             ..osu::References::default()
-        }
+        })
     }
 
     #[test]
@@ -932,7 +954,7 @@ mod tests {
 
     #[test]
     fn videos_are_matched_by_extension() {
-        let empty = osu::References::default();
+        let empty = ReferenceIndex::from(&osu::References::default());
         assert_eq!(categorise("intro.mp4", &empty), Some(Category::Videos));
         assert_eq!(categorise("INTRO.AVI", &empty), Some(Category::Videos));
     }
@@ -943,9 +965,81 @@ mod tests {
         references.storyboard.insert("bg.jpg".to_owned());
 
         assert_eq!(
-            categorise("bg.jpg", &references),
+            categorise("bg.jpg", &ReferenceIndex::from(&references)),
             Some(Category::Backgrounds)
         );
+    }
+
+    #[test]
+    fn mixed_case_backgrounds_never_become_storyboard_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join(crate::storage::DATABASE_FILENAME),
+            b"stub",
+        )
+        .unwrap();
+        let library = Library::open(directory.path()).unwrap();
+        let set = set_with(
+            &["Map.osu", "SB/BG.JPG", "voice.WAV", "ÉCRAN.MP4"],
+            &["écran.mp4"],
+            &["sb/bg.jpg"],
+        );
+        let difficulty = library.blob_path(&set.files[0].hash);
+        std::fs::create_dir_all(difficulty.parent().unwrap()).unwrap();
+        std::fs::write(
+            difficulty,
+            "[Events]\nSprite,Background,Centre,\"sb\\bg.jpg\",320,240\n\
+             [HitObjects]\n256,192,1000,1,0,0:0:0:0:VOICE.wav\n",
+        )
+        .unwrap();
+
+        let (candidates, parsed) = classify_set(&library, &set, &HashMap::new(), &HashMap::new());
+        assert!(parsed);
+        let roles: Vec<_> = candidates
+            .iter()
+            .map(|c| (c.filename.as_str(), c.category))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                ("SB/BG.JPG", Category::Backgrounds),
+                ("voice.WAV", Category::Hitsounds)
+            ]
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.category != Category::Storyboards)
+        );
+    }
+
+    #[test]
+    fn known_names_skip_parsing_regardless_of_case() {
+        let set = set_with(
+            &["Map.osu", "AUDIO.MP3", "BG.JPG"],
+            &["audio.mp3"],
+            &["bg.jpg"],
+        );
+        assert!(!needs_parsing(&set, &known(&set)));
+        assert_eq!(classify(&set)[0].category, Category::Backgrounds);
+    }
+
+    #[test]
+    fn reference_categories_use_the_same_filename_keys() {
+        let references = osu::References {
+            videos: BTreeSet::from(["SB/VIDEO.BIN".to_owned()]),
+            storyboard: BTreeSet::from(["SB/SPRITE.PNG".to_owned()]),
+            hitsounds: BTreeSet::from(["SAMPLE.WAV".to_owned()]),
+            ..osu::References::default()
+        };
+        let index = ReferenceIndex::from(&references);
+        for (name, expected) in [
+            ("sb/video.bin", Category::Videos),
+            ("sb/sprite.png", Category::Storyboards),
+            ("sample.wav", Category::Hitsounds),
+        ] {
+            assert_eq!(categorise(name, &index), Some(expected));
+        }
     }
 
     #[test]
@@ -953,18 +1047,30 @@ mod tests {
         let mut references = osu::References::default();
         references.storyboard.insert("Thumbs.db".to_owned());
 
-        assert_eq!(categorise("Thumbs.db", &references), Some(Category::Junk));
+        assert_eq!(
+            categorise("Thumbs.db", &ReferenceIndex::from(&references)),
+            Some(Category::Junk)
+        );
     }
 
     #[test]
     fn unclassified_files_are_left_alone() {
-        assert_eq!(categorise("readme.txt", &osu::References::default()), None);
+        assert_eq!(
+            categorise(
+                "readme.txt",
+                &ReferenceIndex::from(&osu::References::default())
+            ),
+            None
+        );
     }
 
     #[test]
     fn storyboard_scripts_are_storyboards() {
         assert_eq!(
-            categorise("map.osb", &osu::References::default()),
+            categorise(
+                "map.osb",
+                &ReferenceIndex::from(&osu::References::default())
+            ),
             Some(Category::Storyboards)
         );
     }
