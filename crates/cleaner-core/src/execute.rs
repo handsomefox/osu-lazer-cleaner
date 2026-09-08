@@ -15,7 +15,7 @@ use crate::snapshot::{self, Manifest, Snapshot};
 use crate::storage::Library;
 use cleaner_realm::{Realm, Removal, Restoration};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Progress reported while a clean runs.
 #[derive(Debug, Clone, Copy)]
@@ -146,7 +146,7 @@ type Prepared = (usize, PathBuf, Vec<(String, u64)>);
 fn prepare(
     library: &Library,
     candidates: &[crate::Candidate],
-    snapshot_dir: &std::path::Path,
+    snapshot_dir: &Path,
     finalised: &std::cell::Cell<Option<PathBuf>>,
     progress: &mut impl FnMut(CleanProgress),
 ) -> Result<Prepared, SnapshotError> {
@@ -342,28 +342,47 @@ fn back_up_database(library: &Library) -> Result<PathBuf, SnapshotError> {
     let partial = directory.join(format!("{DATABASE_BACKUP}.partial"));
     let _ = std::fs::remove_file(&partial);
 
-    std::fs::copy(library.database(), &partial).map_err(|source| SnapshotError::Io {
+    let written = write_backup(library, &partial, &destination);
+    if written.is_err() {
+        // A half-written copy is worse than none: it would sit next to the snapshots looking
+        // like something to fall back on.
+        let _ = std::fs::remove_file(&partial);
+    }
+    written.map(|()| destination)
+}
+
+/// Copies the database to `partial`, flushes it, and moves it to `destination`.
+fn write_backup(
+    library: &Library,
+    partial: &Path,
+    destination: &Path,
+) -> Result<(), SnapshotError> {
+    std::fs::copy(library.database(), partial).map_err(|source| SnapshotError::Io {
         action: "copying the database before compacting it",
-        path: partial.clone(),
+        path: partial.to_path_buf(),
         source,
     })?;
 
     // Flushing matters here: the whole point is a copy that survives whatever the rewrite does.
-    std::fs::File::open(&partial)
+    //
+    // The handle has to be opened for writing. Windows refuses `FlushFileBuffers` on a
+    // read-only handle, where Linux is happy to `fsync` one, so a read-only open passed every
+    // test here and failed every one on Windows.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(partial)
         .and_then(|file| file.sync_all())
         .map_err(|source| SnapshotError::Io {
             action: "flushing the database copy",
-            path: partial.clone(),
+            path: partial.to_path_buf(),
             source,
         })?;
 
-    std::fs::rename(&partial, &destination).map_err(|source| SnapshotError::Io {
+    std::fs::rename(partial, destination).map_err(|source| SnapshotError::Io {
         action: "saving the database copy",
-        path: destination.clone(),
+        path: destination.to_path_buf(),
         source,
-    })?;
-
-    Ok(destination)
+    })
 }
 
 /// The copy of the database a compaction left behind, and its size.
@@ -405,7 +424,7 @@ pub fn remove_database_backup(library: &Library) -> Result<(), SnapshotError> {
 /// individually that doing them one at a time dominates a large clean.
 fn release_all(
     library: &Library,
-    snapshot_dir: &std::path::Path,
+    snapshot_dir: &Path,
     blobs: &[(String, u64)],
     progress: &mut impl FnMut(CleanProgress),
 ) -> Result<(), SnapshotError> {
@@ -703,6 +722,22 @@ mod tests {
             .map(|entries| entries.flatten().map(|e| e.path()).collect())
             .unwrap_or_default();
         assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+    }
+
+    #[test]
+    fn the_database_copy_is_written_flushed_and_moved_into_place() {
+        let (_dir, library) = library();
+
+        // Called on its own, so that a failure here cannot be mistaken for the rewrite
+        // failing. Flushing is the step that behaves differently on Windows.
+        let path = back_up_database(&library).expect("could not write the copy");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"stub");
+        assert_eq!(
+            std::fs::read_dir(library.snapshots_dir()).unwrap().count(),
+            1,
+            "no half-written copy may be left beside it"
+        );
     }
 
     #[test]

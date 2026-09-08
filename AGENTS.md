@@ -63,6 +63,12 @@ the Visual Studio generator nests artifacts per build configuration.
 cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 ```
 
+This compiles for Windows; it does not run there. Differences in what the two operating systems
+allow at runtime reach CI untouched, so think about them while writing rather than after. One
+that already cost a release: Windows refuses `FlushFileBuffers` on a read-only handle, so
+`File::open` followed by `sync_all` passes every test here and fails every test on Windows. Open
+for writing when the point is to flush.
+
 ## Tests
 
 Tests are inline `#[cfg(test)] mod tests` blocks using `tempfile`. There is no `tests/`
