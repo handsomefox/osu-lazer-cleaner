@@ -9,7 +9,9 @@
 //! A clean that fails before it commits takes its half-built snapshot with it, because those
 //! links would otherwise keep blobs alive that the library still owns.
 
+use crate::durability;
 use crate::error::SnapshotError;
+use crate::operation::OperationLock;
 use crate::plan::{Options, Plan};
 use crate::snapshot::{self, Manifest, Snapshot};
 use crate::storage::Library;
@@ -98,6 +100,7 @@ pub fn run(
     }
 
     check_database_path(library)?;
+    let _lock = OperationLock::acquire(library)?;
     let snapshot_dir = snapshot::begin(library)?;
 
     // `finalise` renames the directory before the commit, so a failure has to be able to find
@@ -124,7 +127,7 @@ pub fn run(
         }
     };
 
-    release_all(library, &final_dir, &blobs, &mut progress)?;
+    release_unreferenced(library, &final_dir, &blobs, &mut progress)?;
 
     Ok(Outcome {
         detached: removals,
@@ -187,6 +190,7 @@ fn prepare(
         // including blobs that never left the library.
         let dir = snapshot::finalise(snapshot_dir, &manifest)?;
         finalised.set(Some(dir.clone()));
+        snapshot::sync_published(library, &dir)?;
         progress(CleanProgress::UpdatingDatabase);
         Ok::<_, SnapshotError>((removals.clone(), (dir, manifest.blobs)))
     })?;
@@ -226,10 +230,9 @@ fn validate_candidates<'a>(
             || file.hash != candidate.hash
             || file.filename != candidate.filename
             || file.filename.to_ascii_lowercase().ends_with(".osu")
-            || set
-                .audio
-                .iter()
-                .any(|audio| audio.eq_ignore_ascii_case(&file.filename))
+            || set.audio.iter().any(|audio| {
+                crate::osu::filename_key(audio) == crate::osu::filename_key(&file.filename)
+            })
             || !seen.insert((candidate.set_index, candidate.file_index))
         {
             return Err(SnapshotError::StalePlan);
@@ -298,6 +301,7 @@ impl Compaction {
 /// rewritten unless the copy is complete and on disk.
 pub fn compact(library: &Library) -> Result<Compaction, SnapshotError> {
     check_database_path(library)?;
+    let _lock = OperationLock::acquire(library)?;
     let path = library.database();
     let measure = |when| {
         std::fs::metadata(&path)
@@ -378,10 +382,17 @@ fn write_backup(
             source,
         })?;
 
-    std::fs::rename(partial, destination).map_err(|source| SnapshotError::Io {
+    durability::rename(partial, destination).map_err(|source| SnapshotError::Io {
         action: "saving the database copy",
         path: destination.to_path_buf(),
         source,
+    })?;
+    durability::sync_directories(&library.snapshots_dir(), library.root()).map_err(|source| {
+        SnapshotError::Io {
+            action: "publishing the database copy",
+            path: destination.to_path_buf(),
+            source,
+        }
     })
 }
 
@@ -407,6 +418,7 @@ pub fn database_backup(library: &Library) -> Option<(PathBuf, u64)> {
 ///
 /// Returns [`SnapshotError::Io`] if the file exists and cannot be removed.
 pub fn remove_database_backup(library: &Library) -> Result<(), SnapshotError> {
+    let _lock = OperationLock::acquire(library)?;
     let Some((path, _)) = database_backup(library) else {
         return Ok(());
     };
@@ -415,6 +427,27 @@ pub fn remove_database_backup(library: &Library) -> Result<(), SnapshotError> {
         action: "deleting the database copy",
         path,
         source,
+    })
+}
+
+/// A writer may have acquired a reference after the clean committed. Recheck under a new
+/// transaction and keep that lock until every unlink finishes, as `RealmFileStore.Cleanup` does.
+fn release_unreferenced(
+    library: &Library,
+    snapshot_dir: &Path,
+    blobs: &[(String, u64)],
+    progress: &mut impl FnMut(CleanProgress),
+) -> Result<(), SnapshotError> {
+    check_database_path(library)?;
+    let realm = Realm::open_for_write(&library.database())?;
+    realm.with_write_transaction(|realm| {
+        let current = realm.read_library()?;
+        let unreferenced: Vec<_> = blobs
+            .iter()
+            .filter(|(hash, _)| current.usage_counts.get(hash).copied().unwrap_or(0) == 0)
+            .cloned()
+            .collect();
+        release_all(library, snapshot_dir, &unreferenced, progress)
     })
 }
 
@@ -516,9 +549,9 @@ fn each_blob(
 
 /// Puts a snapshot's files back, both the bytes and the database rows.
 ///
-/// Blobs move back first, so the database never points at a file that is missing. Reattaching
-/// the rows matters as much as the bytes: without them nothing refers to the restored files,
-/// and osu!lazer would sweep them again on its next startup.
+/// Rows are validated and staged before blobs are linked back. The write lock covers both,
+/// and the transaction commits only once the restored files are durable. Snapshot links stay
+/// in place until commit, so a failed or interrupted restore retains its recovery data.
 ///
 /// # Errors
 ///
@@ -526,12 +559,11 @@ fn each_blob(
 pub fn restore(
     library: &Library,
     snapshot: &Snapshot,
-    mut progress: impl FnMut(CleanProgress),
+    progress: impl FnMut(CleanProgress),
 ) -> Result<usize, SnapshotError> {
     check_database_path(library)?;
-    let blobs = snapshot::restore_blobs(library, snapshot, &mut |done, total| {
-        progress(CleanProgress::Restoring { done, total });
-    })?;
+    let _lock = OperationLock::acquire(library)?;
+    let snapshot = snapshot::reload(library, snapshot)?;
 
     let restorations: Vec<Restoration> = snapshot
         .manifest
@@ -546,17 +578,22 @@ pub fn restore(
         })
         .collect();
 
-    let rows = {
+    let progress = std::cell::RefCell::new(progress);
+    let (rows, blobs) = {
         let realm = Realm::open_for_write(&library.database())?;
-        realm.restore_usages(&restorations, |done, total| {
-            progress(CleanProgress::Reattaching { done, total });
-        })?
+        realm.restore_usages_with(
+            &restorations,
+            |done, total| progress.borrow_mut()(CleanProgress::Reattaching { done, total }),
+            || {
+                snapshot::restore_blobs(library, &snapshot, &mut |done, total| {
+                    progress.borrow_mut()(CleanProgress::Restoring { done, total });
+                })
+            },
+        )?
     };
 
-    // A restored snapshot holds nothing: its files are back in the library. Leaving the
-    // directory behind would keep advertising space it no longer occupies, and offering to
-    // restore it a second time.
-    snapshot::delete(library, snapshot)?;
+    // Every restored usage now owns its library link. Only now may the recovery links go.
+    snapshot::remove_restored(library, &snapshot)?;
 
     tracing::info!(blobs, rows, "restored a snapshot");
     Ok(blobs)
@@ -794,5 +831,52 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_reference_acquired_after_commit_prevents_release() {
+        use cleaner_realm::fixture::{SetFixture, synthetic_realm};
+        let directory = tempfile::tempdir().unwrap();
+        let hash = "a".repeat(64);
+        drop(synthetic_realm(
+            &directory.path().join("client.realm"),
+            &[SetFixture::new([1; 16], "First", &[("intro.mp4", &hash)])],
+        ));
+        let library = Library::open(directory.path()).unwrap();
+        let blob = library.blob_path(&hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"video").unwrap();
+        let plan = crate::build_plan(
+            &library,
+            &std::collections::HashSet::from([Category::Videos]),
+            |_| {},
+        )
+        .unwrap();
+        run(&library, &plan, &Options { dry_run: false }, |_| {}).unwrap();
+        let snapshot = snapshot::list(&library).unwrap().remove(0);
+
+        // Reimport the blob before a delayed release operation gets the write lock.
+        std::fs::write(&blob, b"video").unwrap();
+        let realm = Realm::open_for_write(&library.database()).unwrap();
+        realm
+            .restore_usages(
+                &[Restoration {
+                    set_id: [1; 16],
+                    filename: "intro.mp4".to_owned(),
+                    hash: hash.clone(),
+                }],
+                |_, _| {},
+            )
+            .unwrap();
+        drop(realm);
+        release_unreferenced(
+            &library,
+            &snapshot.dir,
+            &snapshot.manifest.blobs,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&blob).unwrap(), b"video");
+        assert!(snapshot.dir.join("blobs").join(hash).is_file());
     }
 }

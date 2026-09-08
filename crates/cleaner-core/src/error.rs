@@ -46,6 +46,27 @@ pub enum ScanError {
 /// Failures while creating, restoring, or deleting a snapshot.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
+    /// Another cleaner process is changing this library.
+    #[error("another cleaner operation is using this library; wait for it to finish")]
+    OperationInProgress,
+
+    /// Another snapshot depends on files this deletion would remove.
+    #[error(
+        "snapshot {dependent} needs files from {snapshot}; restore the newer snapshot first, or delete {dependent} first"
+    )]
+    SnapshotDependency {
+        /// Snapshot whose deletion was requested.
+        snapshot: String,
+        /// Retained snapshot that needs these files.
+        dependent: String,
+    },
+
+    /// A restored file does not match its recovery data.
+    #[error("{path} does not match the snapshot; keeping the snapshot")]
+    BlobMismatch {
+        /// File that failed verification.
+        path: PathBuf,
+    },
     /// The database no longer matches the selected scan results.
     #[error("the library changed since the scan; scan again before cleaning")]
     StalePlan,

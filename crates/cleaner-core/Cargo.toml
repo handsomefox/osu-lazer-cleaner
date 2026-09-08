@@ -14,6 +14,7 @@ cleaner-realm = { path = "../cleaner-realm" }
 jiff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

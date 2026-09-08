@@ -377,3 +377,149 @@ fn previewing_a_clean_changes_nothing() {
     assert!(fixture.holds(&video));
     assert!(!fixture.library.snapshots_dir().exists());
 }
+
+/// Real hashes let these tests also exercise recovery of partially restored 1.0 snapshots.
+fn video_fixture(two_owners: bool) -> (Fixture, String) {
+    let video = "96b050b919f3fca2fc8b6923537136a197ad13c583beb1438d1a12ccbc999c42".to_owned();
+    let mut sets = vec![SetFixture::new([1; 16], "First", &[("intro.mp4", &video)])];
+    if two_owners {
+        sets.push(SetFixture::new([2; 16], "Second", &[("intro.mp4", &video)]));
+    }
+    (Fixture::build(&sets, &[(&video, b"video bytes")]), video)
+}
+
+fn clean_video(fixture: &Fixture, exclude_second: bool) -> crate::Snapshot {
+    let mut plan = fixture.scan(&[Category::Videos]);
+    plan.exclude([2; 16], exclude_second);
+    crate::run(&fixture.library, &plan, &Options { dry_run: false }, |_| {}).unwrap();
+    crate::snapshot::list(&fixture.library).unwrap().remove(0)
+}
+
+#[test]
+fn a_missing_set_fails_before_restore_touches_any_blob() {
+    let (fixture, video) = video_fixture(false);
+    let snapshot = clean_video(&fixture, false);
+    let realm = cleaner_realm::Realm::open_for_write(&fixture.library.database()).unwrap();
+    cleaner_realm::fixture::keep_first_sets(&realm, 0).unwrap();
+    drop(realm);
+
+    assert!(crate::restore(&fixture.library, &snapshot, |_| {}).is_err());
+    assert!(!fixture.holds(&video));
+    assert_eq!(
+        std::fs::read(snapshot.dir.join("blobs").join(&video)).unwrap(),
+        b"video bytes"
+    );
+}
+
+#[test]
+fn corrupt_restore_destinations_keep_the_snapshot_and_roll_back_rows() {
+    for contents in [b"truncated".as_slice(), b"wrong bytes".as_slice()] {
+        let (fixture, video) = video_fixture(false);
+        let snapshot = clean_video(&fixture, false);
+        std::fs::write(fixture.library.blob_path(&video), contents).unwrap();
+
+        assert!(matches!(
+            crate::restore(&fixture.library, &snapshot, |_| {}),
+            Err(crate::SnapshotError::BlobMismatch { .. })
+        ));
+        assert_eq!(
+            std::fs::read(snapshot.dir.join("blobs").join(&video)).unwrap(),
+            b"video bytes"
+        );
+        let contents = cleaner_realm::Realm::open_read_only(&fixture.library.database())
+            .unwrap()
+            .read_library()
+            .unwrap();
+        assert!(!contents.usage_counts.contains_key(&video));
+
+        std::fs::remove_file(fixture.library.blob_path(&video)).unwrap();
+        crate::restore(&fixture.library, &snapshot, |_| {}).unwrap();
+        assert_eq!(
+            std::fs::read(fixture.library.blob_path(&video)).unwrap(),
+            b"video bytes"
+        );
+        assert!(!snapshot.dir.exists());
+    }
+}
+
+#[test]
+fn partial_blob_restoration_retains_every_recovery_link() {
+    let (fixture, video) = video_fixture(false);
+    let snapshot = clean_video(&fixture, false);
+    // Simulate interruption after file publication but before the database transaction commits.
+    crate::snapshot::restore_blobs(&fixture.library, &snapshot, &mut |_, _| {}).unwrap();
+    assert!(fixture.holds(&video));
+    assert!(snapshot.dir.join("blobs").join(&video).is_file());
+
+    // A subsequent game cleanup can remove the unreferenced library link without losing data.
+    std::fs::remove_file(fixture.library.blob_path(&video)).unwrap();
+    crate::restore(&fixture.library, &snapshot, |_| {}).unwrap();
+    assert_eq!(
+        std::fs::read(fixture.library.blob_path(&video)).unwrap(),
+        b"video bytes"
+    );
+}
+
+#[test]
+fn a_snapshot_needed_by_an_older_clean_cannot_be_deleted() {
+    let (fixture, video) = video_fixture(true);
+    let older = clean_video(&fixture, true);
+    let newer = clean_video(&fixture, false);
+    assert!(older.manifest.blobs.is_empty());
+    assert!(matches!(
+        crate::snapshot::delete(&fixture.library, &newer),
+        Err(crate::SnapshotError::SnapshotDependency { .. })
+    ));
+    assert!(newer.dir.join("blobs").join(&video).is_file());
+
+    crate::restore(&fixture.library, &newer, |_| {}).unwrap();
+    crate::restore(&fixture.library, &older, |_| {}).unwrap();
+    let contents = cleaner_realm::Realm::open_read_only(&fixture.library.database())
+        .unwrap()
+        .read_library()
+        .unwrap();
+    assert_eq!(contents.usage_counts.get(&video), Some(&2));
+    assert!(fixture.holds(&video));
+}
+
+#[test]
+fn deleting_dependent_snapshots_first_allows_reclaiming_the_blob() {
+    let (fixture, video) = video_fixture(true);
+    let older = clean_video(&fixture, true);
+    let newer = clean_video(&fixture, false);
+    crate::snapshot::delete(&fixture.library, &older).unwrap();
+    crate::snapshot::delete(&fixture.library, &newer).unwrap();
+    assert!(!fixture.holds(&video));
+    assert!(crate::snapshot::list(&fixture.library).unwrap().is_empty());
+}
+
+#[test]
+fn an_old_snapshot_cannot_reattach_a_missing_shared_blob() {
+    let (fixture, video) = video_fixture(true);
+    let older = clean_video(&fixture, true);
+    let newer = clean_video(&fixture, false);
+    // Reproduce a dependency already deleted by version 1.0 or outside the cleaner.
+    std::fs::remove_dir_all(newer.dir).unwrap();
+    assert!(crate::restore(&fixture.library, &older, |_| {}).is_err());
+    assert!(older.dir.is_dir());
+    let contents = cleaner_realm::Realm::open_read_only(&fixture.library.database())
+        .unwrap()
+        .read_library()
+        .unwrap();
+    assert!(!contents.usage_counts.contains_key(&video));
+}
+
+#[test]
+fn a_version_one_restore_can_resume_after_its_blobs_were_moved() {
+    let (fixture, video) = video_fixture(false);
+    let snapshot = clean_video(&fixture, false);
+    std::fs::rename(
+        snapshot.dir.join("blobs").join(&video),
+        fixture.library.blob_path(&video),
+    )
+    .unwrap();
+    crate::restore(&fixture.library, &snapshot, |_| {}).unwrap();
+    assert!(fixture.holds(&video));
+    assert!(!snapshot.dir.exists());
+    assert_eq!(fixture.scan(&[Category::Videos]).selected_references(), 1);
+}

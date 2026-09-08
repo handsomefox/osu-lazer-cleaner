@@ -16,10 +16,12 @@
 
 mod bench;
 pub mod catalog;
+mod durability;
 mod end_to_end;
 pub mod error;
 pub mod execute;
 pub mod format;
+mod operation;
 pub mod osu;
 pub mod plan;
 pub mod report;

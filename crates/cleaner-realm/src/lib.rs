@@ -247,7 +247,52 @@ pub struct Realm {
     ptr: *mut sys::realm_t,
 }
 
+/// Rolls back on errors and unwinding. No transaction may outlive the operation that owns it.
+struct WriteTransaction<'a> {
+    realm: &'a Realm,
+    active: bool,
+}
+
+impl Drop for WriteTransaction<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            // SAFETY: this guard owns the write transaction and borrows its live realm.
+            unsafe { sys::realm_rollback(self.realm.ptr) };
+        }
+    }
+}
+
 impl Realm {
+    /// Runs an operation under the write lock, committing on success and rolling back otherwise.
+    ///
+    /// File operations must use this same lock: osu!lazer's `RealmFileStore.Add` and `Cleanup`
+    /// both touch the blob store inside a write transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operation's error, or an error opening or committing the transaction.
+    pub fn with_write_transaction<T, E: From<RealmError>>(
+        &self,
+        operation: impl FnOnce(&Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.check_schema()?;
+        // SAFETY: the guard below commits or rolls back before returning or unwinding.
+        if !unsafe { sys::realm_begin_write(self.ptr) } {
+            return Err(last_error().into());
+        }
+        let mut transaction = WriteTransaction {
+            realm: self,
+            active: true,
+        };
+        let result = operation(self)?;
+        // SAFETY: this transaction is current and owned by the guard.
+        if !unsafe { sys::realm_commit(self.ptr) } {
+            return Err(last_error().into());
+        }
+        transaction.active = false;
+        Ok(result)
+    }
+
     fn check_schema(&self) -> Result<(), RealmError> {
         let version = self.schema_version();
         if version > 52 {
@@ -600,12 +645,7 @@ impl Realm {
         &self,
         prepare: impl FnOnce(&Self) -> Result<(Vec<Removal>, T), E>,
     ) -> Result<T, E> {
-        self.check_schema()?;
-        // SAFETY: every path below commits or rolls back this transaction.
-        if !unsafe { sys::realm_begin_write(self.ptr) } {
-            return Err(last_error().into());
-        }
-        let result = (|| {
+        self.with_write_transaction(|_| {
             let (removals, prepared) = prepare(self)?;
 
             let class = self.class_key("BeatmapSet")?;
@@ -627,26 +667,7 @@ impl Realm {
                 self.erase_from_set(class, files_key, set_index, &file_indices)?;
             }
             Ok(prepared)
-        })();
-
-        let prepared = match result {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                // SAFETY: the transaction above is open.
-                unsafe { sys::realm_rollback(self.ptr) };
-                return Err(error);
-            }
-        };
-
-        // SAFETY: the transaction opened above is still current.
-        if !unsafe { sys::realm_commit(self.ptr) } {
-            let error = last_error();
-            // SAFETY: cancel the failed commit before releasing the handle.
-            unsafe { sys::realm_rollback(self.ptr) };
-            return Err(error.into());
-        }
-
-        Ok(prepared)
+        })
     }
 
     /// Reattaches usages to their beatmap sets, in one transaction.
@@ -665,9 +686,39 @@ impl Realm {
     pub fn restore_usages(
         &self,
         restorations: &[Restoration],
-        mut progress: impl FnMut(usize, usize),
+        progress: impl FnMut(usize, usize),
     ) -> Result<usize, RealmError> {
-        self.check_schema()?;
+        self.restore_usages_with(restorations, progress, || Ok::<_, RealmError>(()))
+            .map(|(rows, ())| rows)
+    }
+
+    /// Stages restored usages, prepares their blobs under the same lock, and then commits.
+    ///
+    /// Missing sets and conflicting filenames fail before `prepare` touches the filesystem.
+    /// A preparation failure rolls back every staged usage.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, preparation, or transaction error.
+    pub fn restore_usages_with<T, E: From<RealmError>>(
+        &self,
+        restorations: &[Restoration],
+        mut progress: impl FnMut(usize, usize),
+        prepare: impl FnOnce() -> Result<T, E>,
+    ) -> Result<(usize, T), E> {
+        self.with_write_transaction(|_| {
+            let rows = self.restore_in_transaction(restorations, &mut progress)?;
+            let prepared = prepare()?;
+            Ok((rows, prepared))
+        })
+    }
+
+    /// Reattaches usages while the caller holds the write transaction.
+    fn restore_in_transaction(
+        &self,
+        restorations: &[Restoration],
+        progress: &mut impl FnMut(usize, usize),
+    ) -> Result<usize, RealmError> {
         if restorations.is_empty() {
             return Ok(0);
         }
@@ -689,11 +740,6 @@ impl Realm {
                 .push(restoration);
         }
 
-        // SAFETY: begins a transaction that every path below either commits or rolls back.
-        if !unsafe { sys::realm_begin_write(self.ptr) } {
-            return Err(last_error());
-        }
-
         let total = by_set.len();
         let mut restored = 0;
 
@@ -702,7 +748,7 @@ impl Realm {
                 progress(done, total);
             }
 
-            let outcome = self.restore_into_set(
+            restored += self.restore_into_set(
                 class,
                 files_key,
                 filename_key,
@@ -710,24 +756,10 @@ impl Realm {
                 file_class,
                 set_id,
                 &entries,
-            );
-
-            match outcome {
-                Ok(count) => restored += count,
-                Err(error) => {
-                    // SAFETY: a transaction is open; rolling back discards every edit above.
-                    unsafe { sys::realm_rollback(self.ptr) };
-                    return Err(error);
-                }
-            }
+            )?;
         }
 
         progress(total, total);
-
-        // SAFETY: the transaction opened above is still current.
-        if !unsafe { sys::realm_commit(self.ptr) } {
-            return Err(last_error());
-        }
 
         Ok(restored)
     }
@@ -1662,6 +1694,77 @@ mod tests {
                 error.to_string().contains("no longer exists"),
                 "unexpected error: {error}"
             );
+        });
+    }
+
+    #[test]
+    fn failed_restore_preparation_rolls_back_and_releases_the_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let realm = synthetic_realm(
+            &directory.path().join("client.realm"),
+            &[SetFixture::new([1; 16], "First", &[])],
+        );
+        let restorations = [Restoration {
+            set_id: [1; 16],
+            filename: "video.mp4".to_owned(),
+            hash: "a".repeat(64),
+        }];
+        let failed = realm.restore_usages_with::<(), RealmError>(
+            &restorations,
+            |_, _| {},
+            || Err(RealmError::InvalidPath("injected file failure".to_owned())),
+        );
+        assert!(failed.is_err());
+        assert!(realm.read_library().unwrap().usage_counts.is_empty());
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            realm.restore_usages_with::<(), RealmError>(
+                &restorations,
+                |_, _| {},
+                || panic!("interrupted preparation"),
+            )
+        }));
+        assert!(panicked.is_err());
+        assert!(realm.read_library().unwrap().usage_counts.is_empty());
+        assert_eq!(realm.restore_usages(&restorations, |_, _| {}).unwrap(), 1);
+    }
+
+    #[test]
+    fn file_preparation_keeps_other_database_writers_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("client.realm");
+        // The fixture declares a schema, so it opens in a different schema mode than a clean
+        // does. realm-core refuses a second open in another mode, so close it before the two
+        // writers below open the same database the way production opens it.
+        drop(synthetic_realm(&path, &[]));
+        let realm = Realm::open_for_write(&path).unwrap();
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let handle = realm
+                .with_write_transaction::<_, RealmError>(|_| {
+                    let handle = scope.spawn(move || {
+                        let other = Realm::open_for_write(&path).unwrap();
+                        started_tx.send(()).unwrap();
+                        other
+                            .with_write_transaction::<_, RealmError>(|_| Ok(()))
+                            .unwrap();
+                        finished_tx.send(()).unwrap();
+                    });
+                    started_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    assert!(matches!(
+                        finished_rx.recv_timeout(std::time::Duration::from_millis(50)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ));
+                    Ok(handle)
+                })
+                .unwrap();
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            handle.join().unwrap();
         });
     }
 

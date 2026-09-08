@@ -22,6 +22,7 @@ eframe = { version = "=0.36.1", default-features = false, features = ["default_f
 jiff = { version = "=0.2.35", features = ["serde"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
+sha2 = "=0.11.0"
 tempfile = "=3.27.0"
 thiserror = "=2.0.20"
 tracing = "=0.1.44"
@@ -32,6 +33,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Storage_FileSystem",
 ] }
 
 [profile.release]

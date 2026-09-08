@@ -9,7 +9,9 @@
 //! On a filesystem with no hard links the snapshot gets a copy instead, which needs the space
 //! twice until the snapshot is deleted.
 
+use crate::durability;
 use crate::error::SnapshotError;
+use crate::operation::OperationLock;
 use crate::plan::Candidate;
 use crate::safety::is_safe_path;
 use crate::storage::{Library, blob_relative_path};
@@ -131,6 +133,11 @@ impl Snapshot {
 ///
 /// Returns [`SnapshotError::Io`] only if the snapshots directory itself cannot be read.
 pub fn list(library: &Library) -> Result<Vec<Snapshot>, SnapshotError> {
+    read_snapshots(library, false)
+}
+
+/// Deletion must not overlook an unreadable manifest that could describe a dependency.
+fn read_snapshots(library: &Library, strict: bool) -> Result<Vec<Snapshot>, SnapshotError> {
     let root = library.snapshots_dir();
     guard(library, &root)?;
     if !root.is_dir() {
@@ -143,18 +150,38 @@ pub fn list(library: &Library) -> Result<Vec<Snapshot>, SnapshotError> {
         source,
     })?;
 
-    let mut snapshots: Vec<Snapshot> = entries
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
-        .filter(|entry| !entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX))
-        .filter_map(|entry| {
+    let mut snapshots = Vec::new();
+    for entry in entries {
+        let read = (|| {
+            let entry = entry.map_err(|source| SnapshotError::Io {
+                action: "listing snapshots",
+                path: root.clone(),
+                source,
+            })?;
+            if entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX) {
+                return Ok(None);
+            }
+            let kind = entry.file_type().map_err(|source| SnapshotError::Io {
+                action: "checking a snapshot directory",
+                path: entry.path(),
+                source,
+            })?;
+            if !kind.is_dir() {
+                return Ok(None);
+            }
             let dir = entry.path();
-            guard(library, &dir.join(MANIFEST_FILE)).ok()?;
-            read_manifest(&dir)
-                .ok()
-                .map(|manifest| Snapshot { dir, manifest })
-        })
-        .collect();
+            guard(library, &dir.join(MANIFEST_FILE))?;
+            Ok(Some(Snapshot {
+                manifest: read_manifest(&dir)?,
+                dir,
+            }))
+        })();
+        match read {
+            Ok(Some(snapshot)) => snapshots.push(snapshot),
+            Err(error) if strict => return Err(error),
+            Ok(None) | Err(_) => {}
+        }
+    }
 
     // Newest first. Snapshots have to be restored in reverse order, because each one was
     // taken against the library as the one before it left it, so the most recent is the only
@@ -189,6 +216,15 @@ fn read_manifest(dir: &Path) -> Result<Manifest, SnapshotError> {
     Ok(manifest)
 }
 
+pub(crate) fn reload(library: &Library, snapshot: &Snapshot) -> Result<Snapshot, SnapshotError> {
+    validate_snapshot_dir(library, &snapshot.dir)?;
+    guard(library, &snapshot.dir.join(MANIFEST_FILE))?;
+    Ok(Snapshot {
+        dir: snapshot.dir.clone(),
+        manifest: read_manifest(&snapshot.dir)?,
+    })
+}
+
 /// Creates an empty snapshot directory and returns where to build it.
 ///
 /// The directory is named `.tmp-*` until [`finalise`] renames it, so an interrupted clean
@@ -214,7 +250,10 @@ pub fn begin(library: &Library) -> Result<PathBuf, SnapshotError> {
         source,
     })?;
 
-    ensure_same_volume(library, &dir)?;
+    if let Err(error) = ensure_same_volume(library, &dir) {
+        abandon(library, &dir);
+        return Err(error);
+    }
     Ok(dir)
 }
 
@@ -257,8 +296,16 @@ pub(crate) fn preserve_blob(
     };
 
     let destination = snapshot_dir.join(BLOBS_DIR).join(hash);
+    guard(library, &destination)?;
     match std::fs::hard_link(&source, &destination) {
-        Ok(()) => Ok(Some(bytes)),
+        Ok(()) => {
+            durability::sync_file(&destination).map_err(|source| SnapshotError::Io {
+                action: "flushing a snapshot link",
+                path: destination,
+                source,
+            })?;
+            Ok(Some(bytes))
+        }
         // The blob went away between the check above and the link.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => {
@@ -278,9 +325,17 @@ pub(crate) fn preserve_blob(
 /// Copies one blob, flushing it to disk before returning.
 fn copy_blob(source: &Path, destination: &Path) -> std::io::Result<()> {
     let mut input = std::fs::File::open(source)?;
-    let mut output = std::fs::File::create_new(destination)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent"))?;
+    let mut output = tempfile::NamedTempFile::new_in(parent)?;
     std::io::copy(&mut input, &mut output)?;
-    output.sync_all()
+    output.as_file().sync_all()?;
+    // A failed copy cannot leave a partial blob at the name a retry will inspect.
+    let file = output
+        .persist_noclobber(destination)
+        .map_err(|error| error.error)?;
+    file.sync_all()
 }
 
 /// Removes the library's link to a blob the snapshot already holds.
@@ -305,6 +360,7 @@ pub(crate) fn release_blob(
     // Never unlink until the snapshot demonstrably holds the same file. This is the one check
     // standing between a clean and a file the user cannot get back.
     let preserved = snapshot_dir.join(BLOBS_DIR).join(hash);
+    guard(library, &preserved)?;
     if file_len(&preserved)? != Some(bytes) {
         return Err(SnapshotError::NotPreserved {
             path: preserved,
@@ -383,8 +439,17 @@ pub fn finalise(temp_dir: &Path, manifest: &Manifest) -> Result<PathBuf, Snapsho
         })?;
     drop(file);
 
+    // Persist the hard links and manifest entry before publishing their directory name.
+    durability::sync_directories(&temp_dir.join(BLOBS_DIR), temp_dir).map_err(|source| {
+        SnapshotError::Io {
+            action: "flushing the snapshot directory",
+            path: temp_dir.to_path_buf(),
+            source,
+        }
+    })?;
+
     let final_dir = unique_dir(temp_dir, manifest.created);
-    std::fs::rename(temp_dir, &final_dir).map_err(|source| SnapshotError::Io {
+    durability::rename(temp_dir, &final_dir).map_err(|source| SnapshotError::Io {
         action: "finalising the snapshot",
         path: temp_dir.to_path_buf(),
         source,
@@ -393,10 +458,22 @@ pub fn finalise(temp_dir: &Path, manifest: &Manifest) -> Result<PathBuf, Snapsho
     Ok(final_dir)
 }
 
-/// Moves a snapshot's blobs back into the library, in parallel.
+/// Makes the published name durable before the database commit. The caller already records
+/// the renamed path, so a flush failure can still remove its uncommitted snapshot.
+pub(crate) fn sync_published(library: &Library, dir: &Path) -> Result<(), SnapshotError> {
+    validate_snapshot_dir(library, dir)?;
+    durability::sync_directories(dir, library.root()).map_err(|source| SnapshotError::Io {
+        action: "publishing recovery data",
+        path: dir.to_path_buf(),
+        source,
+    })
+}
+
+/// Links a snapshot's blobs back into the library, in parallel, retaining the snapshot copies.
 ///
 /// Returns how many blobs were restored. Restoring the database rows is the caller's job,
-/// because only it holds a writable realm.
+/// because only it holds a writable realm. The caller must hold the Realm write transaction
+/// through this operation and the subsequent commit, so the game cannot sweep restored files.
 ///
 /// # Errors
 ///
@@ -418,7 +495,23 @@ pub fn restore_blobs(
     for candidate in &snapshot.manifest.detached {
         validate_hash(&candidate.hash)?;
     }
-    let blobs = &snapshot.manifest.blobs;
+    // Older snapshots can refer to shared blobs that they never stored. Check those too,
+    // before committing any restored references to files that may have disappeared since.
+    let mut expected: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for (hash, size) in &snapshot.manifest.blobs {
+        if expected
+            .insert(hash, *size)
+            .is_some_and(|previous| previous != *size)
+        {
+            return Err(SnapshotError::BlobMismatch {
+                path: snapshot.dir.join(BLOBS_DIR).join(hash),
+            });
+        }
+    }
+    for candidate in &snapshot.manifest.detached {
+        expected.entry(&candidate.hash).or_insert(candidate.bytes);
+    }
+    let blobs: Vec<_> = expected.into_iter().collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let done = std::sync::atomic::AtomicUsize::new(0);
     let failure: std::sync::Mutex<Option<SnapshotError>> = std::sync::Mutex::new(None);
@@ -433,11 +526,11 @@ pub fn restore_blobs(
             handles.push(scope.spawn(|| {
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some((hash, _)) = blobs.get(index) else {
+                    let Some((hash, bytes)) = blobs.get(index) else {
                         break;
                     };
 
-                    if let Err(error) = restore_one(library, &snapshot.dir, hash) {
+                    if let Err(error) = restore_one(library, &snapshot.dir, hash, *bytes) {
                         let mut slot = failure.lock().expect("restore mutex was poisoned");
                         if slot.is_none() {
                             *slot = Some(error);
@@ -461,19 +554,55 @@ pub fn restore_blobs(
         return Err(error);
     }
 
+    let directories: std::collections::HashSet<_> = blobs
+        .iter()
+        .filter_map(|(hash, _)| library.blob_path(hash).parent().map(Path::to_path_buf))
+        .collect();
+    for directory in directories {
+        guard(library, &directory)?;
+        durability::sync_directories(&directory, library.root()).map_err(|source| {
+            SnapshotError::Io {
+                action: "flushing restored file directories",
+                path: directory,
+                source,
+            }
+        })?;
+    }
+
     Ok(done.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Moves one blob out of a snapshot and back into the library.
+/// Installs one blob without giving up the snapshot's recovery link.
 ///
 /// `snapshot_dir` must already have passed [`validate_snapshot_dir`].
-fn restore_one(library: &Library, snapshot_dir: &Path, hash: &str) -> Result<(), SnapshotError> {
+fn restore_one(
+    library: &Library,
+    snapshot_dir: &Path,
+    hash: &str,
+    bytes: u64,
+) -> Result<(), SnapshotError> {
     let destination = blob_source(library, hash)?;
     let source = snapshot_dir.join(BLOBS_DIR).join(hash);
+    guard(library, &source)?;
 
-    if file_len(&source)?.is_none() {
-        if file_len(&destination)?.is_some() {
-            return Ok(());
+    let source_size = file_len(&source)?;
+    let destination_size = file_len(&destination)?;
+    if source_size.is_none() {
+        if destination_size == Some(bytes) {
+            // Version 1.0 moved files before its database transaction. When retrying such a
+            // restore, the content hash is the only remaining way to verify those bytes.
+            if matches_hash(&destination, hash).map_err(|source| SnapshotError::Io {
+                action: "verifying a previously restored file",
+                path: destination.clone(),
+                source,
+            })? {
+                return durability::sync_file(&destination).map_err(|source| SnapshotError::Io {
+                    action: "flushing a previously restored file",
+                    path: destination,
+                    source,
+                });
+            }
+            return Err(SnapshotError::BlobMismatch { path: destination });
         }
         return Err(SnapshotError::Io {
             action: "restoring a missing blob",
@@ -482,9 +611,25 @@ fn restore_one(library: &Library, snapshot_dir: &Path, hash: &str) -> Result<(),
         });
     }
 
-    if file_len(&destination)?.is_some() {
-        // The blob came back another way, most likely a re-import. Ours is redundant.
-        return Ok(());
+    if source_size != Some(bytes) {
+        return Err(SnapshotError::BlobMismatch { path: source });
+    }
+
+    if let Some(size) = destination_size {
+        if size != bytes
+            || !files_match(&source, &destination).map_err(|source| SnapshotError::Io {
+                action: "comparing a restored file",
+                path: destination.clone(),
+                source,
+            })?
+        {
+            return Err(SnapshotError::BlobMismatch { path: destination });
+        }
+        return durability::sync_file(&destination).map_err(|source| SnapshotError::Io {
+            action: "flushing a restored file",
+            path: destination,
+            source,
+        });
     }
 
     if let Some(parent) = destination.parent() {
@@ -495,11 +640,101 @@ fn restore_one(library: &Library, snapshot_dir: &Path, hash: &str) -> Result<(),
         })?;
     }
 
-    std::fs::rename(&source, &destination).map_err(|source_error| SnapshotError::Io {
-        action: "restoring a file from the snapshot",
-        path: source,
-        source: source_error,
+    if std::fs::hard_link(&source, &destination).is_err() {
+        copy_blob(&source, &destination).map_err(|source| SnapshotError::Io {
+            action: "copying a file back from the snapshot",
+            path: destination.clone(),
+            source,
+        })?;
+    }
+    durability::sync_file(&destination).map_err(|source| SnapshotError::Io {
+        action: "flushing a restored link",
+        path: destination,
+        source,
     })
+}
+
+/// Exact comparison for a pre-existing destination, without hashing normal restores.
+fn files_match(left: &Path, right: &Path) -> std::io::Result<bool> {
+    use std::io::BufRead as _;
+    let left = std::fs::File::open(left)?;
+    let right = std::fs::File::open(right)?;
+    if same_file(&left, &right)? {
+        return Ok(true);
+    }
+    let mut left = std::io::BufReader::new(left);
+    let mut right = std::io::BufReader::new(right);
+    loop {
+        let a = left.fill_buf()?;
+        let b = right.fill_buf()?;
+        if a.is_empty() || b.is_empty() {
+            return Ok(a.is_empty() && b.is_empty());
+        }
+        let count = a.len().min(b.len());
+        if a[..count] != b[..count] {
+            return Ok(false);
+        }
+        left.consume(count);
+        right.consume(count);
+    }
+}
+
+fn same_file(left: &std::fs::File, right: &std::fs::File) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let a = left.metadata()?;
+        let b = right.metadata()?;
+        Ok(a.dev() == b.dev() && a.ino() == b.ino())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let identity = |file: &std::fs::File| -> std::io::Result<_> {
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            // SAFETY: the handle belongs to a live file and the output buffer is ours.
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok((
+                info.dwVolumeSerialNumber,
+                info.nFileIndexHigh,
+                info.nFileIndexLow,
+            ))
+        };
+        Ok(identity(left)? == identity(right)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (left, right);
+        Ok(false)
+    }
+}
+
+fn matches_hash(path: &Path, hash: &str) -> std::io::Result<bool> {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = sha2::Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let digest = digest.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        // Writing to a String cannot fail, so the result carries no information.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex.eq_ignore_ascii_case(hash))
 }
 
 /// Deletes a snapshot, reclaiming its space.
@@ -509,6 +744,40 @@ fn restore_one(library: &Library, snapshot_dir: &Path, hash: &str) -> Result<(),
 /// Returns [`SnapshotError::OutsideLibrary`] if the snapshot is not directly inside the
 /// library's snapshots directory, or [`SnapshotError::Io`] if removal fails.
 pub fn delete(library: &Library, snapshot: &Snapshot) -> Result<(), SnapshotError> {
+    let _lock = OperationLock::acquire(library)?;
+    validate_snapshot_dir(library, &snapshot.dir)?;
+    // Read the current manifest under the operation lock, not a cached interface summary.
+    let current = reload(library, snapshot)?;
+    for other in read_snapshots(library, true)? {
+        if other.dir == current.dir {
+            continue;
+        }
+        let needed: std::collections::HashSet<_> = other
+            .manifest
+            .detached
+            .iter()
+            .map(|c| c.hash.as_str())
+            .collect();
+        for (hash, size) in &current.manifest.blobs {
+            if !needed.contains(hash.as_str()) {
+                continue;
+            }
+            validate_hash(hash)?;
+            let own_copy = other.dir.join(BLOBS_DIR).join(hash);
+            guard(library, &own_copy)?;
+            if file_len(&own_copy)? != Some(*size) {
+                return Err(SnapshotError::SnapshotDependency {
+                    snapshot: current.id(),
+                    dependent: other.id(),
+                });
+            }
+        }
+    }
+    remove_restored(library, &current)
+}
+
+/// Removes recovery links after restoration commits. The caller holds the operation lock.
+pub(crate) fn remove_restored(library: &Library, snapshot: &Snapshot) -> Result<(), SnapshotError> {
     validate_directory(library, &snapshot.dir)?;
     let snapshots_dir = library.snapshots_dir();
 
@@ -862,7 +1131,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::remove_dir_all(library.files_dir()).unwrap();
         std::os::unix::fs::symlink(outside.path(), library.files_dir()).unwrap();
-        assert!(restore_one(&library, &temp, &hash).is_err());
+        assert!(restore_one(&library, &temp, &hash, 7).is_err());
         assert!(temp.join(BLOBS_DIR).join(hash).is_file());
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
@@ -890,11 +1159,11 @@ mod tests {
 
     #[test]
     fn retrying_a_moved_blob_preserves_the_library_copy() {
-        let hash = "a".repeat(64);
-        let (_dir, library) = library_with_blob(&hash, b"payload");
+        let hash = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+        let (_dir, library) = library_with_blob(hash, b"payload");
         let temp = begin(&library).unwrap();
-        assert!(restore_one(&library, &temp, &hash).is_ok());
-        assert_eq!(std::fs::read(library.blob_path(&hash)).unwrap(), b"payload");
+        assert!(restore_one(&library, &temp, hash, 7).is_ok());
+        assert_eq!(std::fs::read(library.blob_path(hash)).unwrap(), b"payload");
     }
 
     #[test]
@@ -904,5 +1173,56 @@ mod tests {
 
         begin(&library).unwrap();
         assert!(list(&library).unwrap().is_empty());
+    }
+
+    #[test]
+    fn restoring_a_blob_retains_the_same_file_in_the_snapshot() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+        let dir = clean_one(&library, &hash, 7);
+        restore_one(&library, &dir, &hash, 7).unwrap();
+        let recovery = std::fs::File::open(dir.join(BLOBS_DIR).join(&hash)).unwrap();
+        let restored = std::fs::File::open(library.blob_path(&hash)).unwrap();
+        assert!(
+            same_file(&recovery, &restored).unwrap(),
+            "hard-link restores need no second copy"
+        );
+    }
+
+    #[test]
+    fn a_truncated_snapshot_blob_is_not_restored() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+        let dir = clean_one(&library, &hash, 7);
+        std::fs::write(dir.join(BLOBS_DIR).join(&hash), b"pay").unwrap();
+        assert!(matches!(
+            restore_one(&library, &dir, &hash, 7),
+            Err(SnapshotError::BlobMismatch { .. })
+        ));
+        assert!(!library.blob_path(&hash).exists());
+    }
+
+    #[test]
+    fn a_same_size_corrupt_legacy_restore_is_refused() {
+        let hash = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+        let (_dir, library) = library_with_blob(hash, b"PAYLOAD");
+        let dir = begin(&library).unwrap();
+        assert!(matches!(
+            restore_one(&library, &dir, hash, 7),
+            Err(SnapshotError::BlobMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn deletion_refuses_to_ignore_an_unreadable_dependency_manifest() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+        let dir = clean_one(&library, &hash, 7);
+        let snapshot = list(&library).unwrap().remove(0);
+        let unreadable = library.snapshots_dir().join("older");
+        std::fs::create_dir(&unreadable).unwrap();
+        std::fs::write(unreadable.join(MANIFEST_FILE), "broken JSON").unwrap();
+        assert!(delete(&library, &snapshot).is_err());
+        assert!(dir.join(BLOBS_DIR).join(hash).is_file());
     }
 }

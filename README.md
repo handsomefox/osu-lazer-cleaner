@@ -72,7 +72,13 @@ twice until you delete the snapshot.
 
 Before detaching files, the tool checks their identities and current reference counts under
 the database write lock. If a set or file changed since the scan, the clean stops and asks you
-to scan again.
+to scan again. After committing, it reacquires the write lock and checks reference counts
+again before removing library links. A file that acquired a new owner stays in the library.
+
+Recovery files are flushed before the database commits. Unix builds also flush the snapshot
+directories and their parents. Windows builds flush files through writable handles and publish
+the snapshot with a write-through rename. A per-library lock prevents two cleaner processes
+from changing snapshots at the same time.
 
 Your free space does not change yet. That is deliberate. Start osu!lazer, check that your
 beatmaps still play, and then delete the snapshot to reclaim the space. If something is wrong,
@@ -80,9 +86,17 @@ restore the snapshot instead and the files go back.
 
 Restore snapshots newest first. Restore also recreates file records that osu!lazer removed
 after the clean. If a beatmap set is missing or a filename now holds different content, restore
-stops and keeps the snapshot.
+stops and keeps the snapshot. The snapshot retains its links until the restored database
+references commit, so an interrupted restore remains recoverable.
+
+On a filesystem with hard links, restoring needs no second copy of the blob contents. Without
+hard links, restore temporarily needs extra space for copies. An existing destination must
+match the snapshot before the recovery copy can be removed. Interrupted restores from version
+1.0 can resume by verifying already-moved files against their SHA-256 hashes.
 
 Deleting a snapshot is the only operation that destroys anything, and it asks first.
+Deletion is refused if another retained snapshot needs files that only this snapshot holds.
+Restore the newer snapshot first, or delete the dependent older snapshot first.
 
 ## Install
 
