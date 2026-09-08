@@ -25,6 +25,8 @@ enum Screen {
 enum Activity {
     /// Reading the library. Safe to abandon.
     Scanning,
+    /// Reading the snapshot list.
+    ListingSnapshots,
     /// Moving files into a snapshot.
     Cleaning,
     /// Moving files back out of a snapshot.
@@ -38,13 +40,14 @@ enum Activity {
 impl Activity {
     /// Whether stopping now could leave the library half-changed.
     fn is_destructive(self) -> bool {
-        !matches!(self, Self::Scanning)
+        !matches!(self, Self::Scanning | Self::ListingSnapshots)
     }
 
     /// How to name it mid-sentence.
     fn describe(self) -> &'static str {
         match self {
             Self::Scanning => "scanning the library",
+            Self::ListingSnapshots => "reading snapshots",
             Self::Cleaning => "moving files into a snapshot",
             Self::Restoring => "moving files back into the library",
             Self::Deleting => "deleting a snapshot",
@@ -88,6 +91,7 @@ pub(crate) struct App {
     activity: Option<Activity>,
     plan: Option<Plan>,
     selected: HashSet<Category>,
+    selected_totals: (usize, u64),
     snapshots: Vec<SnapshotSummary>,
     /// Size of `client.realm`, so the compact control can show what it is working on.
     database_bytes: u64,
@@ -121,6 +125,7 @@ impl App {
                 .filter(|c| c.default_selected())
                 .collect(),
             snapshots: Vec::new(),
+            selected_totals: (0, 0),
             database_bytes: 0,
             compaction: None,
             modal: None,
@@ -148,7 +153,9 @@ impl App {
                     "Ready to scan".clone_into(&mut self.status);
                     self.library = Some(root);
                     self.database_bytes = database_bytes;
-                    self.activity = None;
+                    self.plan = None;
+                    self.compaction = None;
+                    self.activity = Some(Activity::ListingSnapshots);
                     self.error = None;
                     self.worker.send(Command::ListSnapshots);
                 }
@@ -174,7 +181,7 @@ impl App {
                     ));
                     "Clean finished".clone_into(&mut self.status);
                     self.plan = None;
-                    self.activity = None;
+                    self.activity = Some(Activity::ListingSnapshots);
                     self.worker.send(Command::ListSnapshots);
                 }
                 Event::Compacted { result } => {
@@ -208,7 +215,7 @@ impl App {
 
     /// Sends the clean the user confirmed.
     fn confirm_clean(&mut self) {
-        let Some(plan) = self.plan.clone() else {
+        let Some(plan) = self.plan.take() else {
             return;
         };
 
@@ -227,6 +234,7 @@ impl App {
         for category in Category::ALL {
             plan.select(*category, self.selected.contains(category));
         }
+        self.selected_totals = (plan.selected_files(), plan.selected_bytes());
     }
 }
 
@@ -345,7 +353,7 @@ impl App {
             ui.add_space(14.0);
         }
 
-        let Some(plan) = self.plan.clone() else {
+        let Some(plan) = self.plan.take() else {
             ui.label(theme::figure("Nothing scanned yet"));
             ui.add_space(6.0);
             ui.label(
@@ -361,7 +369,8 @@ impl App {
             return;
         };
 
-        let removing = plan.selected_bytes();
+        let removing = self.selected_totals.1;
+        let previous_selection = self.selected.clone();
 
         ui.horizontal(|ui| {
             ui.label(theme::figure(human_bytes(plan.bytes_total)));
@@ -414,6 +423,10 @@ impl App {
                     .color(theme::MUTED),
             );
         });
+        self.plan = Some(plan);
+        if self.selected != previous_selection {
+            self.apply_selection();
+        }
     }
 
     /// One row per category: tick, name, what it means, how much space, how many files.
@@ -628,9 +641,7 @@ impl App {
     fn wording(&self, modal: Question) -> (&'static str, String, &'static str, bool) {
         match modal {
             Question::Clean => {
-                let plan = self.plan.as_ref();
-                let bytes = plan.map_or(0, Plan::selected_bytes);
-                let files = plan.map_or(0, Plan::selected_files);
+                let (files, bytes) = self.selected_totals;
                 (
                     "Move these files to a snapshot?",
                     format!(
