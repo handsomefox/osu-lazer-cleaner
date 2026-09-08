@@ -399,7 +399,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cleaner-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cleaner-core",
  "crossbeam-channel",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "cleaner-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "cleaner-core",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "cleaner-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cleaner-realm",
  "jiff",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "cleaner-realm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bindgen",
  "cmake",
