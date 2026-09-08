@@ -215,11 +215,31 @@ fn read_animation(fields: &[&str], known_files: &BTreeSet<String>, references: &
         .storyboard
         .extend(resolve_extension(&path, known_files));
 
-    for frame in 0..frame_count {
-        let name = path.replacen('.', &format!("{frame}."), 1);
-        references
-            .storyboard
-            .extend(resolve_extension(&name, known_files));
+    let Some((prefix, _)) = path.split_once('.') else {
+        return;
+    };
+    // Work is bounded by the files the set owns, even if an untrusted storyboard claims
+    // billions of frames. lazer inserts the frame number before every dot in the path.
+    for owned in known_files {
+        let Some(head) = owned.get(..prefix.len()) else {
+            continue;
+        };
+        if !head.eq_ignore_ascii_case(prefix) {
+            continue;
+        }
+        let Some(number) = owned[prefix.len()..].split('.').next() else {
+            continue;
+        };
+        let Ok(frame) = number.parse::<usize>() else {
+            continue;
+        };
+        if frame < frame_count
+            && path
+                .replace('.', &format!("{frame}."))
+                .eq_ignore_ascii_case(owned)
+        {
+            references.storyboard.insert(owned.clone());
+        }
     }
 }
 
@@ -391,6 +411,19 @@ mod tests {
         for frame in ["sb/foo0.png", "sb/foo1.png", "sb/foo2.png"] {
             assert!(refs.storyboard.contains(frame), "missing frame {frame}");
         }
+    }
+
+    #[test]
+    fn animation_work_is_bounded_by_owned_files() {
+        let known = files(&["sb/foo0.png", "sb/foo999999.png", "other.png"]);
+        let text = format!(
+            "[Events]\nAnimation,Foreground,Centre,\"sb/foo.png\",0,0,{},50\n",
+            usize::MAX
+        );
+        let refs = parse(&text, SourceKind::Difficulty, &known);
+        assert!(refs.storyboard.contains("sb/foo999999.png"));
+        assert!(!refs.storyboard.contains("other.png"));
+        assert!(refs.storyboard.len() <= known.len());
     }
 
     #[test]

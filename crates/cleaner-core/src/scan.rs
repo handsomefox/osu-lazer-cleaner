@@ -188,7 +188,11 @@ fn classify_set(
     let candidates = set
         .files
         .iter()
-        .filter(|file| !protected.contains(&file.filename))
+        .filter(|file| {
+            !protected
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&file.filename))
+        })
         .filter_map(|file| {
             let category = categorise(&file.filename, &references)?;
             let remaining = usage_counts
@@ -511,12 +515,19 @@ fn is_blob_name(name: &str) -> bool {
 /// Case-insensitive extension test, matching how lazer compares filenames.
 fn has_extension(filename: &str, extension: &str) -> bool {
     filename.len() > extension.len()
-        && filename[filename.len() - extension.len()..].eq_ignore_ascii_case(extension)
+        && filename.as_bytes()[filename.len() - extension.len()..]
+            .eq_ignore_ascii_case(extension.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_filenames_do_not_panic_during_extension_checks() {
+        assert!(!has_extension("aああ", ".mp4"));
+        assert!(has_extension("あ.MP4", ".mp4"));
+    }
 
     fn refs_with_background(name: &str) -> osu::References {
         let mut references = osu::References::default();
