@@ -2,8 +2,8 @@
 //!
 //! The order is deliberate. The database transaction commits first, then the blobs move. If
 //! the process dies between the two, the library holds blobs nothing references, which lazer
-//! sweeps on its next startup and this tool reports as unreferenced. The reverse order would
-//! leave the database pointing at files that are gone.
+//! sweeps on its next startup. A manifest is saved before either step so an interrupted clean
+//! can be restored. The reverse order would leave the database pointing at files that are gone.
 
 use crate::error::SnapshotError;
 use crate::plan::{Options, Plan};
@@ -79,6 +79,7 @@ pub fn run(
         });
     }
 
+    check_database_path(library)?;
     let snapshot_dir = snapshot::begin(library)?;
 
     // Orphaned blobs have no usage to detach; they are already unreferenced.
@@ -91,10 +92,29 @@ pub fn run(
         })
         .collect();
 
-    let schema_version = {
+    progress(CleanProgress::UpdatingDatabase);
+    let (final_dir, freed) = {
         let realm = Realm::open_for_write(&library.database())?;
-        realm.erase_usages(&removals)?;
-        realm.schema_version()
+        realm.erase_usages_with(|realm| {
+            let current = realm.read_library()?;
+            let freed = validate_candidates(&candidates, &current)?;
+            let manifest = Manifest {
+                format_version: snapshot::FORMAT_VERSION,
+                created: jiff::Timestamp::now(),
+                app_version: env!("CARGO_PKG_VERSION").to_owned(),
+                schema_version: realm.schema_version(),
+                detached: candidates.clone(),
+                blobs: freed
+                    .iter()
+                    .filter(|(hash, _)| library.blob_path(hash).is_file())
+                    .map(|(hash, size)| (hash.clone(), *size))
+                    .collect(),
+            };
+            // Publish recovery data before committing or moving any bytes. An interrupted
+            // clean remains restorable, including blobs that never left the library.
+            let dir = snapshot::finalise(&snapshot_dir, &manifest)?;
+            Ok::<_, SnapshotError>((removals.clone(), (dir, freed)))
+        })?
     };
 
     // Only blobs that reach zero usages may move. A file shared with another set, a skin, or a
@@ -103,25 +123,13 @@ pub fn run(
     // Sizes go into a map first. Looking each one up by scanning the candidate list meant a
     // pass over every candidate for every blob, which on a large clean is tens of billions of
     // string comparisons before a single file moves.
-    let mut freed: HashMap<&str, u64> = HashMap::new();
-    for candidate in candidates.iter().filter(|c| c.frees_blob) {
-        freed.insert(candidate.hash.as_str(), candidate.bytes);
-    }
-
-    let moved = stash_all(library, &snapshot_dir, &freed, &mut progress)?;
+    let freed = freed
+        .iter()
+        .map(|(hash, size)| (hash.as_str(), *size))
+        .collect();
+    let moved = stash_all(library, &final_dir, &freed, &mut progress)?;
     let blobs: Vec<(String, u64)> = moved;
     let bytes = blobs.iter().map(|(_, size)| size).sum();
-
-    let manifest = Manifest {
-        format_version: snapshot::FORMAT_VERSION,
-        created: jiff::Timestamp::now(),
-        app_version: env!("CARGO_PKG_VERSION").to_owned(),
-        schema_version,
-        detached: candidates.clone(),
-        blobs: blobs.clone(),
-    };
-
-    let final_dir = snapshot::finalise(&snapshot_dir, &manifest)?;
 
     Ok(Outcome {
         detached: removals.len(),
@@ -130,6 +138,60 @@ pub fn run(
         snapshot: Some(final_dir),
         dry_run: false,
     })
+}
+
+/// Rejects shifted indices and recomputes which blobs lose their last owner.
+fn validate_candidates(
+    candidates: &[crate::Candidate],
+    current: &cleaner_realm::Library,
+) -> Result<HashMap<String, u64>, SnapshotError> {
+    let sets: HashMap<_, _> = current
+        .beatmap_sets
+        .iter()
+        .map(|set| (set.index, set))
+        .collect();
+    let mut remaining = current.usage_counts.clone();
+    let mut seen = std::collections::HashSet::new();
+    for candidate in candidates {
+        if candidate.hash.len() != 64 || !candidate.hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(SnapshotError::StalePlan);
+        }
+        if candidate.set_index == usize::MAX {
+            if remaining.get(&candidate.hash).copied().unwrap_or(0) != 0 {
+                return Err(SnapshotError::StalePlan);
+            }
+            continue;
+        }
+        let Some(set) = sets.get(&candidate.set_index) else {
+            return Err(SnapshotError::StalePlan);
+        };
+        let Some(file) = set.files.get(candidate.file_index) else {
+            return Err(SnapshotError::StalePlan);
+        };
+        if set.id != candidate.set_id
+            || file.hash != candidate.hash
+            || file.filename != candidate.filename
+            || file.filename.to_ascii_lowercase().ends_with(".osu")
+            || set
+                .audio
+                .iter()
+                .any(|audio| audio.eq_ignore_ascii_case(&file.filename))
+            || !seen.insert((candidate.set_index, candidate.file_index))
+        {
+            return Err(SnapshotError::StalePlan);
+        }
+        let count = remaining
+            .get_mut(&candidate.hash)
+            .ok_or(SnapshotError::StalePlan)?;
+        *count = count.checked_sub(1).ok_or(SnapshotError::StalePlan)?;
+    }
+    Ok(candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.frees_blob && remaining.get(&candidate.hash).copied().unwrap_or(0) == 0
+        })
+        .map(|candidate| (candidate.hash.clone(), candidate.bytes))
+        .collect())
 }
 
 /// Rewrites the database without its free space, reporting the sizes before and after.
@@ -143,6 +205,7 @@ pub fn run(
 /// Returns [`SnapshotError`] if the database cannot be read or realm-core refuses to compact,
 /// which it does while anything else has the database open.
 pub fn compact(library: &Library) -> Result<(u64, u64), SnapshotError> {
+    check_database_path(library)?;
     let path = library.database();
 
     let before = std::fs::metadata(&path)
@@ -183,10 +246,13 @@ fn stash_all(
     let failure: std::sync::Mutex<Option<SnapshotError>> = std::sync::Mutex::new(None);
 
     std::thread::scope(|scope| {
-        let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        let workers = std::thread::available_parallelism()
+            .map_or(4, std::num::NonZero::get)
+            .min(hashes.len());
+        let mut handles = Vec::with_capacity(workers);
 
         for _ in 0..workers {
-            scope.spawn(|| {
+            handles.push(scope.spawn(|| {
                 let mut local = Vec::new();
 
                 loop {
@@ -214,11 +280,11 @@ fn stash_all(
                     .lock()
                     .expect("stash mutex was poisoned")
                     .push(local);
-            });
+            }));
         }
 
         // Report from this thread, so the caller's closure never has to be `Sync`.
-        while next.load(std::sync::atomic::Ordering::Relaxed) < hashes.len() {
+        while handles.iter().any(|handle| !handle.is_finished()) {
             progress(CleanProgress::Moving {
                 done: done.load(std::sync::atomic::Ordering::Relaxed),
                 total: hashes.len(),
@@ -253,6 +319,7 @@ pub fn restore(
     snapshot: &Snapshot,
     mut progress: impl FnMut(CleanProgress),
 ) -> Result<usize, SnapshotError> {
+    check_database_path(library)?;
     let blobs = snapshot::restore_blobs(library, snapshot, &mut |done, total| {
         progress(CleanProgress::Moving { done, total });
     })?;
@@ -285,6 +352,14 @@ pub fn restore(
 
     tracing::info!(blobs, rows, "restored a snapshot");
     Ok(blobs)
+}
+
+fn check_database_path(library: &Library) -> Result<(), SnapshotError> {
+    let path = library.database();
+    if !crate::safety::is_safe_path(&path, &[library.root()]) {
+        return Err(SnapshotError::OutsideLibrary { path });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -352,5 +427,68 @@ mod tests {
 
         assert_eq!(outcome.detached, 0);
         assert!(outcome.snapshot.is_none());
+    }
+
+    fn current_library(candidate: &Candidate, references: u32) -> cleaner_realm::Library {
+        cleaner_realm::Library {
+            beatmap_sets: vec![cleaner_realm::BeatmapSet {
+                index: candidate.set_index,
+                id: candidate.set_id,
+                files: vec![cleaner_realm::NamedFile {
+                    index: 0,
+                    filename: candidate.filename.clone(),
+                    hash: candidate.hash.clone(),
+                }],
+                audio: Vec::new(),
+                backgrounds: Vec::new(),
+            }],
+            usage_counts: HashMap::from([(candidate.hash.clone(), references)]),
+        }
+    }
+
+    #[test]
+    fn clean_rechecks_shared_blobs_and_shifted_indices() {
+        let plan = plan_with_one_selected();
+        let candidate = &plan.groups[0].candidates[0];
+        let mut current = current_library(candidate, 2);
+        assert!(
+            validate_candidates(std::slice::from_ref(candidate), &current)
+                .unwrap()
+                .is_empty()
+        );
+        current.beatmap_sets[0].id = [1; 16];
+        assert!(validate_candidates(std::slice::from_ref(candidate), &current).is_err());
+        current.beatmap_sets[0].id = candidate.set_id;
+        current.beatmap_sets[0].files[0].hash = "b".repeat(64);
+        assert!(validate_candidates(std::slice::from_ref(candidate), &current).is_err());
+    }
+
+    #[test]
+    fn clean_rejects_duplicates_and_protected_audio() {
+        let candidate = plan_with_one_selected().groups[0].candidates[0].clone();
+        let mut current = current_library(&candidate, 1);
+        assert!(validate_candidates(&[candidate.clone(), candidate.clone()], &current).is_err());
+        current.beatmap_sets[0]
+            .audio
+            .push(candidate.filename.to_uppercase());
+        assert!(validate_candidates(&[candidate], &current).is_err());
+    }
+
+    #[test]
+    fn stash_errors_do_not_leave_the_progress_loop_running() {
+        let (_dir, library) = library();
+        let count = std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2 + 1;
+        let names: Vec<_> = (0..count).map(|index| format!("invalid-{index}")).collect();
+        let freed = names.iter().map(|name| (name.as_str(), 1)).collect();
+        let started = std::time::Instant::now();
+        assert!(
+            stash_all(&library, library.root(), &freed, &mut |_| {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(10),
+                    "stash workers did not finish"
+                );
+            })
+            .is_err()
+        );
     }
 }

@@ -46,6 +46,9 @@ pub enum ScanError {
 /// Failures while creating, restoring, or deleting a snapshot.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
+    /// The database no longer matches the selected scan results.
+    #[error("the library changed since the scan; scan again before cleaning")]
+    StalePlan,
     /// A file operation failed.
     #[error("{action} failed for {path}: {source}")]
     Io {

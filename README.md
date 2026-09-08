@@ -38,7 +38,7 @@ to the osu! servers, so deleting or editing one breaks score submission on that 
 
 A file is only removed once nothing else refers to it. osu!lazer applies the same rule in
 `RealmFileStore.Cleanup`, expressed as the query `Usages.@count = 0`. Beatmap sets are not the
-only owners: replays and skins hold references too, so a hitsound shared between a beatmap and
+only owners: replays, skins, and cached online assets hold references too, so a hitsound shared between a beatmap and
 a skin stays where it is when only the beatmap gives it up.
 
 Removing anything other than a difficulty leaves `BeatmapSetInfo.Hash` untouched. osu!lazer
@@ -54,13 +54,21 @@ schema on disk rather than reconciling it against a declared one.
 
 ### Nothing is deleted in one step
 
-A clean detaches files from the database and moves them into a snapshot. Moving is a rename,
-so it is instant and needs no extra disk space, which matters when a clean displaces tens of
-gigabytes.
+A clean saves its recovery manifest, detaches files from the database, and moves them into a
+snapshot. Moving uses renames and does not copy the file contents. A failed or interrupted
+clean keeps its manifest so that you can restore files already moved.
+
+Before detaching files, the tool checks their identities and current reference counts under
+the database write lock. If a set or file changed since the scan, the clean stops and asks you
+to scan again.
 
 Your free space does not change yet. That is deliberate. Start osu!lazer, check that your
 beatmaps still play, and then delete the snapshot to reclaim the space. If something is wrong,
 restore the snapshot instead and the files go back.
+
+Restore snapshots newest first. Restore also recreates file records that osu!lazer removed
+after the clean. If a beatmap set is missing or a filename now holds different content, restore
+stops and keeps the snapshot.
 
 Deleting a snapshot is the only operation that destroys anything, and it asks first.
 
@@ -71,7 +79,7 @@ Download the latest release from the
 `osu-lazer-cleaner.exe`. It finds your library automatically, including when `storage.ini`
 points somewhere other than the default location.
 
-Close osu!lazer before cleaning.
+Close osu!lazer before cleaning, restoring, or compacting the database.
 
 ## Command line
 
@@ -120,8 +128,9 @@ cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -
 Testing a Windows executable needs the database on an NTFS volume, because Windows file
 locking does not work over the WSL filesystem.
 
-Some tests need a real osu!lazer library at `ref/client.realm`. They are skipped when it is
-absent, which is why CI does not exercise them.
+Synthetic Realm tests run in CI and cover cached asset references, transaction rollback, and
+restoration after osu!lazer removes a file record. Additional tests use a real library at
+`ref/client.realm` and skip when it is absent. Tests always copy that database before opening it.
 
 ## License
 

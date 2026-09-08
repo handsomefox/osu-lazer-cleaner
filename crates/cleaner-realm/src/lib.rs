@@ -248,6 +248,19 @@ pub struct Realm {
 }
 
 impl Realm {
+    fn check_schema(&self) -> Result<(), RealmError> {
+        let version = self.schema_version();
+        if version > 52 {
+            return Err(RealmError::Core {
+                code: 0,
+                message: format!(
+                    "unsupported osu!lazer schema {version}; this build supports up to 52"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Opens `path` read-only, without migrating it.
     ///
     /// Migration callbacks only fire for `RLM_SCHEMA_MODE_AUTOMATIC` and
@@ -360,7 +373,7 @@ impl Realm {
         keys.into_iter().map(|key| self.class(key)).collect()
     }
 
-    /// Rewrites the database without its free space, and reports whether it shrank.
+    /// Rewrites the database without its free space, and reports whether it was rewritten.
     ///
     /// Realm never shrinks on its own. Deleting rows returns their space to an internal free
     /// list for reuse, so the file stays the same size however much is removed. Compacting
@@ -371,8 +384,8 @@ impl Realm {
     ///
     /// # Errors
     ///
-    /// Returns [`RealmError::Core`] if realm-core refuses to compact, which it does when
-    /// another handle to the database is open.
+    /// Returns [`RealmError::Core`] on a database error. Returns `false` when another handle
+    /// prevents compaction.
     pub fn compact(&self) -> Result<bool, RealmError> {
         let mut compacted = false;
 
@@ -403,6 +416,7 @@ impl Realm {
     ///
     /// Returns [`RealmError::Core`] if the schema does not match what osu!lazer writes.
     pub fn read_library(&self) -> Result<Library, RealmError> {
+        self.check_schema()?;
         let usage = self.class_key("RealmNamedFileUsage")?;
         let filename_key = self.property_key(usage, "Filename")?;
         let target_key = self.property_key(usage, "File")?;
@@ -457,6 +471,20 @@ impl Realm {
                         backgrounds,
                     });
                 }
+            }
+        }
+
+        if let Some(class) = self.optional_class_key("RealmOnlineAsset")? {
+            let asset_file = self.property_key(class, "File")?;
+            for index in 0..self.count(class)? {
+                let asset = self.object_at(class, index)?;
+                // SAFETY: `asset_file` names the embedded usage on this asset.
+                let usage = unsafe { sys::realm_get_linked_object(asset.ptr, asset_file) };
+                let usage = value::Object::from_raw(usage)?;
+                // SAFETY: `target_key` names the File link on this usage.
+                let file = unsafe { sys::realm_get_linked_object(usage.ptr, target_key) };
+                let hash = value::Object::from_raw(file)?.string(hash_key)?;
+                *counts.entry(hash).or_insert(0) += 1;
             }
         }
 
@@ -543,63 +571,89 @@ impl Realm {
     /// Returns [`RealmError::Core`] if the transaction cannot be committed. The transaction is
     /// cancelled on any failure, leaving the database untouched.
     pub fn erase_usages(&self, removals: &[Removal]) -> Result<(), RealmError> {
-        if removals.is_empty() {
-            return Ok(());
-        }
+        self.erase_usages_with(|_| Ok((removals.to_vec(), ())))
+    }
 
-        let class = self.class_key("BeatmapSet")?;
-        let files_key = self.property_key(class, "Files")?;
-
-        let mut by_set: HashMap<usize, Vec<usize>> = HashMap::new();
-        for removal in removals {
-            by_set
-                .entry(removal.set_index)
-                .or_default()
-                .push(removal.file_index);
-        }
-
-        // SAFETY: begins a transaction we either commit or cancel on every path below.
+    /// Validates a plan and records its recovery data under the database write lock.
+    ///
+    /// `prepare` runs before any usages are removed. It returns the removals and a value
+    /// that is returned after commit. A preparation or erase error rolls back the transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the preparation error or a database transaction error.
+    pub fn erase_usages_with<T, E: From<RealmError>>(
+        &self,
+        prepare: impl FnOnce(&Self) -> Result<(Vec<Removal>, T), E>,
+    ) -> Result<T, E> {
+        self.check_schema()?;
+        // SAFETY: every path below commits or rolls back this transaction.
         if !unsafe { sys::realm_begin_write(self.ptr) } {
-            return Err(last_error());
+            return Err(last_error().into());
         }
+        let result = (|| {
+            let (removals, prepared) = prepare(self)?;
 
-        for (set_index, mut file_indices) in by_set {
-            file_indices.sort_unstable();
-            file_indices.reverse();
+            let class = self.class_key("BeatmapSet")?;
+            let files_key = self.property_key(class, "Files")?;
 
-            if let Err(error) = self.erase_from_set(class, files_key, set_index, &file_indices) {
-                // SAFETY: a transaction is open; rolling back discards every edit above.
+            let mut by_set: HashMap<usize, Vec<usize>> = HashMap::new();
+            for removal in &removals {
+                by_set
+                    .entry(removal.set_index)
+                    .or_default()
+                    .push(removal.file_index);
+            }
+
+            for (set_index, mut file_indices) in by_set {
+                file_indices.sort_unstable();
+                file_indices.dedup();
+                file_indices.reverse();
+
+                self.erase_from_set(class, files_key, set_index, &file_indices)?;
+            }
+            Ok(prepared)
+        })();
+
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // SAFETY: the transaction above is open.
                 unsafe { sys::realm_rollback(self.ptr) };
                 return Err(error);
             }
-        }
+        };
 
         // SAFETY: the transaction opened above is still current.
         if !unsafe { sys::realm_commit(self.ptr) } {
-            return Err(last_error());
+            let error = last_error();
+            // SAFETY: cancel the failed commit before releasing the handle.
+            unsafe { sys::realm_rollback(self.ptr) };
+            return Err(error.into());
         }
 
-        Ok(())
+        Ok(prepared)
     }
 
     /// Reattaches usages to their beatmap sets, in one transaction.
     ///
     /// This is the inverse of [`Realm::erase_usages`], used when restoring a snapshot. Each
     /// entry recreates a `RealmNamedFileUsage` at the end of its set's list and points it at
-    /// the existing `File` row for that hash.
+    /// the `File` row for that hash, recreating the row if lazer removed it.
     ///
     /// Without this, restoring would put the bytes back but leave nothing referring to them,
     /// and osu!lazer would delete them again on its next startup.
     ///
     /// # Errors
     ///
-    /// Returns [`RealmError::Core`] if a hash has no `File` row, or if the transaction cannot
-    /// be committed. The transaction is rolled back on any failure.
+    /// Returns [`RealmError::Core`] if a set is missing, a filename has different content,
+    /// or the transaction cannot be committed. Any failure rolls back the transaction.
     pub fn restore_usages(
         &self,
         restorations: &[Restoration],
         mut progress: impl FnMut(usize, usize),
     ) -> Result<usize, RealmError> {
+        self.check_schema()?;
         if restorations.is_empty() {
             return Ok(0);
         }
@@ -680,14 +734,33 @@ impl Realm {
         entries: &[&Restoration],
     ) -> Result<usize, RealmError> {
         let Some(object) = self.find_set(class, set_ref)? else {
-            // The set was deleted since the snapshot was taken. Its files have nowhere to go,
-            // which is not an error: the user removed the beatmap deliberately.
-            return Ok(0);
+            return Err(RealmError::Core {
+                code: 0,
+                message: "the snapshot's beatmap set no longer exists".to_owned(),
+            });
         };
 
-        // Only the names matter here. Reading the full usages would resolve each one's linked
-        // File row and read its hash, which is a wasted lookup per file already in the set.
-        let present = Self::read_filenames(&object, files_key, filename_key)?;
+        let hash_key = self.property_key(file_class, "Hash")?;
+        let mut present: HashMap<_, _> =
+            Self::read_usages(&object, files_key, filename_key, target_key, hash_key)?
+                .into_iter()
+                .map(|file| (file.filename, file.hash))
+                .collect();
+
+        for entry in entries {
+            if present
+                .get(&entry.filename)
+                .is_some_and(|hash| hash != &entry.hash)
+            {
+                return Err(RealmError::Core {
+                    code: 0,
+                    message: format!(
+                        "{} now refers to different content; keeping the snapshot",
+                        entry.filename
+                    ),
+                });
+            }
+        }
 
         // SAFETY: `object` is live and `files_key` names a list property on its class. The
         // handle is acquired once and reused, rather than reacquired for every file.
@@ -699,7 +772,7 @@ impl Realm {
         let mut restored = 0;
         for entry in entries {
             // Already listed, which happens when a restore runs twice.
-            if present.contains(&entry.filename) {
+            if present.contains_key(&entry.filename) {
                 continue;
             }
 
@@ -711,53 +784,12 @@ impl Realm {
             }
 
             restored += 1;
+            present.insert(entry.filename.clone(), entry.hash.clone());
         }
 
         // SAFETY: released exactly once, after the loop.
         unsafe { sys::realm_release(list.cast()) };
         Ok(restored)
-    }
-
-    /// Reads just the filenames from an owner's file list.
-    fn read_filenames(
-        owner: &value::Object,
-        list_key: sys::realm_property_key_t,
-        filename_key: sys::realm_property_key_t,
-    ) -> Result<std::collections::HashSet<String>, RealmError> {
-        // SAFETY: `owner` is live and `list_key` names a list property on its class.
-        let list = unsafe { sys::realm_get_list(owner.ptr, list_key) };
-        if list.is_null() {
-            return Err(last_error());
-        }
-
-        let mut size = 0;
-        // SAFETY: `list` is live; released on every path below.
-        if !unsafe { sys::realm_list_size(list, &raw mut size) } {
-            // SAFETY: released before propagating.
-            unsafe { sys::realm_release(list.cast()) };
-            return Err(last_error());
-        }
-
-        let mut names = std::collections::HashSet::with_capacity(size);
-        for index in 0..size {
-            // SAFETY: `index` is below the size realm-core just reported.
-            let entry = unsafe { sys::realm_list_get_linked_object(list, index) };
-
-            match value::Object::from_raw(entry).and_then(|e| e.string(filename_key)) {
-                Ok(name) => {
-                    names.insert(name);
-                }
-                Err(error) => {
-                    // SAFETY: released before propagating.
-                    unsafe { sys::realm_release(list.cast()) };
-                    return Err(error);
-                }
-            }
-        }
-
-        // SAFETY: released exactly once, after the loop.
-        unsafe { sys::realm_release(list.cast()) };
-        Ok(names)
     }
 
     /// Adds one `RealmNamedFileUsage` to the end of an already-acquired file list.
@@ -858,7 +890,7 @@ impl Realm {
         value::Object::from_raw(object).map(Some)
     }
 
-    /// Finds the `File` row for a hash.
+    /// Finds the `File` row for a hash, recreating a swept row in the caller's transaction.
     fn find_file_row(
         &self,
         file_class: sys::realm_class_key_t,
@@ -881,11 +913,14 @@ impl Realm {
             sys::realm_object_find_with_primary_key(self.ptr, file_class, key, &raw mut found)
         };
 
-        if !found || object.is_null() {
-            return Err(RealmError::Core {
-                code: 0,
-                message: format!("no File row for hash {hash}"),
-            });
+        if object.is_null() && !found {
+            // osu!lazer removes zero-usage File rows on startup. The primary key is the
+            // only stored property, so restoring it recreates the original row exactly.
+            // SAFETY: the caller holds a write transaction and `key` owns no borrowed data
+            // beyond `raw`, which remains live through this call.
+            let created =
+                unsafe { sys::realm_object_create_with_primary_key(self.ptr, file_class, key) };
+            return value::Object::from_raw(created);
         }
 
         value::Object::from_raw(object)
@@ -1131,6 +1166,263 @@ pub struct ClassInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn property(
+        name: &'static CStr,
+        kind: sys::realm_property_type_e,
+    ) -> sys::realm_property_info_t {
+        sys::realm_property_info_t {
+            name: name.as_ptr(),
+            public_name: c"".as_ptr(),
+            link_target: c"".as_ptr(),
+            link_origin_property_name: c"".as_ptr(),
+            type_: kind,
+            ..Default::default()
+        }
+    }
+
+    fn link(name: &'static CStr, target: &'static CStr, list: bool) -> sys::realm_property_info_t {
+        sys::realm_property_info_t {
+            link_target: target.as_ptr(),
+            collection_type: if list {
+                sys::realm_collection_type_RLM_COLLECTION_TYPE_LIST
+            } else {
+                sys::realm_collection_type_RLM_COLLECTION_TYPE_NONE
+            },
+            flags: i32::from(!list), // Single object links are nullable.
+            ..property(name, sys::realm_property_type_RLM_PROPERTY_TYPE_OBJECT)
+        }
+    }
+
+    /// Builds a small library through the C API. No personal data or schema migration is used.
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "test fixture setup owns and releases every C API handle in one sequence"
+    )]
+    fn synthetic_realm(path: &Path) -> Realm {
+        let string = sys::realm_property_type_RLM_PROPERTY_TYPE_STRING;
+        let boolean = sys::realm_property_type_RLM_PROPERTY_TYPE_BOOL;
+        let uuid = sys::realm_property_type_RLM_PROPERTY_TYPE_UUID;
+        let properties = [
+            vec![sys::realm_property_info_t {
+                flags: 2,
+                ..property(c"Hash", string)
+            }],
+            vec![property(c"Filename", string), link(c"File", c"File", false)],
+            vec![
+                sys::realm_property_info_t {
+                    flags: 2,
+                    ..property(c"ID", uuid)
+                },
+                property(c"DeletePending", boolean),
+                property(c"Protected", boolean),
+                link(c"Files", c"RealmNamedFileUsage", true),
+                link(c"Beatmaps", c"Beatmap", true),
+            ],
+            vec![link(c"Metadata", c"BeatmapMetadata", false)],
+            vec![
+                property(c"AudioFile", string),
+                property(c"BackgroundFile", string),
+            ],
+            vec![link(c"File", c"RealmNamedFileUsage", false)],
+        ];
+        let names = [
+            c"File",
+            c"RealmNamedFileUsage",
+            c"BeatmapSet",
+            c"Beatmap",
+            c"BeatmapMetadata",
+            c"RealmOnlineAsset",
+        ];
+        let classes: Vec<_> = names
+            .iter()
+            .zip(&properties)
+            .enumerate()
+            .map(|(index, (name, props))| sys::realm_class_info_t {
+                name: name.as_ptr(),
+                primary_key: match index {
+                    0 => c"Hash".as_ptr(),
+                    2 => c"ID".as_ptr(),
+                    _ => c"".as_ptr(),
+                },
+                num_properties: props.len(),
+                flags: i32::from(index == 1),
+                ..Default::default()
+            })
+            .collect();
+        let mut pointers: Vec<_> = properties.iter().map(Vec::as_ptr).collect();
+        let raw_path = CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: all schema names and arrays outlive these calls. This creates a new scratch
+        // database with a declared schema. Production opens never use this schema mode.
+        let realm = unsafe {
+            let schema =
+                sys::realm_schema_new(classes.as_ptr(), classes.len(), pointers.as_mut_ptr());
+            assert!(!schema.is_null());
+            let config = sys::realm_config_new();
+            let scheduler = make_noop_scheduler();
+            sys::realm_config_set_path(config, raw_path.as_ptr());
+            sys::realm_config_set_schema(config, schema);
+            sys::realm_config_set_schema_version(config, 52);
+            sys::realm_config_set_scheduler(config, scheduler);
+            let ptr = sys::realm_open(config);
+            sys::realm_release(config.cast());
+            sys::realm_release(schema.cast());
+            sys::realm_release(scheduler.cast());
+            assert!(!ptr.is_null(), "{}", last_error());
+            Realm { ptr }
+        };
+        let class = realm.class_key("BeatmapSet").unwrap();
+        let key = sys::realm_value_t {
+            type_: sys::realm_value_type_RLM_TYPE_UUID,
+            __bindgen_anon_1: sys::realm_value__bindgen_ty_1 {
+                uuid: sys::realm_uuid_t { bytes: [1; 16] },
+            },
+        };
+        // SAFETY: the realm and class are live, and the object handle is released after commit.
+        unsafe {
+            assert!(sys::realm_begin_write(realm.ptr));
+            let object = sys::realm_object_create_with_primary_key(realm.ptr, class, key);
+            assert!(!object.is_null(), "{}", last_error());
+            assert!(sys::realm_commit(realm.ptr));
+            sys::realm_release(object.cast());
+        }
+        realm.restore_usages(&[restoration()], |_, _| {}).unwrap();
+        realm
+    }
+
+    fn restoration() -> Restoration {
+        Restoration {
+            set_id: [1; 16],
+            set_index: 0,
+            filename: "Thumbs.db".to_owned(),
+            hash: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "test creates an online asset and its embedded usage in one transaction"
+    )]
+    fn synthetic_online_asset_keeps_its_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let realm = synthetic_realm(&dir.path().join("client.realm"));
+        let asset_class = realm.class_key("RealmOnlineAsset").unwrap();
+        let asset_file = realm.property_key(asset_class, "File").unwrap();
+        let target = realm
+            .property_key(realm.class_key("RealmNamedFileUsage").unwrap(), "File")
+            .unwrap();
+        let file = realm
+            .find_file_row(realm.class_key("File").unwrap(), &restoration().hash)
+            .unwrap();
+        // SAFETY: every object and property belongs to this realm. The transaction commits
+        // before the owned object handles are released.
+        unsafe {
+            assert!(sys::realm_begin_write(realm.ptr));
+            let asset =
+                value::Object::from_raw(sys::realm_object_create(realm.ptr, asset_class)).unwrap();
+            let usage =
+                value::Object::from_raw(sys::realm_set_embedded(asset.ptr, asset_file)).unwrap();
+            let link = sys::realm_value_t {
+                type_: sys::realm_value_type_RLM_TYPE_LINK,
+                __bindgen_anon_1: sys::realm_value__bindgen_ty_1 {
+                    link: sys::realm_object_as_link(file.ptr),
+                },
+            };
+            assert!(sys::realm_set_value(usage.ptr, target, link, false));
+            assert!(sys::realm_commit(realm.ptr));
+        }
+        assert_eq!(
+            realm.read_library().unwrap().usage_counts[&restoration().hash],
+            2
+        );
+        realm
+            .erase_usages(&[Removal {
+                set_index: 0,
+                file_index: 0,
+            }])
+            .unwrap();
+        assert_eq!(
+            realm.read_library().unwrap().usage_counts[&restoration().hash],
+            1
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "test simulates lazer deleting an orphaned File row"
+    )]
+    fn synthetic_restore_recreates_a_swept_file_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let realm = synthetic_realm(&dir.path().join("client.realm"));
+        realm
+            .erase_usages(&[Removal {
+                set_index: 0,
+                file_index: 0,
+            }])
+            .unwrap();
+        let file = realm
+            .find_file_row(realm.class_key("File").unwrap(), &restoration().hash)
+            .unwrap();
+        // SAFETY: delete the known fixture row in a transaction, as lazer's cleanup does.
+        unsafe {
+            assert!(sys::realm_begin_write(realm.ptr));
+            assert!(sys::realm_object_delete(file.ptr));
+            assert!(sys::realm_commit(realm.ptr));
+        }
+        assert_eq!(
+            realm.restore_usages(&[restoration()], |_, _| {}).unwrap(),
+            1
+        );
+        assert_eq!(
+            realm.restore_usages(&[restoration()], |_, _| {}).unwrap(),
+            0
+        );
+        assert_eq!(
+            realm.read_library().unwrap().usage_counts[&restoration().hash],
+            1
+        );
+        assert_eq!(realm.schema_version(), 52);
+    }
+
+    #[test]
+    fn synthetic_failed_preparation_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let realm = synthetic_realm(&dir.path().join("client.realm"));
+        let error = realm.erase_usages_with::<(), RealmError>(|_| {
+            Err(RealmError::InvalidPath("test".to_owned()))
+        });
+        assert!(error.is_err());
+        assert_eq!(
+            realm.read_library().unwrap().usage_counts[&restoration().hash],
+            1
+        );
+        realm
+            .erase_usages(&[Removal {
+                set_index: 0,
+                file_index: 0,
+            }])
+            .unwrap();
+        assert!(realm.read_library().unwrap().usage_counts.is_empty());
+    }
+
+    #[test]
+    fn synthetic_restore_rejects_conflicting_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let realm = synthetic_realm(&dir.path().join("client.realm"));
+        let mut entry = restoration();
+        entry.hash = "b".repeat(64);
+        assert!(realm.restore_usages(&[entry], |_, _| {}).is_err());
+        assert_eq!(
+            realm.read_library().unwrap().usage_counts[&restoration().hash],
+            1
+        );
+        assert_eq!(
+            realm.restore_usages(&[restoration()], |_, _| {}).unwrap(),
+            0
+        );
+    }
 
     /// Copies the sample database into a scratch directory and returns the copy's path.
     ///

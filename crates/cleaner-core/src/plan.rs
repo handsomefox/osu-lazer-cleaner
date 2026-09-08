@@ -191,18 +191,20 @@ mod set_id {
         out.serialize_str(&text)
     }
 
-    /// Reads the key back, treating anything malformed as absent.
+    /// Reads the key back, rejecting malformed identities.
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(input: D) -> Result<[u8; 16], D::Error> {
         let text = String::deserialize(input)?;
         let mut id = [0_u8; 16];
 
-        if text.len() != 32 {
-            return Ok(id);
+        if text.len() != 32 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(serde::de::Error::custom(
+                "set_id must contain 32 hex digits",
+            ));
         }
 
         for (index, slot) in id.iter_mut().enumerate() {
             let Ok(byte) = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16) else {
-                return Ok([0_u8; 16]);
+                return Err(serde::de::Error::custom("invalid set_id"));
             };
             *slot = byte;
         }
@@ -342,5 +344,23 @@ mod tests {
     #[test]
     fn previewing_is_the_default() {
         assert!(Options::default().dry_run);
+    }
+
+    #[test]
+    fn malformed_set_id_cannot_fall_back_to_a_position() {
+        let mut value = serde_json::to_value(candidate("aa", 1, Category::Junk, true)).unwrap();
+        for malformed in [
+            "x".repeat(32),
+            format!("a{}a", "é".repeat(15)),
+            String::new(),
+        ] {
+            value["set_id"] = serde_json::Value::String(malformed);
+            assert!(serde_json::from_value::<Candidate>(value.clone()).is_err());
+        }
+        value.as_object_mut().unwrap().remove("set_id");
+        assert_eq!(
+            serde_json::from_value::<Candidate>(value).unwrap().set_id,
+            [0; 16]
+        );
     }
 }

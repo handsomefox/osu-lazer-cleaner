@@ -6,23 +6,36 @@ use std::fs;
 use std::path::{Component, MAIN_SEPARATOR, Path};
 
 /// Reports whether `path` is strictly under one of `roots` (never a root
-/// itself). Comparison is lexical and case-insensitive on cleaned paths, and
+/// itself). Comparison is lexical and case-insensitive on Windows, and
 /// the target and every existing ancestor below the trusted root are rejected
-/// when they are a symlink or Windows reparse point.
+/// when they are a symlink or Windows reparse point. Parent traversal is rejected.
 #[must_use]
 pub fn is_safe_path(path: &Path, roots: &[&Path]) -> bool {
+    // Do not normalise away components before checking symlinks.
+    if path.components().any(|part| part == Component::ParentDir) {
+        return false;
+    }
     roots
         .iter()
         .any(|root| is_path_under_root(path, root) && path_chain_is_safe(path, root))
 }
 
 fn is_path_under_root(path: &Path, root: &Path) -> bool {
-    let path_key = normalized_key(path);
-    let root_key = normalized_key(root);
-    if path_key.is_empty() || root_key.is_empty() || path_key == root_key {
-        return false;
+    #[cfg(not(windows))]
+    return path != root && path.starts_with(root);
+
+    #[cfg(windows)]
+    {
+        if path != root && path.starts_with(root) {
+            return true;
+        }
+        let path_key = normalized_key(path);
+        let root_key = normalized_key(root);
+        if path_key.is_empty() || root_key.is_empty() || path_key == root_key {
+            return false;
+        }
+        path_key.starts_with(&format!("{root_key}{MAIN_SEPARATOR}"))
     }
-    path_key.starts_with(&format!("{root_key}{MAIN_SEPARATOR}"))
 }
 
 /// Checks every directory between `root` and the target. A missing ancestor
@@ -37,7 +50,7 @@ fn path_chain_is_safe(path: &Path, root: &Path) -> bool {
     let root_key = normalized_key(root);
     let mut current = Some(path);
     while let Some(candidate) = current {
-        if normalized_key(candidate) == root_key {
+        if candidate == root || (cfg!(windows) && normalized_key(candidate) == root_key) {
             return true;
         }
         match fs::symlink_metadata(candidate) {
@@ -138,6 +151,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn comparison_is_case_insensitive() {
         let root = sep("/Home/User/AppData");
         assert!(is_safe_path(&sep("/home/user/appdata/X"), &[&root]));
@@ -147,7 +161,7 @@ mod tests {
     fn dotdot_cannot_escape() {
         let root = sep("/home/user/appdata");
         assert!(!is_safe_path(&sep("/home/user/appdata/../other"), &[&root]));
-        assert!(is_safe_path(&sep("/home/user/appdata/a/../b"), &[&root]));
+        assert!(!is_safe_path(&sep("/home/user/appdata/a/../b"), &[&root]));
     }
 
     #[test]
@@ -155,6 +169,13 @@ mod tests {
         let root = sep("/home/user/appdata");
         assert!(!is_safe_path(Path::new(""), &[&root]));
         assert!(!is_safe_path(&sep("/home/user/appdata/x"), &[]));
+    }
+
+    #[test]
+    fn the_current_directory_can_be_a_trusted_root() {
+        let root = Path::new(".");
+        assert!(is_safe_path(&root.join("missing-directory/blob"), &[root]));
+        assert!(!is_safe_path(root, &[root]));
     }
 
     #[test]
@@ -194,5 +215,16 @@ mod tests {
 
         assert!(!is_safe_path(&root.join("linked/cache"), &[&root]));
         assert!(!is_safe_path(&root.join("linked"), &[&root]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn differently_cased_siblings_are_outside_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("safe");
+        let other = dir.path().join("SAFE");
+        create_dir_all(&root).unwrap();
+        create_dir_all(&other).unwrap();
+        assert!(!is_safe_path(&other.join("file"), &[&root]));
     }
 }

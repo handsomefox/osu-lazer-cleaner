@@ -103,7 +103,7 @@ impl Library {
 /// Builds the `files/`-relative path for a hash.
 #[must_use]
 pub fn blob_relative_path(hash: &str) -> PathBuf {
-    if hash.len() < 2 {
+    if !hash.is_ascii() || hash.len() < 2 {
         return PathBuf::from(hash);
     }
 

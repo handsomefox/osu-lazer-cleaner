@@ -10,7 +10,52 @@ use crate::plan::Candidate;
 use crate::safety::is_safe_path;
 use crate::storage::{Library, blob_relative_path};
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+
+fn guard(library: &Library, path: &Path) -> Result<(), SnapshotError> {
+    if !is_safe_path(path, &[library.root()]) {
+        return Err(SnapshotError::OutsideLibrary {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_hash(hash: &str) -> Result<(), SnapshotError> {
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(SnapshotError::OutsideLibrary {
+            path: PathBuf::from(hash),
+        });
+    }
+    Ok(())
+}
+
+fn validate_directory(library: &Library, dir: &Path) -> Result<(), SnapshotError> {
+    if dir.parent() != Some(library.snapshots_dir().as_path()) {
+        return Err(SnapshotError::OutsideLibrary {
+            path: dir.to_path_buf(),
+        });
+    }
+    guard(library, dir)
+}
+
+fn regular_file(path: &Path) -> Result<bool, SnapshotError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(SnapshotError::Io {
+            action: "checking a blob",
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, "expected a regular file"),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(SnapshotError::Io {
+            action: "checking a blob",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
 
 /// Manifest format version. Bumped whenever [`Manifest`] changes shape.
 pub const FORMAT_VERSION: u32 = 1;
@@ -79,6 +124,7 @@ impl Snapshot {
 /// Returns [`SnapshotError::Io`] only if the snapshots directory itself cannot be read.
 pub fn list(library: &Library) -> Result<Vec<Snapshot>, SnapshotError> {
     let root = library.snapshots_dir();
+    guard(library, &root)?;
     if !root.is_dir() {
         return Ok(Vec::new());
     }
@@ -95,6 +141,7 @@ pub fn list(library: &Library) -> Result<Vec<Snapshot>, SnapshotError> {
         .filter(|entry| !entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX))
         .filter_map(|entry| {
             let dir = entry.path();
+            guard(library, &dir.join(MANIFEST_FILE)).ok()?;
             read_manifest(&dir)
                 .ok()
                 .map(|manifest| Snapshot { dir, manifest })
@@ -151,6 +198,9 @@ pub fn begin(library: &Library) -> Result<PathBuf, SnapshotError> {
         jiff::Timestamp::now().as_nanosecond()
     ));
 
+    guard(library, &blobs.join(BLOBS_DIR))?;
+    guard(library, &library.files_dir())?;
+
     std::fs::create_dir_all(blobs.join(BLOBS_DIR)).map_err(|source| SnapshotError::Io {
         action: "creating a snapshot directory",
         path: blobs.clone(),
@@ -175,6 +225,8 @@ pub fn stash_blob(
     snapshot_dir: &Path,
     hash: &str,
 ) -> Result<bool, SnapshotError> {
+    validate_hash(hash)?;
+    validate_directory(library, snapshot_dir)?;
     let source = library.blob_path(hash);
     let files_dir = library.files_dir();
 
@@ -184,12 +236,14 @@ pub fn stash_blob(
         return Err(SnapshotError::OutsideLibrary { path: source });
     }
 
-    if !source.exists() {
+    if !regular_file(&source)? {
         // Already gone: lazer's own cleanup, or a previous run, got there first.
         return Ok(false);
     }
 
     let destination = snapshot_dir.join(BLOBS_DIR).join(hash);
+    guard(library, &source)?;
+    guard(library, &destination)?;
     std::fs::rename(&source, &destination).map_err(|error| SnapshotError::Io {
         action: "moving a file into the snapshot",
         path: source,
@@ -213,11 +267,20 @@ pub fn finalise(temp_dir: &Path, manifest: &Manifest) -> Result<PathBuf, Snapsho
         })?;
 
     let manifest_path = temp_dir.join(MANIFEST_FILE);
-    std::fs::write(&manifest_path, text).map_err(|source| SnapshotError::Io {
-        action: "writing the snapshot manifest",
-        path: manifest_path,
-        source,
-    })?;
+    let mut file =
+        std::fs::File::create_new(&manifest_path).map_err(|source| SnapshotError::Io {
+            action: "writing the snapshot manifest",
+            path: manifest_path.clone(),
+            source,
+        })?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|source| SnapshotError::Io {
+            action: "saving the snapshot manifest",
+            path: manifest_path,
+            source,
+        })?;
+    drop(file);
 
     let final_dir = unique_dir(temp_dir, manifest.created);
     std::fs::rename(temp_dir, &final_dir).map_err(|source| SnapshotError::Io {
@@ -247,16 +310,26 @@ pub fn restore_blobs(
     snapshot: &Snapshot,
     progress: &mut impl FnMut(usize, usize),
 ) -> Result<usize, SnapshotError> {
+    validate_directory(library, &snapshot.dir)?;
+    for (hash, _) in &snapshot.manifest.blobs {
+        validate_hash(hash)?;
+    }
+    for candidate in &snapshot.manifest.detached {
+        validate_hash(&candidate.hash)?;
+    }
     let blobs = &snapshot.manifest.blobs;
     let next = std::sync::atomic::AtomicUsize::new(0);
     let done = std::sync::atomic::AtomicUsize::new(0);
     let failure: std::sync::Mutex<Option<SnapshotError>> = std::sync::Mutex::new(None);
 
     std::thread::scope(|scope| {
-        let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        let workers = std::thread::available_parallelism()
+            .map_or(4, std::num::NonZero::get)
+            .min(blobs.len());
+        let mut handles = Vec::with_capacity(workers);
 
         for _ in 0..workers {
-            scope.spawn(|| {
+            handles.push(scope.spawn(|| {
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some((hash, _)) = blobs.get(index) else {
@@ -273,11 +346,11 @@ pub fn restore_blobs(
 
                     done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-            });
+            }));
         }
 
         // Report from this thread, so the caller's closure never has to be `Sync`.
-        while next.load(std::sync::atomic::Ordering::Relaxed) < blobs.len() {
+        while handles.iter().any(|handle| !handle.is_finished()) {
             progress(done.load(std::sync::atomic::Ordering::Relaxed), blobs.len());
             std::thread::sleep(std::time::Duration::from_millis(120));
         }
@@ -292,13 +365,24 @@ pub fn restore_blobs(
 
 /// Moves one blob out of a snapshot and back into the library.
 fn restore_one(library: &Library, snapshot_dir: &Path, hash: &str) -> Result<(), SnapshotError> {
+    validate_hash(hash)?;
+    validate_directory(library, snapshot_dir)?;
     let source = snapshot_dir.join(BLOBS_DIR).join(hash);
-    if !source.exists() {
-        return Ok(());
+    let destination = library.blob_path(hash);
+    guard(library, &source)?;
+    guard(library, &destination)?;
+    if !regular_file(&source)? {
+        if regular_file(&destination)? {
+            return Ok(());
+        }
+        return Err(SnapshotError::Io {
+            action: "restoring a missing blob",
+            path: source,
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        });
     }
 
-    let destination = library.blob_path(hash);
-    if destination.exists() {
+    if regular_file(&destination)? {
         // The blob came back another way, most likely a re-import. Ours is redundant.
         return Ok(());
     }
@@ -325,6 +409,7 @@ fn restore_one(library: &Library, snapshot_dir: &Path, hash: &str) -> Result<(),
 /// Returns [`SnapshotError::OutsideLibrary`] if the snapshot is not directly inside the
 /// library's snapshots directory, or [`SnapshotError::Io`] if removal fails.
 pub fn delete(library: &Library, snapshot: &Snapshot) -> Result<(), SnapshotError> {
+    validate_directory(library, &snapshot.dir)?;
     let snapshots_dir = library.snapshots_dir();
 
     // Defence in depth, adapted from eldenring-backuptool's retention guard: a snapshot must
@@ -359,7 +444,11 @@ fn ensure_same_volume(library: &Library, snapshot_dir: &Path) -> Result<(), Snap
         source,
     })?;
 
-    let target = library.files_dir().join(".volume-probe");
+    let target = library.files_dir().join(format!(
+        ".volume-probe-{}",
+        jiff::Timestamp::now().as_nanosecond()
+    ));
+    guard(library, &target)?;
     if let Some(parent) = target.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -504,6 +593,71 @@ mod tests {
             Err(SnapshotError::OutsideLibrary { .. })
         ));
         assert!(elsewhere.path().exists(), "the directory must survive");
+        assert!(matches!(
+            restore_blobs(&library, &snapshot, &mut |_, _| {}),
+            Err(SnapshotError::OutsideLibrary { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_hashes_are_refused_before_any_move() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+        let temp = begin(&library).unwrap();
+        for invalid in ["../escape", "/absolute", "é", "a\\..\\escape"] {
+            assert!(stash_blob(&library, &temp, invalid).is_err());
+            let snapshot = Snapshot {
+                dir: temp.clone(),
+                manifest: manifest(vec![(invalid.to_owned(), 1)]),
+            };
+            assert!(restore_blobs(&library, &snapshot, &mut |_, _| {}).is_err());
+        }
+        assert!(library.blob_path(&hash).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rechecks_the_blob_store_ancestor() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+        let temp = begin(&library).unwrap();
+        stash_blob(&library, &temp, &hash).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::remove_dir_all(library.files_dir()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), library.files_dir()).unwrap();
+        assert!(restore_one(&library, &temp, &hash).is_err());
+        assert!(temp.join(BLOBS_DIR).join(hash).is_file());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn failed_workers_finish_with_unclaimed_blobs() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+        let temp = begin(&library).unwrap();
+        std::fs::remove_file(library.blob_path(&hash)).unwrap();
+        let count = std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2 + 1;
+        let snapshot = Snapshot {
+            dir: temp,
+            manifest: manifest(vec![(hash, 7); count]),
+        };
+        let started = std::time::Instant::now();
+        let error = restore_blobs(&library, &snapshot, &mut |_, _| {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "restore workers did not finish"
+            );
+        });
+        assert!(error.is_err());
+    }
+
+    #[test]
+    fn retrying_a_moved_blob_preserves_the_library_copy() {
+        let hash = "a".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+        let temp = begin(&library).unwrap();
+        assert!(restore_one(&library, &temp, &hash).is_ok());
+        assert_eq!(std::fs::read(library.blob_path(&hash)).unwrap(), b"payload");
     }
 
     #[test]
