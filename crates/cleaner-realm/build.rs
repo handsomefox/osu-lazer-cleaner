@@ -24,7 +24,9 @@ fn main() {
     );
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed={}", header.display());
+    // An implementation or CMake change can alter the archive without changing realm.h.
+    // Watching the checkout also covers submodule updates and vendored dependencies.
+    println!("cargo:rerun-if-changed={}", vendor.display());
 
     patch_realm_core(&vendor);
     let build_dir = build_realm_core(&vendor);
@@ -43,7 +45,7 @@ fn main() {
 /// The equivalent diff is kept at `patches/0001-clang-cl-compat.patch` for review. It is
 /// applied here in Rust rather than shelled out to `git apply` or `patch` so that the build
 /// does not depend on either tool being installed. Rewriting is skipped when the fix is
-/// already present, so this is idempotent and leaves the submodule clean on repeat builds.
+/// already present, so repeat builds do not rewrite an already-patched file.
 fn patch_realm_core(vendor: &Path) {
     const BROKEN: &str = "return -0x8000000000000000LL;";
     const FIXED: &str = "return -0x7fffffffffffffffLL - 1;";
