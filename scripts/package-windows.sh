@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly CARGO_XWIN_VERSION="0.23.0"
+readonly CARGO_XWIN_VERSION="0.23.1"
 readonly product="osu-lazer-cleaner"
 readonly executable_name="osu!lazer Cleaner.exe"
 readonly target="x86_64-pc-windows-msvc"
