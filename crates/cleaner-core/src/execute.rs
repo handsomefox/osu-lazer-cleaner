@@ -194,6 +194,28 @@ fn validate_candidates(
         .collect())
 }
 
+/// What compacting the database did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compaction {
+    /// Whether realm-core actually rewrote the file.
+    ///
+    /// It declines rather than fails when the database is still in use, so this is the only way
+    /// to tell a successful compaction from one that never happened.
+    pub rewritten: bool,
+    /// Size of the database before.
+    pub before: u64,
+    /// Size of the database after.
+    pub after: u64,
+}
+
+impl Compaction {
+    /// How many bytes the rewrite gave back.
+    #[must_use]
+    pub const fn freed(&self) -> u64 {
+        self.before.saturating_sub(self.after)
+    }
+}
+
 /// Rewrites the database without its free space, reporting the sizes before and after.
 ///
 /// Realm never shrinks on its own: deleting rows returns their space to an internal free list
@@ -202,31 +224,29 @@ fn validate_candidates(
 ///
 /// # Errors
 ///
-/// Returns [`SnapshotError`] if the database cannot be read or realm-core refuses to compact,
-/// which it does while anything else has the database open.
-pub fn compact(library: &Library) -> Result<(u64, u64), SnapshotError> {
+/// Returns [`SnapshotError`] if the database cannot be opened or measured.
+pub fn compact(library: &Library) -> Result<Compaction, SnapshotError> {
     check_database_path(library)?;
     let path = library.database();
+    let measure = |when| {
+        std::fs::metadata(&path)
+            .map_err(|source| SnapshotError::Io {
+                action: when,
+                path: path.clone(),
+                source,
+            })
+            .map(|meta| meta.len())
+    };
 
-    let before = std::fs::metadata(&path)
-        .map_err(|source| SnapshotError::Io {
-            action: "measuring the database",
-            path: path.clone(),
-            source,
-        })?
-        .len();
+    let before = measure("measuring the database")?;
+    let rewritten = Realm::open_for_write(&path)?.compact()?;
+    let after = measure("measuring the database")?;
 
-    Realm::open_for_write(&path)?.compact()?;
-
-    let after = std::fs::metadata(&path)
-        .map_err(|source| SnapshotError::Io {
-            action: "measuring the database",
-            path: path.clone(),
-            source,
-        })?
-        .len();
-
-    Ok((before, after))
+    Ok(Compaction {
+        rewritten,
+        before,
+        after,
+    })
 }
 
 /// Moves every freed blob into the snapshot, in parallel.

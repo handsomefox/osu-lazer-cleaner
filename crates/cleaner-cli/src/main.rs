@@ -327,19 +327,30 @@ fn clean(
 /// Rewrites the database without its free space.
 fn compact(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let library = open_library(cli.library.as_deref())?;
-    let (before, after) = cleaner_core::compact(&library)?;
+    let result = cleaner_core::compact(&library)?;
 
-    if after < before {
+    if !result.rewritten {
+        // realm-core declines rather than fails here, so saying nothing would report a
+        // compaction that never ran.
         println!(
-            "database went from {} to {}, freeing {}",
-            human_bytes(before),
-            human_bytes(after),
-            human_bytes(before - after)
+            "database left alone at {}; something else has it open, so close osu!lazer and try \
+             again",
+            human_bytes(result.before)
+        );
+        return Ok(());
+    }
+
+    if result.freed() == 0 {
+        println!(
+            "database is already compact at {}; nothing to reclaim",
+            human_bytes(result.before)
         );
     } else {
         println!(
-            "database is already compact at {}; nothing to reclaim",
-            human_bytes(before)
+            "database went from {} to {}, freeing {}",
+            human_bytes(result.before),
+            human_bytes(result.after),
+            human_bytes(result.freed())
         );
     }
 

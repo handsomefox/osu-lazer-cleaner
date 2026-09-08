@@ -134,3 +134,35 @@ pub(crate) fn figure(text: impl Into<String>) -> egui::RichText {
 pub(crate) fn number(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text).monospace()
 }
+
+/// Groups a count in threes, because six-figure file counts are unreadable run together.
+///
+/// This stays in the window rather than in `cleaner_core`, where the same counts are printed
+/// for scripts to parse.
+pub(crate) fn grouped(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+
+    for (position, digit) in digits.chars().enumerate() {
+        if position > 0 && (digits.len() - position).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grouped;
+
+    #[test]
+    fn groups_digits_in_threes() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(1_000), "1,000");
+        assert_eq!(grouped(154_002), "154,002");
+        assert_eq!(grouped(1_234_567), "1,234,567");
+    }
+}

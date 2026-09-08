@@ -31,6 +31,8 @@ enum Activity {
     Restoring,
     /// Deleting a snapshot permanently.
     Deleting,
+    /// Rewriting the database without its free space.
+    Compacting,
 }
 
 impl Activity {
@@ -46,6 +48,7 @@ impl Activity {
             Self::Cleaning => "moving files into a snapshot",
             Self::Restoring => "moving files back into the library",
             Self::Deleting => "deleting a snapshot",
+            Self::Compacting => "rewriting the database",
         }
     }
 }
@@ -63,6 +66,18 @@ enum Question {
     Quit(Activity),
 }
 
+/// Gap between a table's columns.
+const COLUMN_GAP: f32 = 20.0;
+
+/// Width of the byte-count column, set by the widest string it holds (`534.08 MB`).
+const SIZE_WIDTH: f32 = 86.0;
+
+/// Width of the file-count column, set by the widest grouped count (`1,234,567`).
+const COUNT_WIDTH: f32 = 86.0;
+
+/// What both numeric columns and their gaps take, so the text column can have the rest.
+const NUMBER_COLUMNS: f32 = SIZE_WIDTH + COUNT_WIDTH + COLUMN_GAP * 2.0;
+
 /// The whole application.
 pub(crate) struct App {
     worker: Worker,
@@ -74,6 +89,10 @@ pub(crate) struct App {
     plan: Option<Plan>,
     selected: HashSet<Category>,
     snapshots: Vec<SnapshotSummary>,
+    /// Size of `client.realm`, so the compact control can show what it is working on.
+    database_bytes: u64,
+    /// What the last compaction did, if one has run.
+    compaction: Option<cleaner_core::Compaction>,
     modal: Option<Question>,
     /// Snapshot the open question refers to, for restore and delete.
     pending_snapshot: Option<String>,
@@ -102,6 +121,8 @@ impl App {
                 .filter(|c| c.default_selected())
                 .collect(),
             snapshots: Vec::new(),
+            database_bytes: 0,
+            compaction: None,
             modal: None,
             pending_snapshot: None,
             last_result: None,
@@ -120,9 +141,13 @@ impl App {
     fn absorb_events(&mut self) {
         for event in self.worker.drain() {
             match event {
-                Event::LibraryOpened { root } => {
+                Event::LibraryOpened {
+                    root,
+                    database_bytes,
+                } => {
                     "Ready to scan".clone_into(&mut self.status);
                     self.library = Some(root);
+                    self.database_bytes = database_bytes;
                     self.activity = None;
                     self.error = None;
                     self.worker.send(Command::ListSnapshots);
@@ -151,6 +176,12 @@ impl App {
                     self.plan = None;
                     self.activity = None;
                     self.worker.send(Command::ListSnapshots);
+                }
+                Event::Compacted { result } => {
+                    self.database_bytes = result.after;
+                    "Compact finished".clone_into(&mut self.status);
+                    self.compaction = Some(result);
+                    self.activity = None;
                 }
                 Event::Snapshots { entries } => {
                     self.snapshots = entries;
@@ -387,63 +418,81 @@ impl App {
 
     /// One row per category: tick, name, what it means, how much space, how many files.
     fn category_table(&mut self, ui: &mut egui::Ui, plan: &Plan) {
-        egui::Grid::new("categories")
-            .num_columns(3)
-            .spacing([26.0, 12.0])
-            .striped(true)
-            .show(ui, |ui| {
-                for group in &plan.groups {
-                    let found = group.files > 0;
-                    let on = self.selected.contains(&group.category);
+        column_headings(ui);
+        for (index, group) in plan.groups.iter().enumerate() {
+            self.category_row(ui, group, index % 2 == 1);
+        }
+    }
 
-                    ui.vertical(|ui| {
-                        // A grid cell shrinks to its narrowest content, which would wrap every
-                        // label onto its own line.
-                        ui.set_min_width(330.0);
+    /// Draws one category, banded so the eye can carry a name across to its numbers.
+    fn category_row(&mut self, ui: &mut egui::Ui, group: &cleaner_core::Group, striped: bool) {
+        // Reserved now, painted once the row's height is known, so the band sits behind the
+        // text rather than over it.
+        let band = ui.painter().add(egui::Shape::Noop);
 
-                        ui.add_enabled_ui(found && self.idle(), |ui| {
-                            let mut ticked = on;
-                            let label =
-                                egui::RichText::new(group.category.label()).color(if on && found {
-                                    theme::REMOVE
-                                } else {
-                                    theme::TEXT
-                                });
+        let found = group.files > 0;
+        let on = self.selected.contains(&group.category);
+        let tint = if !found {
+            theme::LINE
+        } else if on {
+            theme::REMOVE
+        } else {
+            theme::TEXT
+        };
 
-                            if ui.checkbox(&mut ticked, label).changed() {
-                                if ticked {
-                                    self.selected.insert(group.category);
-                                } else {
-                                    self.selected.remove(&group.category);
-                                }
-                                self.apply_selection();
-                            }
-                        });
+        let text_width = (ui.available_width() - NUMBER_COLUMNS).max(180.0);
+        let row = ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = COLUMN_GAP;
 
-                        ui.label(
-                            egui::RichText::new(group.category.description())
-                                .small()
-                                .color(theme::MUTED),
-                        );
-                    });
+            ui.allocate_ui_with_layout(
+                egui::vec2(text_width, 0.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.set_width(text_width);
+                    self.category_label(ui, group, found, on);
+                },
+            );
 
-                    let tint = if !found {
-                        theme::LINE
-                    } else if on {
-                        theme::REMOVE
-                    } else {
-                        theme::TEXT
-                    };
+            column(ui, SIZE_WIDTH, &human_bytes(group.bytes), tint);
+            column(ui, COUNT_WIDTH, &theme::grouped(group.files), tint);
+        });
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(theme::number(human_bytes(group.bytes)).color(tint));
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(theme::number(group.files.to_string()).color(tint));
-                    });
-                    ui.end_row();
-                }
+        if striped {
+            stripe(ui, band, row.response.rect);
+        }
+    }
+
+    /// The tick, the category name, and the sentence explaining what removing it costs.
+    fn category_label(
+        &mut self,
+        ui: &mut egui::Ui,
+        group: &cleaner_core::Group,
+        found: bool,
+        on: bool,
+    ) {
+        ui.add_enabled_ui(found && self.idle(), |ui| {
+            let mut ticked = on;
+            let label = egui::RichText::new(group.category.label()).color(if on && found {
+                theme::REMOVE
+            } else {
+                theme::TEXT
             });
+
+            if ui.checkbox(&mut ticked, label).changed() {
+                if ticked {
+                    self.selected.insert(group.category);
+                } else {
+                    self.selected.remove(&group.category);
+                }
+                self.apply_selection();
+            }
+        });
+
+        ui.label(
+            egui::RichText::new(group.category.description())
+                .small()
+                .color(theme::MUTED),
+        );
     }
 
     /// Snapshots, newest first, with restore and delete.
@@ -458,61 +507,118 @@ impl App {
 
         if self.snapshots.is_empty() {
             ui.label("No snapshots yet. Cleaning creates one.");
-            return;
+        } else {
+            if self.snapshots.len() > 1 {
+                ui.label(
+                    egui::RichText::new(
+                        "Restore newest first. Each snapshot was taken against the library as \
+                         the one above it left it.",
+                    )
+                    .small()
+                    .color(theme::MUTED),
+                );
+                ui.add_space(12.0);
+            }
+
+            for (position, entry) in self.snapshots.clone().iter().enumerate() {
+                // Only the newest can be restored on its own; the rest wait their turn.
+                self.snapshot_row(ui, entry, position == 0, position % 2 == 1);
+            }
         }
 
-        if self.snapshots.len() > 1 {
-            ui.label(
-                egui::RichText::new(
-                    "Restore newest first. Each snapshot was taken against the library as the \
-                     one above it left it.",
-                )
-                .small()
-                .color(theme::MUTED),
-            );
-            ui.add_space(12.0);
-        }
+        ui.add_space(22.0);
+        ui.separator();
+        ui.add_space(14.0);
+        self.database_section(ui);
+    }
 
-        let entries = self.snapshots.clone();
-        egui::Grid::new("snapshots")
-            .num_columns(5)
-            .spacing([22.0, 11.0])
-            .striped(true)
-            .show(ui, |ui| {
-                for (position, entry) in entries.iter().enumerate() {
-                    // Only the newest can be restored on its own; the rest wait their turn.
-                    let newest = position == 0;
+    /// One snapshot: when it was taken, what it holds, and the two things to do with it.
+    fn snapshot_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        entry: &SnapshotSummary,
+        newest: bool,
+        striped: bool,
+    ) {
+        let band = ui.painter().add(egui::Shape::Noop);
 
+        let row = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = COLUMN_GAP;
+
+            // Right to left, so the buttons keep their place while the date column takes up
+            // whatever the window leaves.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_enabled_ui(self.idle(), |ui| {
+                    if ui.button("Delete").clicked() {
+                        self.pending_snapshot = Some(entry.id.clone());
+                        self.modal = Some(Question::Delete);
+                    }
+                });
+
+                ui.add_enabled_ui(newest && self.idle(), |ui| {
+                    let button = ui.button("Put files back");
+                    if !newest {
+                        button.on_disabled_hover_text("Restore the snapshot above this one first.");
+                    } else if button.clicked() {
+                        self.pending_snapshot = Some(entry.id.clone());
+                        self.modal = Some(Question::Restore);
+                    }
+                });
+
+                column(ui, COUNT_WIDTH, &theme::grouped(entry.files), theme::TEXT);
+                column(ui, SIZE_WIDTH, &human_bytes(entry.bytes), theme::TEXT);
+
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.label(&entry.created);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(theme::number(entry.files.to_string()));
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(theme::number(human_bytes(entry.bytes)));
-                    });
+                });
+            });
+        });
 
-                    ui.add_enabled_ui(newest && self.idle(), |ui| {
-                        let button = ui.button("Put files back");
-                        if !newest {
-                            button.on_disabled_hover_text(
-                                "Restore the snapshot above this one first.",
-                            );
-                        } else if button.clicked() {
-                            self.pending_snapshot = Some(entry.id.clone());
-                            self.modal = Some(Question::Restore);
-                        }
-                    });
+        if striped {
+            stripe(ui, band, row.response.rect);
+        }
+    }
 
-                    ui.add_enabled_ui(self.idle(), |ui| {
-                        if ui.button("Delete").clicked() {
-                            self.pending_snapshot = Some(entry.id.clone());
-                            self.modal = Some(Question::Delete);
-                        }
-                    });
+    /// The database file, its size, and the one operation that shrinks it.
+    ///
+    /// A clean can detach hundreds of thousands of rows without `client.realm` losing a byte,
+    /// because Realm keeps the freed space on an internal list to reuse. Showing the size next
+    /// to the button is the only way that stops looking like the tool did nothing.
+    fn database_section(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Database").heading());
+            ui.add_space(6.0);
+            if self.database_bytes > 0 {
+                ui.label(theme::number(human_bytes(self.database_bytes)).color(theme::MUTED));
+            }
+        });
 
-                    ui.end_row();
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "client.realm keeps the space its removed rows used until it is rewritten. \
+                 Close osu!lazer first.",
+            )
+            .small()
+            .color(theme::MUTED),
+        );
+        ui.add_space(12.0);
+
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(self.idle() && self.library.is_some(), |ui| {
+                if ui.button("Compact database").clicked() {
+                    self.compaction = None;
+                    self.error = None;
+                    self.activity = Some(Activity::Compacting);
+                    self.worker.send(Command::Compact);
                 }
             });
+
+            if let Some(result) = self.compaction {
+                let (text, colour) = describe_compaction(result);
+                ui.label(egui::RichText::new(text).small().color(colour));
+            }
+        });
     }
 
     /// What an open question says and which button carries it out.
@@ -640,6 +746,56 @@ impl App {
     }
 }
 
+/// Draws one number in a fixed-width column, right-aligned against the column's edge.
+///
+/// The width has to come from a reserved rectangle rather than from a right-aligned layout: a
+/// layout inside a container that has not settled its own width aligns against whatever space
+/// happens to be free, which puts each row's number in a different place.
+fn column(ui: &mut egui::Ui, width: f32, text: &str, colour: egui::Color32) {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let height = ui.spacing().interact_size.y;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+
+    ui.painter().text(
+        rect.right_center(),
+        egui::Align2::RIGHT_CENTER,
+        text,
+        font,
+        colour,
+    );
+}
+
+/// Names the two numeric columns, since a bare pair of figures does not say which is which.
+fn column_headings(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = COLUMN_GAP;
+        ui.add_space((ui.available_width() - NUMBER_COLUMNS).max(0.0));
+
+        for (width, heading) in [(SIZE_WIDTH, "space"), (COUNT_WIDTH, "files")] {
+            let height = ui.spacing().interact_size.y;
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+            ui.painter().text(
+                rect.right_center(),
+                egui::Align2::RIGHT_CENTER,
+                heading,
+                egui::TextStyle::Small.resolve(ui.style()),
+                theme::MUTED,
+            );
+        }
+    });
+}
+
+/// Paints the alternating band behind a row, across the container's full width.
+fn stripe(ui: &egui::Ui, reserved: egui::layers::ShapeIdx, row: egui::Rect) {
+    let pad = ui.spacing().item_spacing.y / 2.0;
+    let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), row.y_range().expand(pad));
+
+    ui.painter().set(
+        reserved,
+        egui::Shape::rect_filled(rect, egui::CornerRadius::same(4), theme::SURFACE),
+    );
+}
+
 /// One band showing the whole library, with the part a clean would take filled in.
 ///
 /// This is the question the tool exists to answer, so it is the only loud thing on the screen.
@@ -699,4 +855,20 @@ fn composition_bar(ui: &mut egui::Ui, total: u64, removing: u64) {
             ui.label(text);
         });
     });
+}
+
+fn describe_compaction(result: cleaner_core::Compaction) -> (String, egui::Color32) {
+    if !result.rewritten {
+        return (
+            "Database is in use. Close osu!lazer and try again.".to_owned(),
+            theme::REMOVE,
+        );
+    }
+    if result.freed() == 0 {
+        return ("No space to reclaim.".to_owned(), theme::MUTED);
+    }
+    (
+        format!("Reclaimed {}.", human_bytes(result.freed())),
+        theme::GOOD,
+    )
 }

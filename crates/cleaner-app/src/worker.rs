@@ -40,6 +40,8 @@ pub(crate) enum Command {
         /// Which snapshot.
         id: String,
     },
+    /// Rewrite the database without its free space.
+    Compact,
 }
 
 /// What the worker reports back.
@@ -49,6 +51,8 @@ pub(crate) enum Event {
     LibraryOpened {
         /// Its root directory.
         root: PathBuf,
+        /// How big `client.realm` is, so the window can show it without a scan.
+        database_bytes: u64,
     },
     /// Progress during a scan.
     Progress {
@@ -67,9 +71,14 @@ pub(crate) enum Event {
         /// Bytes moved into the snapshot.
         bytes: u64,
     },
+    /// A compaction finished, whether or not it changed anything.
+    Compacted {
+        /// What it did.
+        result: cleaner_core::Compaction,
+    },
     /// The snapshot list was refreshed.
     Snapshots {
-        /// Snapshots, oldest first.
+        /// Snapshots, newest first.
         entries: Vec<SnapshotSummary>,
     },
     /// Something went wrong.
@@ -176,6 +185,7 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
                 Ok(found) => {
                     report(Event::LibraryOpened {
                         root: found.root().to_path_buf(),
+                        database_bytes: database_bytes(&found),
                     });
                     *library = Some(found);
                 }
@@ -237,14 +247,7 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
                 return;
             };
 
-            match snapshot::list(library) {
-                Ok(entries) => report(Event::Snapshots {
-                    entries: entries.iter().map(SnapshotSummary::from).collect(),
-                }),
-                Err(error) => report(Event::Failed {
-                    message: error.to_string(),
-                }),
-            }
+            report(snapshot_event(library));
         }
 
         Command::RestoreSnapshot { id } => {
@@ -262,7 +265,28 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
         Command::DeleteSnapshot { id } => {
             act_on_snapshot(library.as_ref(), &id, events, snapshot::delete);
         }
+
+        Command::Compact => {
+            let Some(library) = library.as_ref() else {
+                return;
+            };
+
+            report(match cleaner_core::compact(library) {
+                Ok(result) => Event::Compacted { result },
+                Err(error) => Event::Failed {
+                    message: error.to_string(),
+                },
+            });
+        }
     }
+}
+
+/// Measures `client.realm`, or reports zero if it cannot be measured.
+///
+/// A size that cannot be read is worth showing as absent rather than failing to open a library
+/// over it: everything else here works without it.
+fn database_bytes(library: &Library) -> u64 {
+    std::fs::metadata(library.database()).map_or(0, |meta| meta.len())
 }
 
 /// Applies an operation to the named snapshot, then refreshes the list.
@@ -300,10 +324,17 @@ fn act_on_snapshot(
         return;
     }
 
-    if let Ok(entries) = snapshot::list(library) {
-        let _ = events.send(Event::Snapshots {
+    let _ = events.send(snapshot_event(library));
+}
+
+fn snapshot_event(library: &Library) -> Event {
+    match snapshot::list(library) {
+        Ok(entries) => Event::Snapshots {
             entries: entries.iter().map(SnapshotSummary::from).collect(),
-        });
+        },
+        Err(error) => Event::Failed {
+            message: error.to_string(),
+        },
     }
 }
 

@@ -81,6 +81,10 @@ points somewhere other than the default location.
 
 Close osu!lazer before cleaning, restoring, or compacting the database.
 
+The **Snapshots** screen shows the database size and a **Compact database** button. Compaction
+reclaims the space left by removed database rows. It reports when another open handle prevents
+the rewrite.
+
 ## Command line
 
 The same operations are available from `osu-lazer-cleaner-cli`, which is useful for scripting
