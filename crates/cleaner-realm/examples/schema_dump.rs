@@ -18,7 +18,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: schema_dump <path to client.realm>".into());
     };
 
-    let realm = cleaner_realm::Realm::open_read_only(std::path::Path::new(&path))?;
+    let scratch = tempfile::tempdir()?;
+    let copy = scratch.path().join("client.realm");
+    std::fs::copy(&path, &copy)?;
+    let realm = cleaner_realm::Realm::open_read_only(&copy)?;
     let mut classes = realm.classes()?;
     classes.sort_by_key(|c| std::cmp::Reverse(c.rows));
 
