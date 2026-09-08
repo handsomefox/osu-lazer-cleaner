@@ -4,14 +4,14 @@
 //! this interface, and no arguments open the window.
 
 #![expect(
-    clippy::print_stdout,
     clippy::print_stderr,
-    reason = "a command-line tool reports results on stdout and progress on stderr"
+    reason = "a command-line tool reports progress on stderr; results go to the writer `run` takes"
 )]
 
 use clap::{Parser, Subcommand};
 use cleaner_core::{Category, Library, Options, Plan, human_bytes, snapshot};
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -117,21 +117,24 @@ pub(crate) fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
-    match run(&cli) {
+    match run(&cli, &mut std::io::stdout().lock()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            tracing::error!("{error}");
-            eprintln!("error: {error}");
+            if cli.json {
+                eprintln!("{}", serde_json::json!({"error": error.to_string()}));
+            } else {
+                eprintln!("error: {error}");
+            }
             ExitCode::FAILURE
         }
     }
 }
 
 /// Dispatches the requested command.
-fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn run(cli: &Cli, out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     match &cli.command {
         Command::Categories => {
-            list_categories(cli.json);
+            list_categories(cli.json, out)?;
             Ok(())
         }
         Command::Scan { verbose, dump } => {
@@ -143,15 +146,15 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(path) = dump {
                 let text = serde_json::to_string_pretty(&report)?;
                 std::fs::write(path, text)?;
-                println!("wrote the diagnostic report to {}", path.display());
+                eprintln!("wrote the diagnostic report to {}", path.display());
             }
 
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                writeln!(out, "{}", serde_json::to_string_pretty(&report)?)?;
             } else if *verbose {
-                print!("{}", cleaner_core::report::render(&report));
+                write!(out, "{}", cleaner_core::report::render(&report))?;
             } else {
-                report_scan(&library, &plan);
+                report_scan(&library, &plan, out)?;
             }
 
             Ok(())
@@ -159,9 +162,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Clean {
             categories,
             confirm,
-        } => clean(cli, categories, *confirm),
-        Command::Compact => compact(cli),
-        Command::Snapshot(command) => snapshots(cli, command),
+        } => clean(cli, categories, *confirm, out),
+        Command::Compact => compact(cli, out),
+        Command::Snapshot(command) => snapshots(cli, command, out),
     }
 }
 
@@ -187,7 +190,7 @@ fn scan(library: &Library, selected: &HashSet<Category>) -> Result<Plan, cleaner
 }
 
 /// Prints the categories and what each one removes.
-fn list_categories(json: bool) {
+fn list_categories(json: bool, out: &mut impl Write) -> std::io::Result<()> {
     if json {
         let entries: Vec<_> = Category::ALL
             .iter()
@@ -200,11 +203,12 @@ fn list_categories(json: bool) {
                 })
             })
             .collect();
-        println!(
+        writeln!(
+            out,
             "{}",
             serde_json::to_string_pretty(&entries).unwrap_or_default()
-        );
-        return;
+        )?;
+        return Ok(());
     }
 
     for category in Category::ALL {
@@ -213,42 +217,57 @@ fn list_categories(json: bool) {
         } else {
             " "
         };
-        println!("{mark} {:<16} {}", category.slug(), category.description());
+        writeln!(
+            out,
+            "{mark} {:<16} {}",
+            category.slug(),
+            category.description()
+        )?;
     }
-    println!("\n* selected by default");
+    writeln!(out, "\n* selected by default")
 }
 
 /// Prints what a scan found.
 ///
 /// `--json` goes through the report rather than here, because that is the shape worth
 /// promising to a script.
-fn report_scan(library: &Library, plan: &Plan) {
-    println!("library: {}", library.root().display());
-    println!(
+fn report_scan(library: &Library, plan: &Plan, out: &mut impl Write) -> std::io::Result<()> {
+    writeln!(out, "library: {}", library.root().display())?;
+    writeln!(
+        out,
         "{} beatmap sets, {} files, {}\n",
         plan.sets_scanned,
         plan.blobs_total,
         human_bytes(plan.bytes_total)
-    );
+    )?;
 
-    println!("{:<16} {:>9} {:>12}", "category", "files", "reclaimable");
+    writeln!(
+        out,
+        "{:<16} {:>9} {:>12}",
+        "category", "files", "reclaimable"
+    )?;
     for (category, totals) in plan.totals_by_category() {
-        println!(
+        writeln!(
+            out,
             "{:<16} {:>9} {:>12}",
             category.slug(),
             totals.files,
             human_bytes(totals.bytes)
-        );
+        )?;
     }
 
-    println!(
+    writeln!(
+        out,
         "\nscan took {}: {} measuring files, {} reading the database, {} reading beatmaps",
         seconds(plan.timings.total_ms()),
         seconds(plan.timings.measure_ms),
         seconds(plan.timings.database_ms),
         seconds(plan.timings.classify_ms),
-    );
-    println!("\nRemove a category with: osu-lazer-cleaner clean <category> --confirm");
+    )?;
+    writeln!(
+        out,
+        "\nRemove a category with: osu-lazer-cleaner clean <category> --confirm"
+    )
 }
 
 /// Reports what a clean or a restore is doing, on stderr so stdout stays machine-readable.
@@ -285,6 +304,7 @@ fn clean(
     cli: &Cli,
     categories: &[Category],
     confirm: bool,
+    out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let library = open_library(cli.library.as_deref())?;
     let selected: HashSet<Category> = categories.iter().copied().collect();
@@ -295,7 +315,8 @@ fn clean(
     eprintln!("\r                                                   ");
 
     if cli.json {
-        println!(
+        writeln!(
+            out,
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "dry_run": outcome.dry_run,
@@ -307,94 +328,131 @@ fn clean(
                 "snapshot": outcome.snapshot,
             }))
             .unwrap_or_default()
-        );
+        )?;
         return Ok(());
     }
 
     if outcome.dry_run {
-        println!(
+        writeln!(
+            out,
             "would remove {} files ({} references) and reclaim {}",
             plan.selected_files(),
             plan.selected_references(),
             human_bytes(outcome.bytes)
-        );
-        println!("re-run with --confirm to do it");
+        )?;
+        writeln!(out, "re-run with --confirm to do it")?;
         return Ok(());
     }
 
-    println!(
+    writeln!(
+        out,
         "removed {} files and moved {} into a snapshot",
         outcome.detached,
         human_bytes(outcome.bytes)
-    );
+    )?;
 
     if let Some(path) = &outcome.snapshot {
         let id = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        println!("\nNothing is deleted yet. Start osu!lazer and check your beatmaps.");
-        println!("To reclaim the space: osu-lazer-cleaner snapshot delete {id} --confirm");
-        println!("To undo instead:      osu-lazer-cleaner snapshot restore {id}");
+        writeln!(
+            out,
+            "\nNothing is deleted yet. Start osu!lazer and check your beatmaps."
+        )?;
+        writeln!(
+            out,
+            "To reclaim the space: osu-lazer-cleaner snapshot delete {id} --confirm"
+        )?;
+        writeln!(
+            out,
+            "To undo instead:      osu-lazer-cleaner snapshot restore {id} --confirm"
+        )?;
     }
 
     Ok(())
 }
 
 /// Rewrites the database without its free space.
-fn compact(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn compact(cli: &Cli, out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     let library = open_library(cli.library.as_deref())?;
     let result = cleaner_core::compact(&library)?;
+
+    if cli.json {
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "rewritten": result.rewritten,
+                "before": result.before,
+                "after": result.after,
+                "freed": result.freed(),
+                "backup": result.backup,
+            }))?
+        )?;
+        return Ok(());
+    }
 
     if !result.rewritten {
         // realm-core declines rather than fails here, so saying nothing would report a
         // compaction that never ran.
-        println!(
+        writeln!(
+            out,
             "database left alone at {}; something else has it open, so close osu!lazer and try \
              again",
             human_bytes(result.before)
-        );
+        )?;
         return Ok(());
     }
 
     if result.freed() == 0 {
-        println!(
+        writeln!(
+            out,
             "database is already compact at {}; nothing to reclaim",
             human_bytes(result.before)
-        );
+        )?;
     } else {
-        println!(
+        writeln!(
+            out,
             "database went from {} to {}, freeing {}",
             human_bytes(result.before),
             human_bytes(result.after),
             human_bytes(result.freed())
-        );
+        )?;
     }
 
     Ok(())
 }
 
 /// Handles the snapshot subcommands.
-fn snapshots(cli: &Cli, command: &SnapshotCommand) -> Result<(), Box<dyn std::error::Error>> {
+fn snapshots(
+    cli: &Cli,
+    command: &SnapshotCommand,
+    out: &mut impl Write,
+) -> Result<(), Box<dyn std::error::Error>> {
     let library = open_library(cli.library.as_deref())?;
     let available = snapshot::list(&library)?;
 
     match command {
         SnapshotCommand::List => {
-            list_snapshots(&available, cli.json);
+            list_snapshots(&available, cli.json, out)?;
             Ok(())
         }
         SnapshotCommand::Restore { id, confirm } => {
-            restore_snapshot(&library, &available, id, *confirm)
+            restore_snapshot(&library, &available, id, *confirm, cli.json, out)
         }
         SnapshotCommand::Delete { id, confirm } => {
-            delete_snapshot(&library, &available, id, *confirm)
+            delete_snapshot(&library, &available, id, *confirm, cli.json, out)
         }
     }
 }
 
 /// Prints the snapshots, newest first.
-fn list_snapshots(available: &[cleaner_core::Snapshot], json: bool) {
+fn list_snapshots(
+    available: &[cleaner_core::Snapshot],
+    json: bool,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
     if json {
         let entries: Vec<_> = available
             .iter()
@@ -407,22 +465,24 @@ fn list_snapshots(available: &[cleaner_core::Snapshot], json: bool) {
                 })
             })
             .collect();
-        println!(
+        writeln!(
+            out,
             "{}",
             serde_json::to_string_pretty(&entries).unwrap_or_default()
-        );
-        return;
+        )?;
+        return Ok(());
     }
 
     if available.is_empty() {
-        println!("no snapshots");
-        return;
+        writeln!(out, "no snapshots")?;
+        return Ok(());
     }
 
-    println!("Newest first. Restore in this order.\n");
-    println!("{:<24} {:>8} {:>12}  created", "id", "files", "size");
+    writeln!(out, "Newest first. Restore in this order.\n")?;
+    writeln!(out, "{:<24} {:>8} {:>12}  created", "id", "files", "size")?;
     for entry in available {
-        println!(
+        writeln!(
+            out,
             "{:<24} {:>8} {:>12}  {}",
             entry.id(),
             entry.manifest.blobs.len(),
@@ -432,8 +492,9 @@ fn list_snapshots(available: &[cleaner_core::Snapshot], json: bool) {
                 .created
                 .to_zoned(jiff::tz::TimeZone::system())
                 .strftime("%Y-%m-%d %H:%M")
-        );
+        )?;
     }
+    Ok(())
 }
 
 /// Moves one snapshot's files back into the library.
@@ -442,6 +503,8 @@ fn restore_snapshot(
     available: &[cleaner_core::Snapshot],
     id: &str,
     confirm: bool,
+    json: bool,
+    out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entry = find(available, id)?;
 
@@ -458,19 +521,45 @@ fn restore_snapshot(
     }
 
     if !confirm {
-        println!(
+        if json {
+            writeln!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "dry_run": true, "snapshot": id, "files": entry.manifest.blobs.len(),
+                    "bytes": entry.manifest.bytes(), "restored": 0,
+                })
+            )?;
+            return Ok(());
+        }
+        writeln!(
+            out,
             "would put {} files ({}) back and remove snapshot {id}",
             entry.manifest.blobs.len(),
             human_bytes(entry.manifest.bytes())
-        );
-        println!("re-run with --confirm to do it");
+        )?;
+        writeln!(out, "re-run with --confirm to do it")?;
         return Ok(());
     }
 
     let restored = cleaner_core::restore(library, entry, report_clean)?;
     eprintln!("\r                                             ");
-    println!("restored {restored} files into the library");
-    println!("snapshot {id} is gone; its files are back where they were");
+    if json {
+        writeln!(
+            out,
+            "{}",
+            serde_json::json!({
+                "dry_run": false, "snapshot": id, "files": entry.manifest.blobs.len(),
+                "bytes": entry.manifest.bytes(), "restored": restored,
+            })
+        )?;
+    } else {
+        writeln!(out, "restored {restored} files into the library")?;
+        writeln!(
+            out,
+            "snapshot {id} is gone; its files are back where they were"
+        )?;
+    }
     Ok(())
 }
 
@@ -480,25 +569,49 @@ fn delete_snapshot(
     available: &[cleaner_core::Snapshot],
     id: &str,
     confirm: bool,
+    json: bool,
+    out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entry = find(available, id)?;
 
     if !confirm {
-        println!(
+        if json {
+            writeln!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "dry_run": true, "snapshot": id, "bytes": entry.manifest.bytes(), "deleted": false,
+                })
+            )?;
+            return Ok(());
+        }
+        writeln!(
+            out,
             "would delete snapshot {} and reclaim {}",
             entry.id(),
             human_bytes(entry.manifest.bytes())
-        );
-        println!("re-run with --confirm to do it; this cannot be undone");
+        )?;
+        writeln!(out, "re-run with --confirm to do it; this cannot be undone")?;
         return Ok(());
     }
 
     let reclaimed = entry.manifest.bytes();
     snapshot::delete(library, entry)?;
-    println!(
-        "deleted snapshot {id} and reclaimed {}",
-        human_bytes(reclaimed)
-    );
+    if json {
+        writeln!(
+            out,
+            "{}",
+            serde_json::json!({
+                "dry_run": false, "snapshot": id, "bytes": reclaimed, "deleted": true,
+            })
+        )?;
+    } else {
+        writeln!(
+            out,
+            "deleted snapshot {id} and reclaimed {}",
+            human_bytes(reclaimed)
+        )?;
+    }
     Ok(())
 }
 
@@ -511,4 +624,92 @@ fn find<'a>(
         .iter()
         .find(|s| s.id() == id)
         .ok_or_else(|| format!("no snapshot named '{id}'"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn json_command(library: &Library, arguments: &[&str]) -> serde_json::Value {
+        let mut args = vec![
+            "osu-lazer-cleaner",
+            "--json",
+            "--library",
+            library.root().to_str().unwrap(),
+        ];
+        args.extend_from_slice(arguments);
+        let cli = Cli::try_parse_from(args).unwrap();
+        let mut out = Vec::new();
+        run(&cli, &mut out).unwrap();
+        serde_json::from_slice(&out).unwrap_or_else(|error| {
+            panic!(
+                "{arguments:?} emitted invalid JSON: {error}: {}",
+                String::from_utf8_lossy(&out)
+            )
+        })
+    }
+
+    fn empty_snapshot(library: &Library) -> String {
+        let dir = snapshot::begin(library).unwrap();
+        let manifest = cleaner_core::Manifest {
+            format_version: snapshot::FORMAT_VERSION,
+            created: jiff::Timestamp::now(),
+            app_version: "test".to_owned(),
+            schema_version: 52,
+            detached: Vec::new(),
+            blobs: Vec::new(),
+        };
+        snapshot::finalise(&dir, &manifest)
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn every_json_command_emits_one_json_document() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(cleaner_realm::fixture::synthetic_realm(
+            &directory.path().join("client.realm"),
+            &[],
+        ));
+        let library = Library::open(directory.path()).unwrap();
+
+        assert!(json_command(&library, &["categories"]).is_array());
+        assert!(json_command(&library, &["scan"])["categories"].is_array());
+        assert_eq!(json_command(&library, &["clean", "junk"])["dry_run"], true);
+        assert_eq!(
+            json_command(&library, &["clean", "junk", "--confirm"])["dry_run"],
+            false
+        );
+        assert!(json_command(&library, &["compact"])["rewritten"].is_boolean());
+        assert!(json_command(&library, &["snapshot", "list"]).is_array());
+
+        let id = empty_snapshot(&library);
+        assert_eq!(
+            json_command(&library, &["snapshot", "restore", &id])["dry_run"],
+            true
+        );
+        assert_eq!(
+            json_command(&library, &["snapshot", "restore", &id, "--confirm"])["dry_run"],
+            false
+        );
+        let id = empty_snapshot(&library);
+        assert_eq!(
+            json_command(&library, &["snapshot", "delete", &id])["deleted"],
+            false
+        );
+        assert_eq!(
+            json_command(&library, &["snapshot", "delete", &id, "--confirm"])["deleted"],
+            true
+        );
+
+        let report = directory.path().join("report.json");
+        let output = json_command(&library, &["scan", "--dump", report.to_str().unwrap()]);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+        assert_eq!(output, saved);
+    }
 }

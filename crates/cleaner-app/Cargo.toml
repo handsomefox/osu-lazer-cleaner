@@ -23,5 +23,9 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+cleaner-realm = { path = "../cleaner-realm", features = ["test-support"] }
+tempfile.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

@@ -130,8 +130,9 @@ osu-lazer-cleaner snapshot delete 20260907-215337 --confirm
 ```
 
 Every command takes `--library <path>` to point at a specific directory and `--json` for
-machine-readable output. `clean` and `snapshot delete` report what they would do and change
-nothing until you add `--confirm`.
+machine-readable output. Successful JSON commands write one JSON document to stdout, including
+when `scan --dump` also saves a report. Progress messages go to stderr. `clean`, `snapshot
+restore`, and `snapshot delete` change nothing until you add `--confirm`.
 
 ## Development
 
