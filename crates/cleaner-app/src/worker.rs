@@ -42,8 +42,11 @@ pub(crate) enum Command {
     },
     /// Rewrite the database without its free space.
     Compact,
-    /// Delete the copy of the database the last compaction kept.
-    RemoveDatabaseBackup,
+    /// Delete one of the copies of the database a compaction kept.
+    RemoveDatabaseBackup {
+        /// File name of the copy, as `BackupSummary` gives it.
+        name: String,
+    },
 }
 
 impl Command {
@@ -57,7 +60,7 @@ impl Command {
             Self::RestoreSnapshot { .. } => "restore snapshot",
             Self::DeleteSnapshot { .. } => "delete snapshot",
             Self::Compact => "compact",
-            Self::RemoveDatabaseBackup => "remove database backup",
+            Self::RemoveDatabaseBackup { .. } => "remove database backup",
         }
     }
 }
@@ -98,8 +101,8 @@ pub(crate) enum Event {
     Snapshots {
         /// Snapshots, newest first.
         entries: Vec<SnapshotSummary>,
-        /// The copy of the database a compaction kept, if there is one.
-        backup: Option<BackupSummary>,
+        /// The copies of the database compactions kept, newest first.
+        backups: Vec<BackupSummary>,
     },
     /// A snapshot operation finished.
     ///
@@ -119,13 +122,17 @@ pub(crate) enum Event {
     },
 }
 
-/// The copy of `client.realm` a compaction kept.
+/// A copy of `client.realm` a compaction kept.
 #[derive(Debug, Clone)]
 pub(crate) struct BackupSummary {
+    /// File name, used to address it.
+    pub(crate) name: String,
     /// Where it is, for the window to show.
     pub(crate) path: PathBuf,
     /// How many bytes deleting it would reclaim.
     pub(crate) bytes: u64,
+    /// When it was taken.
+    pub(crate) taken: String,
 }
 
 /// A snapshot, reduced to what the interface displays.
@@ -246,14 +253,20 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
                 message: "Restore finished",
                 library_changed: true,
             };
-            act_on_snapshot(library.as_ref(), &id, events, done, move |library, snapshot| {
-                cleaner_core::restore(library, snapshot, |progress| {
-                    let _ = reporter.send(Event::Progress {
-                        message: describe_clean(progress),
-                    });
-                })
-                .map(|_| ())
-            });
+            act_on_snapshot(
+                library.as_ref(),
+                &id,
+                events,
+                done,
+                move |library, snapshot| {
+                    cleaner_core::restore(library, snapshot, |progress| {
+                        let _ = reporter.send(Event::Progress {
+                            message: describe_clean(progress),
+                        });
+                    })
+                    .map(|_| ())
+                },
+            );
         }
 
         Command::DeleteSnapshot { id } => {
@@ -276,13 +289,19 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
             report(snapshot_event(library));
         }
 
-        Command::RemoveDatabaseBackup => {
+        Command::RemoveDatabaseBackup { name } => {
             let Some(library) = library.as_ref() else {
                 return;
             };
 
-            match cleaner_core::remove_database_backup(library) {
-                Ok(()) => report(snapshot_event(library)),
+            match cleaner_core::remove_database_backup(library, &name) {
+                Ok(()) => {
+                    report(Event::Finished {
+                        message: "Copy deleted",
+                        library_changed: false,
+                    });
+                    report(snapshot_event(library));
+                }
                 Err(error) => report(failed(&error)),
             }
         }
@@ -394,8 +413,15 @@ fn snapshot_event(library: &Library) -> Event {
     match snapshot::list(library) {
         Ok(entries) => Event::Snapshots {
             entries: entries.iter().map(SnapshotSummary::from).collect(),
-            backup: cleaner_core::database_backup(library)
-                .map(|(path, bytes)| BackupSummary { path, bytes }),
+            backups: cleaner_core::database_backups(library)
+                .into_iter()
+                .map(|copy| BackupSummary {
+                    name: copy.name,
+                    path: copy.path,
+                    bytes: copy.bytes,
+                    taken: format_taken(copy.taken),
+                })
+                .collect(),
         },
         Err(error) => failed(&error),
     }

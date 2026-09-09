@@ -287,11 +287,30 @@ fn validate_candidates<'a>(
     Ok(freed)
 }
 
-/// Name of the copy of `client.realm` taken before a compaction.
+/// What the copies of `client.realm` taken before a compaction are called, either side of the
+/// time the copy was taken.
 ///
-/// One fixed name, so a library holds at most one of these and the user always knows which
-/// compaction it belongs to.
-const DATABASE_BACKUP: &str = "client.realm.backup";
+/// The time is in the name so that a run of compactions leaves a history instead of one file
+/// each compaction overwrites.
+const BACKUP_PREFIX: &str = "client.realm.";
+/// The other half of a copy's name. Also keeps a half-written `.partial` from being mistaken
+/// for a finished copy.
+const BACKUP_SUFFIX: &str = ".backup";
+
+/// The one name version 1.3 and earlier gave the single copy it kept. Still recognised, so that
+/// a copy left by an older version can be listed and deleted.
+const LEGACY_BACKUP: &str = "client.realm.backup";
+
+/// How many copies to keep.
+///
+/// Each one is as large as the database it came from, so keeping every copy would cost a
+/// gigabyte after a handful of compactions. The newest are the ones worth having: a database
+/// osu!lazer refuses to open shows up the next time it starts, not several compactions later.
+const MAX_DATABASE_BACKUPS: usize = 3;
+
+/// How many names to try before giving up and replacing one. A minute of them is far more than
+/// a compaction, which takes a second on a large database, can ever need.
+const MAX_NAME_ATTEMPTS: u32 = 60;
 
 /// What compacting the database did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,8 +400,9 @@ fn back_up_database(library: &Library) -> Result<PathBuf, SnapshotError> {
         source,
     })?;
 
-    let destination = directory.join(DATABASE_BACKUP);
-    let partial = directory.join(format!("{DATABASE_BACKUP}.partial"));
+    let name = unique_backup_name(&directory);
+    let destination = directory.join(&name);
+    let partial = directory.join(format!("{name}.partial"));
     let _ = std::fs::remove_file(&partial);
 
     let written = write_backup(library, &partial, &destination);
@@ -390,8 +410,60 @@ fn back_up_database(library: &Library) -> Result<PathBuf, SnapshotError> {
         // A half-written copy is worse than none: it would sit next to the snapshots looking
         // like something to fall back on.
         let _ = std::fs::remove_file(&partial);
+        return written.map(|()| destination);
     }
-    written.map(|()| destination)
+
+    prune_database_backups(library, &name);
+    Ok(destination)
+}
+
+/// Picks a name no copy already has, stepping forward a second at a time.
+///
+/// Two compactions inside one second would otherwise pick the same name, and the second would
+/// replace the copy the first kept. Stepping the recorded time keeps every name one that
+/// [`stamp_in_name`] can still read.
+fn unique_backup_name(directory: &Path) -> String {
+    let mut taken = jiff::Timestamp::now();
+    for _ in 0..MAX_NAME_ATTEMPTS {
+        let name = format!(
+            "{BACKUP_PREFIX}{}{BACKUP_SUFFIX}",
+            taken.strftime("%Y%m%d-%H%M%S")
+        );
+        if !directory.join(&name).exists() {
+            return name;
+        }
+        taken += jiff::SignedDuration::from_secs(1);
+    }
+
+    // Every name in the minute after now is taken, which means something other than this is
+    // writing them. Replacing one is better than failing the compaction over it.
+    format!(
+        "{BACKUP_PREFIX}{}{BACKUP_SUFFIX}",
+        taken.strftime("%Y%m%d-%H%M%S")
+    )
+}
+
+/// Deletes all but the newest [`MAX_DATABASE_BACKUPS`] copies, never the copy just written.
+///
+/// `keep` is held back whatever its name says, because a clock that has gone backwards would
+/// otherwise make the copy taken a moment ago the oldest one there, and pruning it would leave
+/// the rewrite that follows with nothing to fall back on.
+///
+/// A copy that will not delete is not worth failing a compaction over: the copy that matters is
+/// on disk, so this reports and carries on.
+fn prune_database_backups(library: &Library, keep: &str) {
+    for stale in database_backups(library)
+        .into_iter()
+        .filter(|copy| copy.name != keep)
+        .skip(MAX_DATABASE_BACKUPS.saturating_sub(1))
+    {
+        match std::fs::remove_file(&stale.path) {
+            Ok(()) => tracing::info!(copy = %stale.name, "removed an old database copy"),
+            Err(error) => {
+                tracing::warn!(copy = %stale.name, %error, "could not remove an old database copy");
+            }
+        }
+    }
 }
 
 /// Copies the database to `partial`, flushes it, and moves it to `destination`.
@@ -435,38 +507,118 @@ fn write_backup(
     })
 }
 
-/// The copy of the database a compaction left behind, and its size.
-///
-/// Returns `None` when no compaction has run, or when its copy has been removed.
-#[must_use]
-pub fn database_backup(library: &Library) -> Option<(PathBuf, u64)> {
-    let path = library.snapshots_dir().join(DATABASE_BACKUP);
-    if !crate::safety::is_safe_path(&path, &[library.root()]) {
-        return None;
-    }
-    let bytes = std::fs::symlink_metadata(&path)
-        .ok()
-        .filter(std::fs::Metadata::is_file)?
-        .len();
-    Some((path, bytes))
+/// One copy of the database, kept from before a compaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseBackup {
+    /// File name, which is how the copy is addressed.
+    pub name: String,
+    /// Where it is, for an interface to show and a user to rename.
+    pub path: PathBuf,
+    /// How many bytes deleting it would reclaim.
+    pub bytes: u64,
+    /// When it was written.
+    pub taken: jiff::Timestamp,
 }
 
-/// Deletes the copy of the database a compaction left behind.
+/// Whether a file name is one this wrote, rather than something else sitting beside the
+/// snapshots. Only these are ever listed, pruned, or offered for deletion.
+///
+/// The time has to parse, which is what keeps a name like `client.realm.notes.backup` from
+/// being pruned as though this had written it, and a name carrying a path separator from
+/// reaching anything nested.
+fn is_backup_name(name: &str) -> bool {
+    name == LEGACY_BACKUP || stamp_in_name(name).is_some()
+}
+
+/// The time a copy's name records, or `None` when the name does not record one.
+fn stamp_in_name(name: &str) -> Option<jiff::Timestamp> {
+    let stamp = name
+        .strip_prefix(BACKUP_PREFIX)?
+        .strip_suffix(BACKUP_SUFFIX)?;
+    jiff::civil::DateTime::strptime("%Y%m%d-%H%M%S", stamp)
+        .ok()?
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .ok()
+        .map(|zoned| zoned.timestamp())
+}
+
+/// When a copy was taken, which its name records.
+///
+/// Falls back to when the file was written, for the legacy name, which records nothing.
+/// `written` is `None` only when the filesystem will not say, which leaves nothing to date the
+/// copy by.
+fn taken_from_name(name: &str, written: Option<jiff::Timestamp>) -> Option<jiff::Timestamp> {
+    stamp_in_name(name).or(written)
+}
+
+/// The copies of the database that compactions left behind, newest first.
+///
+/// Returns an empty list when no compaction has run, or when every copy has been removed.
+#[must_use]
+pub fn database_backups(library: &Library) -> Vec<DatabaseBackup> {
+    let directory = library.snapshots_dir();
+    if !crate::safety::is_safe_path(&directory, &[library.root()]) {
+        return Vec::new();
+    }
+
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+
+    let mut found: Vec<DatabaseBackup> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !is_backup_name(&name) {
+                return None;
+            }
+            let meta = entry.metadata().ok().filter(std::fs::Metadata::is_file)?;
+            let written = meta.modified().ok().and_then(|at| at.try_into().ok());
+            let taken = taken_from_name(&name, written)?;
+            Some(DatabaseBackup {
+                name,
+                path: entry.path(),
+                bytes: meta.len(),
+                taken,
+            })
+        })
+        .collect();
+
+    found.sort_by(|left, right| {
+        right
+            .taken
+            .cmp(&left.taken)
+            .then_with(|| right.name.cmp(&left.name))
+    });
+    found
+}
+
+/// Deletes one copy of the database, named as [`DatabaseBackup::name`] gives it.
+///
+/// Deleting a copy that is already gone is not an error, so a second click cannot fail.
 ///
 /// # Errors
 ///
-/// Returns [`SnapshotError::Io`] if the file exists and cannot be removed.
-pub fn remove_database_backup(library: &Library) -> Result<(), SnapshotError> {
+/// Returns [`SnapshotError::OutsideLibrary`] if `name` is not a name this wrote, and
+/// [`SnapshotError::Io`] if the file exists and cannot be removed.
+pub fn remove_database_backup(library: &Library, name: &str) -> Result<(), SnapshotError> {
     let _lock = OperationLock::acquire(library)?;
-    let Some((path, _)) = database_backup(library) else {
-        return Ok(());
-    };
+    let path = library.snapshots_dir().join(name);
+    // `name` arrives from an interface. Anything that is not a copy this wrote, and any name
+    // that walks out of the snapshots directory, is refused rather than deleted.
+    if !is_backup_name(name) || !crate::safety::is_safe_path(&path, &[library.root()]) {
+        return Err(SnapshotError::OutsideLibrary { path });
+    }
 
-    std::fs::remove_file(&path).map_err(|source| SnapshotError::Io {
-        action: "deleting the database copy",
-        path,
-        source,
-    })
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(SnapshotError::Io {
+            action: "deleting the database copy",
+            path,
+            source,
+        }),
+    }
 }
 
 /// A writer may have acquired a reference after the clean committed. Recheck under a new
@@ -830,37 +982,187 @@ mod tests {
     fn compacting_keeps_a_copy_of_the_database() {
         let (_dir, library) = library();
         assert!(
-            database_backup(&library).is_none(),
+            database_backups(&library).is_empty(),
             "nothing to fall back to yet"
         );
 
         // The stub is not a real database, so the rewrite fails. The copy must already exist.
         assert!(compact(&library).is_err());
 
-        let (path, bytes) = database_backup(&library).expect("no copy was kept");
-        assert_eq!(std::fs::read(&path).unwrap(), b"stub");
-        assert_eq!(bytes, 4);
+        let copies = database_backups(&library);
+        let [copy] = copies.as_slice() else {
+            panic!("expected exactly one copy, got {copies:?}");
+        };
+        assert_eq!(std::fs::read(&copy.path).unwrap(), b"stub");
+        assert_eq!(copy.bytes, 4);
+        assert!(
+            copy.name.starts_with(BACKUP_PREFIX) && copy.name.ends_with(BACKUP_SUFFIX),
+            "a copy carries the time it was taken: {}",
+            copy.name
+        );
 
-        remove_database_backup(&library).unwrap();
-        assert!(database_backup(&library).is_none());
-        remove_database_backup(&library).expect("removing a missing copy is not an error");
+        remove_database_backup(&library, &copy.name).unwrap();
+        assert!(database_backups(&library).is_empty());
+        remove_database_backup(&library, &copy.name)
+            .expect("removing a missing copy is not an error");
+    }
+
+    /// Writes `count` copies by hand. Going through `compact` would need a second between each
+    /// one to earn a different name.
+    fn write_copies(library: &Library, count: usize) -> Vec<String> {
+        std::fs::create_dir_all(library.snapshots_dir()).unwrap();
+        (1..=count)
+            .map(|index| {
+                let name = format!("{BACKUP_PREFIX}2026010{index}-000000{BACKUP_SUFFIX}");
+                std::fs::write(library.snapshots_dir().join(&name), b"copy").unwrap();
+                name
+            })
+            .collect()
     }
 
     #[test]
-    fn a_second_compaction_replaces_the_previous_copy() {
+    fn copies_are_listed_newest_first() {
         let (_dir, library) = library();
-        assert!(compact(&library).is_err());
+        let written = write_copies(&library, 3);
 
-        std::fs::write(library.database(), b"newer stub").unwrap();
-        assert!(compact(&library).is_err());
+        let listed: Vec<String> = database_backups(&library)
+            .into_iter()
+            .map(|copy| copy.name)
+            .collect();
+        let mut newest_first = written;
+        newest_first.reverse();
+        assert_eq!(listed, newest_first);
+    }
 
-        let (path, _) = database_backup(&library).expect("no copy was kept");
-        assert_eq!(std::fs::read(&path).unwrap(), b"newer stub");
-        assert_eq!(
-            std::fs::read_dir(library.snapshots_dir()).unwrap().count(),
-            1,
-            "copies must not accumulate"
+    #[test]
+    fn a_copy_version_1_3_wrote_is_still_listed() {
+        let (_dir, library) = library();
+        std::fs::create_dir_all(library.snapshots_dir()).unwrap();
+        std::fs::write(library.snapshots_dir().join(LEGACY_BACKUP), b"copy").unwrap();
+
+        let copies = database_backups(&library);
+        assert_eq!(copies.len(), 1, "an older copy must still be offered");
+        assert_eq!(copies[0].name, LEGACY_BACKUP);
+        remove_database_backup(&library, LEGACY_BACKUP).unwrap();
+        assert!(database_backups(&library).is_empty());
+    }
+
+    #[test]
+    fn a_file_that_only_looks_like_a_copy_is_left_alone() {
+        let (_dir, library) = library();
+        std::fs::create_dir_all(library.snapshots_dir()).unwrap();
+        let nested = library.snapshots_dir().join("client.realm.held");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("important.backup"), b"keep me").unwrap();
+        let handmade = library.snapshots_dir().join("client.realm.mine.backup");
+        std::fs::write(&handmade, b"keep me too").unwrap();
+
+        assert!(
+            database_backups(&library).is_empty(),
+            "only copies this wrote are listed, and so only they are pruned"
         );
+        for name in [
+            "client.realm.held/important.backup",
+            "client.realm.mine.backup",
+            "client.realm.2026-09-09.backup",
+        ] {
+            assert!(
+                remove_database_backup(&library, name).is_err(),
+                "{name} does not record a time this wrote"
+            );
+        }
+        assert!(nested.join("important.backup").exists());
+        assert!(handmade.exists());
+    }
+
+    #[test]
+    fn two_copies_in_the_same_second_both_survive() {
+        let (_dir, library) = library();
+        let first = back_up_database(&library).expect("could not write the first copy");
+        std::fs::write(library.database(), b"newer stub").unwrap();
+        let second = back_up_database(&library).expect("could not write the second copy");
+
+        assert_ne!(first, second, "the second copy must not replace the first");
+        assert_eq!(std::fs::read(&first).unwrap(), b"stub");
+        assert_eq!(std::fs::read(&second).unwrap(), b"newer stub");
+        assert_eq!(database_backups(&library).len(), 2);
+    }
+
+    #[test]
+    fn the_copy_just_written_is_never_the_one_pruned() {
+        let (_dir, library) = library();
+        // Every copy already there is dated later than the one about to be written, as a clock
+        // that has gone backwards would leave them.
+        let existing: Vec<String> = (1..=MAX_DATABASE_BACKUPS)
+            .map(|index| {
+                let name = format!("{BACKUP_PREFIX}2999010{index}-000000{BACKUP_SUFFIX}");
+                std::fs::create_dir_all(library.snapshots_dir()).unwrap();
+                std::fs::write(library.snapshots_dir().join(&name), b"later").unwrap();
+                name
+            })
+            .collect();
+
+        let fresh = back_up_database(&library).expect("could not write the copy");
+
+        assert!(
+            fresh.exists(),
+            "the copy the rewrite depends on must survive"
+        );
+        let left = database_backups(&library);
+        assert_eq!(left.len(), MAX_DATABASE_BACKUPS);
+        assert!(
+            !left.iter().any(|copy| copy.name == existing[0]),
+            "the oldest of the others is the one to go"
+        );
+    }
+
+    #[test]
+    fn a_copy_is_dated_by_its_name_not_by_the_file() {
+        let (_dir, library) = library();
+        write_copies(&library, 1);
+
+        let copies = database_backups(&library);
+        assert_eq!(
+            copies[0].taken.strftime("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-01-01 00:00:00",
+            "the name is where the time is recorded"
+        );
+    }
+
+    #[test]
+    fn only_the_newest_copies_are_kept() {
+        let (_dir, library) = library();
+        let written = write_copies(&library, MAX_DATABASE_BACKUPS + 2);
+
+        prune_database_backups(&library, written.last().unwrap());
+
+        let left: Vec<String> = database_backups(&library)
+            .into_iter()
+            .map(|copy| copy.name)
+            .collect();
+        assert_eq!(left.len(), MAX_DATABASE_BACKUPS);
+        assert!(
+            !left.contains(&written[0]),
+            "the oldest copy must be the one to go"
+        );
+        assert!(left.contains(written.last().unwrap()));
+    }
+
+    #[test]
+    fn only_the_copies_this_wrote_can_be_deleted() {
+        let (_dir, library) = library();
+        std::fs::create_dir_all(library.snapshots_dir()).unwrap();
+        let bystander = library.snapshots_dir().join("notes.txt");
+        std::fs::write(&bystander, b"keep me").unwrap();
+
+        for name in ["notes.txt", "client.realm", "../client.realm", ""] {
+            assert!(
+                remove_database_backup(&library, name).is_err(),
+                "{name} is not a copy this wrote"
+            );
+        }
+        assert!(bystander.exists(), "a bystander must survive");
+        assert!(library.database().exists(), "the database must survive");
     }
 
     #[test]

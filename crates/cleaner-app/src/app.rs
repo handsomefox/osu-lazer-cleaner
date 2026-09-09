@@ -168,8 +168,8 @@ pub(crate) struct App {
     /// Written by the watcher thread, read every frame.
     lazer_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     snapshots: Vec<SnapshotSummary>,
-    /// The copy of the database the last compaction kept.
-    backup: Option<BackupSummary>,
+    /// The copies of the database compactions kept, newest first.
+    backups: Vec<BackupSummary>,
     /// Size of `client.realm`, so the compact control can show what it is working on.
     database_bytes: u64,
     /// What the last compaction did, if one has run.
@@ -219,7 +219,7 @@ impl App {
             search: String::new(),
             sets: Vec::new(),
             lazer_running: watch_for_lazer(ctx.clone()),
-            backup: None,
+            backups: Vec::new(),
             database_bytes: 0,
             compaction: None,
             modal: None,
@@ -288,9 +288,9 @@ impl App {
                     self.compaction = Some(result);
                     self.activity = None;
                 }
-                Event::Snapshots { entries, backup } => {
+                Event::Snapshots { entries, backups } => {
                     self.snapshots = entries;
-                    self.backup = backup;
+                    self.backups = backups;
                     self.activity = None;
                 }
                 Event::Finished {
@@ -1193,8 +1193,8 @@ impl App {
         ui.add_space(10.0);
         ui.label(
             egui::RichText::new(
-                "Compacting copies client.realm first and keeps the copy until you delete it, so \
-                 a rewrite osu!lazer will not open costs nothing but the time to put it back.",
+                "Compacting copies client.realm first and keeps the copy, so a rewrite osu!lazer \
+                 will not open costs nothing but the time to put it back.",
             )
             .small()
             .color(theme::MUTED),
@@ -1220,34 +1220,52 @@ impl App {
             }
         });
 
-        let Some(backup) = self.backup.clone() else {
+        if self.backups.is_empty() {
             return;
-        };
+        }
 
-        ui.add_space(14.0);
+        ui.add_space(16.0);
+        ui.label(egui::RichText::new("Copies of client.realm").strong());
         ui.label(
             egui::RichText::new(format!(
-                "A copy of client.realm from before the last compaction is kept at {}, holding \
-                 {}. Put it back by renaming it over client.realm with osu!lazer closed.",
-                backup.path.display(),
-                human_bytes(backup.bytes)
+                "Kept in {}. Put one back by renaming it over client.realm with osu!lazer \
+                 closed. Compacting keeps the newest few and removes the rest.",
+                self.backups[0]
+                    .path
+                    .parent()
+                    .unwrap_or(&self.backups[0].path)
+                    .display()
             ))
             .small()
             .color(theme::MUTED),
         );
         ui.add_space(8.0);
 
-        ui.add_enabled_ui(self.idle(), |ui| {
-            if ui
-                .button(icons::labelled(icons::DELETE, "Delete the copy"))
-                .on_hover_text("Do this once osu!lazer has opened your library without complaint")
-                .clicked()
-            {
-                self.error = None;
-                self.activity = Some(Activity::ListingSnapshots);
-                self.worker.send(Command::RemoveDatabaseBackup);
-            }
-        });
+        for copy in self.backups.clone() {
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(self.idle(), |ui| {
+                    if ui
+                        .button(icons::DELETE)
+                        .on_hover_text(
+                            "Delete this copy, once osu!lazer has opened your library without \
+                             complaint",
+                        )
+                        .clicked()
+                    {
+                        self.error = None;
+                        self.activity = Some(Activity::ListingSnapshots);
+                        self.worker
+                            .send(Command::RemoveDatabaseBackup { name: copy.name });
+                    }
+                });
+                ui.label(&copy.taken);
+                ui.label(
+                    egui::RichText::new(human_bytes(copy.bytes))
+                        .small()
+                        .color(theme::MUTED),
+                );
+            });
+        }
     }
 
     /// What an open question says and which button carries it out.

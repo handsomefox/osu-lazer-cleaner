@@ -36,8 +36,8 @@ pub mod storage;
 pub use catalog::Category;
 pub use error::{ScanError, SnapshotError, StorageError};
 pub use execute::{
-    CleanProgress, Compaction, Outcome, compact, database_backup, remove_database_backup, restore,
-    run,
+    CleanProgress, Compaction, DatabaseBackup, Outcome, compact, database_backups,
+    remove_database_backup, restore, run,
 };
 pub use format::human_bytes;
 pub use plan::{Candidate, Group, Options, Plan, Progress, SetEntry, SetId, Timings, Totals};
