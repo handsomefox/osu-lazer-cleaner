@@ -440,6 +440,9 @@ impl App {
             .corner_radius(egui::CornerRadius::same(4))
             .inner_margin(egui::Margin::symmetric(12, 9))
             .show(ui, |ui| {
+                // Without this the frame stops at the end of the longest line the paragraph
+                // wrapped to, which leaves a banner that ends short of the window edge.
+                ui.set_min_width(ui.available_width());
                 ui.label(
                     egui::RichText::new(icons::labelled(icons::WARNING, "osu!lazer is running"))
                         .color(theme::BAD)
