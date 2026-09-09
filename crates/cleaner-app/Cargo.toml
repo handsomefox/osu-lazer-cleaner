@@ -19,6 +19,7 @@ cleaner-core = { path = "../cleaner-core" }
 crossbeam-channel.workspace = true
 jiff.workspace = true
 eframe.workspace = true
+egui_extras.workspace = true
 image.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
