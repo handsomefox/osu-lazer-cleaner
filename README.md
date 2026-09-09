@@ -122,9 +122,18 @@ osu!lazer will not open costs nothing but the time to rename the copy back.
 
 ## Diagnostics
 
-The window writes a dated log to `%LOCALAPPDATA%\osu-lazer-cleaner\logs\` on Windows and to
-`~/.local/share/osu-lazer-cleaner/logs/` elsewhere, keeping the last seven days. **About** has a
-button that opens the folder. Attach the newest file to an issue.
+Both interfaces write a dated log to `%LOCALAPPDATA%\osu-lazer-cleaner\logs\` on Windows and
+to `~/.local/share/osu-lazer-cleaner/logs/` elsewhere, keeping the last seven days. **About**
+has a button that opens the folder. Attach the newest file to an issue.
+
+Every operation records what it did and how long it took: the library it opened, the sets and
+candidates a scan found with its phase timings, and the rows, blobs, bytes, and throughput of a
+clean, restore, deletion, or compaction. Failures record the whole error chain, not just the
+sentence the interface showed.
+
+`RUST_LOG` overrides the level. `RUST_LOG=debug` adds a line per blob, which is worth having
+when a single file is behaving oddly and far too much otherwise. On the command line the log
+file keeps everything while stderr stays at warnings, so `--json` output is unaffected.
 
 ## Command line
 

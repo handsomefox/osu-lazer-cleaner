@@ -46,6 +46,22 @@ pub(crate) enum Command {
     RemoveDatabaseBackup,
 }
 
+impl Command {
+    /// A short name for the log. The command itself is too large to print.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::OpenLibrary { .. } => "open library",
+            Self::Scan { .. } => "scan",
+            Self::Clean { .. } => "clean",
+            Self::ListSnapshots => "list snapshots",
+            Self::RestoreSnapshot { .. } => "restore snapshot",
+            Self::DeleteSnapshot { .. } => "delete snapshot",
+            Self::Compact => "compact",
+            Self::RemoveDatabaseBackup => "remove database backup",
+        }
+    }
+}
+
 /// What the worker reports back.
 #[derive(Debug)]
 pub(crate) enum Event {
@@ -187,14 +203,15 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
         let _ = events.send(event);
     };
 
+    // The name only: a Clean carries the whole plan, which is megabytes of Debug output.
+    tracing::info!(command = command.name(), "handling a command");
+
     match command {
         Command::OpenLibrary { path } => open(library, path.as_deref(), events),
 
         Command::Scan { selected } => match library.as_ref() {
             Some(library) => report(scan(library, &selected, events)),
-            None => report(Event::Failed {
-                message: "no library is open".to_owned(),
-            }),
+            None => report(failed_message("no library is open".to_owned())),
         },
 
         Command::Clean { plan } => {
@@ -235,9 +252,7 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
 
             report(match cleaner_core::compact(library) {
                 Ok(result) => Event::Compacted { result },
-                Err(error) => Event::Failed {
-                    message: error.to_string(),
-                },
+                Err(error) => failed(&error),
             });
             report(snapshot_event(library));
         }
@@ -249,9 +264,7 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
 
             match cleaner_core::remove_database_backup(library) {
                 Ok(()) => report(snapshot_event(library)),
-                Err(error) => report(Event::Failed {
-                    message: error.to_string(),
-                }),
+                Err(error) => report(failed(&error)),
             }
         }
     }
@@ -273,9 +286,7 @@ fn open(library: &mut Option<Library>, path: Option<&std::path::Path>, events: &
             *library = Some(found);
         }
         Err(error) => {
-            let _ = events.send(Event::Failed {
-                message: error.to_string(),
-            });
+            let _ = events.send(failed(&error));
         }
     }
 }
@@ -296,9 +307,7 @@ fn scan(
         Ok(plan) => Event::Scanned {
             plan: Box::new(plan),
         },
-        Err(error) => Event::Failed {
-            message: error.to_string(),
-        },
+        Err(error) => failed(&error),
     }
 }
 
@@ -316,9 +325,7 @@ fn clean(library: &Library, plan: &Plan, events: &Sender<Event>) -> Event {
             files: outcome.detached,
             bytes: outcome.bytes,
         },
-        Err(error) => Event::Failed {
-            message: error.to_string(),
-        },
+        Err(error) => failed(&error),
     }
 }
 
@@ -344,24 +351,18 @@ fn act_on_snapshot(
     let entries = match snapshot::list(library) {
         Ok(entries) => entries,
         Err(error) => {
-            let _ = events.send(Event::Failed {
-                message: error.to_string(),
-            });
+            let _ = events.send(failed(&error));
             return;
         }
     };
 
     let Some(target) = entries.iter().find(|s| s.id() == id) else {
-        let _ = events.send(Event::Failed {
-            message: format!("no snapshot named '{id}'"),
-        });
+        let _ = events.send(failed_message(format!("no snapshot named '{id}'")));
         return;
     };
 
     if let Err(error) = operation(library, target) {
-        let _ = events.send(Event::Failed {
-            message: error.to_string(),
-        });
+        let _ = events.send(failed(&error));
         return;
     }
 
@@ -375,9 +376,7 @@ fn snapshot_event(library: &Library) -> Event {
             backup: cleaner_core::database_backup(library)
                 .map(|(path, bytes)| BackupSummary { path, bytes }),
         },
-        Err(error) => Event::Failed {
-            message: error.to_string(),
-        },
+        Err(error) => failed(&error),
     }
 }
 
@@ -411,4 +410,21 @@ fn describe(progress: &cleaner_core::Progress) -> String {
         }
         cleaner_core::Progress::Done => "Scan complete".to_owned(),
     }
+}
+
+/// Reports a failure to the window, and the whole error chain to the log.
+///
+/// `Display` on the outermost error is what the window shows; the chain behind it is what makes
+/// a log worth attaching to an issue.
+fn failed(error: &dyn std::error::Error) -> Event {
+    tracing::error!("{}", cleaner_core::error::chain(error));
+    Event::Failed {
+        message: error.to_string(),
+    }
+}
+
+/// A failure with no error value behind it.
+fn failed_message(message: String) -> Event {
+    tracing::error!("{message}");
+    Event::Failed { message }
 }

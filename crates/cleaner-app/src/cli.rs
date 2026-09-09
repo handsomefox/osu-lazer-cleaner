@@ -92,6 +92,21 @@ enum SnapshotCommand {
     },
 }
 
+impl Command {
+    /// A short name for the log.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Scan { .. } => "scan",
+            Self::Categories => "categories",
+            Self::Clean { .. } => "clean",
+            Self::Compact => "compact",
+            Self::Snapshot(SnapshotCommand::List) => "snapshot list",
+            Self::Snapshot(SnapshotCommand::Restore { .. }) => "snapshot restore",
+            Self::Snapshot(SnapshotCommand::Delete { .. }) => "snapshot delete",
+        }
+    }
+}
+
 /// Parses a category slug for clap.
 fn parse_category(value: &str) -> Result<Category, String> {
     Category::from_slug(value).ok_or_else(|| {
@@ -108,18 +123,28 @@ const NO_ARGUMENTS: &str = "Run osu-lazer-cleaner with no arguments to open the 
 
 /// Runs the command-line interface and returns the process exit code.
 pub(crate) fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    crate::diagnostics::install(crate::diagnostics::Interface::CommandLine);
 
     let cli = Cli::parse();
+    tracing::info!(
+        command = cli.command.name(),
+        json = cli.json,
+        "running a command"
+    );
 
     match run(&cli, &mut std::io::stdout().lock()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            tracing::info!(command = cli.command.name(), "command finished");
+            ExitCode::SUCCESS
+        }
         Err(error) => {
+            // stderr gets the outermost message, which is the one worth reading; the log gets
+            // the chain behind it.
+            tracing::error!(
+                target: crate::diagnostics::LOG_ONLY,
+                "{}",
+                cleaner_core::error::chain(error.as_ref())
+            );
             if cli.json {
                 eprintln!("{}", serde_json::json!({"error": error.to_string()}));
             } else {
