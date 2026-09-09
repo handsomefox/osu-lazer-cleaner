@@ -19,6 +19,12 @@ Scan a library and you get a table: how many files each category holds and how m
 removing it would return. Open **Browse sets** on any row to see which beatmaps make up that
 number and untick the ones you want left alone.
 
+![The clean screen after a scan, with three categories ticked](docs/scan.png)
+
+Nothing has been read yet on the first run, so the window offers the one thing there is to do.
+
+![The clean screen before a scan](docs/first-run.png)
+
 | Category | What it removes |
 |---|---|
 | Videos | Video backdrops. Beatmaps play normally without them. |
@@ -69,6 +75,11 @@ links would otherwise pin files the library still owns.
 
 On a filesystem with no hard links the snapshot gets a copy instead, which needs the space
 twice until you delete the snapshot.
+
+The snapshots screen lists what each clean took, and puts it back or deletes it. The database
+and the copies taken before each compaction sit beside it.
+
+![The snapshots screen, listing one snapshot and three copies of the database](docs/snapshots.png)
 
 Before detaching files, the tool checks their identities and current reference counts under
 the database write lock. If a set or file changed since the scan, the clean stops and asks you
@@ -174,6 +185,15 @@ The workspace is layered so that everything portable stays testable on Linux:
   put the icon, the version, and the DPI settings into the Windows executable.
 
 Building realm-core needs `cmake` and a C++17 compiler. A cold build takes about two minutes.
+
+The pictures above are taken against a library this writes, not against anyone's own:
+
+```
+cargo run -p cleaner-core --example demo_library -- /tmp/demo
+```
+
+It invents 240 beatmap sets and writes their files as sparse files, so the sizes the window
+reports are real while the directory costs two megabytes.
 
 Cross-compile a Windows executable from Linux with `scripts/package-windows.sh`, which needs
 `cargo-xwin`. The same tool lints against the Windows target, which is worth running before
