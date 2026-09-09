@@ -1,5 +1,6 @@
 //! Application state and screen layout.
 
+use crate::icons;
 use crate::theme;
 use crate::worker::{BackupSummary, Command, Event, SnapshotSummary, Worker};
 use cleaner_core::{Category, Plan, SetEntry, Totals, human_bytes};
@@ -16,6 +17,9 @@ const LAZER_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// How many beatmap sets the browse list shows before it asks the user to narrow the search.
 const BROWSE_LIMIT: usize = 500;
 
+/// Storage key holding the screen that was open when the window closed.
+const SCREEN_KEY: &str = "screen";
+
 /// Which screen is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -23,6 +27,26 @@ enum Screen {
     Clean,
     /// Snapshots from previous cleans.
     Snapshots,
+}
+
+impl Screen {
+    /// The name this screen is stored under. Stored rather than derived, so renaming a variant
+    /// cannot silently invalidate what a previous version wrote.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Snapshots => "snapshots",
+        }
+    }
+
+    /// The screen a stored key names, if it still names one.
+    fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "clean" => Some(Self::Clean),
+            "snapshots" => Some(Self::Snapshots),
+            _ => None,
+        }
+    }
 }
 
 /// What the worker is doing, when it is doing something.
@@ -128,19 +152,30 @@ pub(crate) struct App {
     /// Snapshot the open question refers to, for restore and delete.
     pending_snapshot: Option<String>,
     last_result: Option<String>,
+    /// Whether the About modal is open.
+    about: bool,
 }
 
 impl App {
     /// Builds the application and asks the worker to find a library.
-    pub(crate) fn new(ctx: &egui::Context) -> Self {
+    pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let ctx = &cc.egui_ctx;
         theme::apply(ctx);
+        // The About window draws the icon from a PNG, which needs a loader.
+        egui_extras::install_image_loaders(ctx);
+
+        let screen = cc
+            .storage
+            .and_then(|storage| storage.get_string(SCREEN_KEY))
+            .and_then(|key| Screen::from_key(&key))
+            .unwrap_or(Screen::Clean);
 
         let worker = Worker::spawn(ctx.clone());
         worker.send(Command::OpenLibrary { path: None });
 
         Self {
             worker,
-            screen: Screen::Clean,
+            screen,
             library: None,
             status: "Looking for an osu!lazer library".to_owned(),
             error: None,
@@ -164,6 +199,7 @@ impl App {
             modal: None,
             pending_snapshot: None,
             last_result: None,
+            about: false,
         }
     }
 
@@ -366,7 +402,7 @@ impl App {
             .inner_margin(egui::Margin::symmetric(12, 9))
             .show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("osu!lazer is running")
+                    egui::RichText::new(icons::labelled(icons::WARNING, "osu!lazer is running"))
                         .color(theme::BAD)
                         .strong(),
                 );
@@ -422,7 +458,10 @@ impl eframe::App for App {
             )
             .show(root, |ui| {
                 if let Some(error) = self.error.clone() {
-                    ui.label(egui::RichText::new(error).color(theme::BAD));
+                    ui.label(
+                        egui::RichText::new(icons::labelled(icons::ERROR, &error))
+                            .color(theme::BAD),
+                    );
                     ui.add_space(10.0);
                 }
 
@@ -435,6 +474,12 @@ impl eframe::App for App {
             });
 
         self.show_modal(&ctx);
+        crate::about::show(&ctx, &mut self.about);
+    }
+
+    /// Remembers the open screen, so the window comes back where it was left.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(SCREEN_KEY, self.screen.key().to_owned());
     }
 }
 
@@ -472,13 +517,28 @@ impl App {
 
             ui.add_space(18.0);
             ui.add_enabled_ui(self.idle(), |ui| {
-                ui.selectable_value(&mut self.screen, Screen::Clean, "Clean")
-                    .on_hover_text("Ctrl+1, or Ctrl+Tab to switch");
-                ui.selectable_value(&mut self.screen, Screen::Snapshots, "Snapshots")
-                    .on_hover_text("Ctrl+2, or Ctrl+Tab to switch");
+                ui.selectable_value(
+                    &mut self.screen,
+                    Screen::Clean,
+                    icons::labelled(icons::CLEAN, "Clean"),
+                )
+                .on_hover_text("Ctrl+1, or Ctrl+Tab to switch");
+                ui.selectable_value(
+                    &mut self.screen,
+                    Screen::Snapshots,
+                    icons::labelled(icons::SNAPSHOTS, "Snapshots"),
+                )
+                .on_hover_text("Ctrl+2, or Ctrl+Tab to switch");
             });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(icons::ABOUT)
+                    .on_hover_text("About osu!lazer Cleaner")
+                    .clicked()
+                {
+                    self.about = true;
+                }
                 if let Some(root) = &self.library {
                     ui.label(
                         egui::RichText::new(root.display().to_string())
@@ -493,7 +553,9 @@ impl App {
     /// The library, what it is made of, and what to take out of it.
     fn clean_screen(&mut self, ui: &mut egui::Ui) {
         if let Some(result) = self.last_result.clone() {
-            ui.label(egui::RichText::new(result).color(theme::GOOD));
+            ui.label(
+                egui::RichText::new(icons::labelled(icons::SUCCESS, &result)).color(theme::GOOD),
+            );
             ui.label(
                 egui::RichText::new(
                     "Start osu!lazer and check your beatmaps before deleting the snapshot.",
@@ -513,7 +575,10 @@ impl App {
             );
             ui.add_space(16.0);
             ui.add_enabled_ui(self.idle() && self.library.is_some(), |ui| {
-                if ui.button("Scan library").clicked() {
+                if ui
+                    .button(icons::labelled(icons::SCAN, "Scan library"))
+                    .clicked()
+                {
                     self.scan();
                 }
             });
@@ -533,7 +598,11 @@ impl App {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_enabled_ui(self.idle(), |ui| {
-                    if ui.button("Scan again").on_hover_text("F5").clicked() {
+                    if ui
+                        .button(icons::labelled(icons::RESCAN, "Scan again"))
+                        .on_hover_text("F5")
+                        .clicked()
+                    {
                         self.scan();
                     }
                 });
@@ -681,7 +750,11 @@ impl App {
         ui.horizontal(|ui| {
             ui.add_enabled_ui(found && self.idle(), |ui| {
                 let mut ticked = on;
-                let label = egui::RichText::new(category.label()).color(if on && found {
+                let label = egui::RichText::new(icons::labelled(
+                    icons::category(category),
+                    category.label(),
+                ))
+                .color(if on && found {
                     theme::REMOVE
                 } else {
                     theme::TEXT
@@ -936,14 +1009,17 @@ impl App {
             // whatever the window leaves.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_enabled_ui(self.idle(), |ui| {
-                    if ui.button("Delete").clicked() {
+                    if ui
+                        .button(icons::labelled(icons::DELETE, "Delete"))
+                        .clicked()
+                    {
                         self.pending_snapshot = Some(entry.id.clone());
                         self.modal = Some(Question::Delete);
                     }
                 });
 
                 ui.add_enabled_ui(newest && self.idle(), |ui| {
-                    let button = ui.button("Put files back");
+                    let button = ui.button(icons::labelled(icons::RESTORE, "Put files back"));
                     if !newest {
                         button.on_disabled_hover_text("Restore the snapshot above this one first.");
                     } else if button.clicked() {
@@ -993,7 +1069,10 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.add_enabled_ui(self.idle() && self.library.is_some(), |ui| {
-                if ui.button("Compact database").clicked() {
+                if ui
+                    .button(icons::labelled(icons::COMPACT, "Compact database"))
+                    .clicked()
+                {
                     self.compaction = None;
                     self.error = None;
                     self.activity = Some(Activity::Compacting);
@@ -1026,7 +1105,7 @@ impl App {
 
         ui.add_enabled_ui(self.idle(), |ui| {
             if ui
-                .button("Delete the copy")
+                .button(icons::labelled(icons::DELETE, "Delete the copy"))
                 .on_hover_text("Do this once osu!lazer has opened your library without complaint")
                 .clicked()
             {

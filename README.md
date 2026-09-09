@@ -109,7 +109,11 @@ Close osu!lazer before cleaning, restoring, or compacting the database. The wind
 the game and says so while it is open.
 
 Keyboard: `Ctrl+Tab` switches screens, `Ctrl+1` and `Ctrl+2` go straight to one, `F5` scans
-again, and `Esc` closes whatever is open.
+again, and `Esc` closes whatever is open. It reopens on whichever of the two screens you used
+last.
+
+The button in the top right corner opens **About**, which carries the version, the font
+licences, and a button that opens the log folder.
 
 The **Snapshots** screen shows the database size and a **Compact database** button. Compaction
 reclaims the space left by removed database rows. It reports when another open handle prevents
@@ -150,7 +154,8 @@ The workspace is layered so that everything portable stays testable on Linux:
 - `cleaner-core` holds storage discovery, `.osu` and `.osb` parsing, scanning, and snapshots.
   It has no platform or interface dependencies.
 - `cleaner-app` holds both interfaces and builds the one executable. It is the only crate that
-  depends on egui.
+  depends on egui. `assets/` carries the icon, Inter, and Phosphor; `app.rc` and `app.manifest`
+  put the icon, the version, and the DPI settings into the Windows executable.
 
 Building realm-core needs `cmake` and a C++17 compiler. A cold build takes about two minutes.
 
