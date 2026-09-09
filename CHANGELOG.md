@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.0
+
+- Give the executable and the window an icon.
+- Set the interface in Inter, and put Phosphor glyphs on the screens, categories, and actions.
+- Add an About window carrying the version, the font licences, the project link, and a button
+  that opens the log folder.
+- Write one dated log file per day and keep the last seven, instead of truncating a single file
+  on every run. The files move into `%LOCALAPPDATA%\osu-lazer-cleaner\logs`.
+- Ask Windows where `AppData` lives instead of reading the environment, so a redirected profile
+  still finds osu!lazer's library and this tool's own data.
+- Reopen on the screen the window was closed on.
+- Declare `longPathAware` and per-monitor DPI awareness in the Windows manifest.
+
 ## 1.1.0
 
 - Match background, storyboard, video, and hitsound references without regard to filename case.
