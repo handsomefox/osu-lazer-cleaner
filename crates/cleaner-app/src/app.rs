@@ -555,49 +555,60 @@ impl App {
 
     /// Title, screen switch, and the library path.
     fn header(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("osu!")
-                    .heading()
-                    .color(theme::REMOVE)
-                    .strong(),
-            );
-            ui.add_space(-6.0);
-            ui.label(egui::RichText::new("lazer Cleaner").heading());
+        // `horizontal` makes a row one interactive control tall, centres anything shorter within
+        // it, and lets anything taller hang off the bottom. The buttons are taller than that, so
+        // they hung below the title and left it looking as though it floated above the row.
+        // Giving the row the height of its tallest item first centres everything on one line.
+        let buttons =
+            ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().button_padding.y * 2.0;
+        let height = buttons.max(ui.text_style_height(&egui::TextStyle::Heading));
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), height),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(
+                    egui::RichText::new("osu!")
+                        .heading()
+                        .color(theme::REMOVE)
+                        .strong(),
+                );
+                ui.add_space(-6.0);
+                ui.label(egui::RichText::new("lazer Cleaner").heading());
 
-            ui.add_space(18.0);
-            ui.add_enabled_ui(self.idle(), |ui| {
-                ui.selectable_value(
-                    &mut self.screen,
-                    Screen::Clean,
-                    icons::labelled(icons::CLEAN, "Clean"),
-                )
-                .on_hover_text("Ctrl+1, or Ctrl+Tab to switch");
-                ui.selectable_value(
-                    &mut self.screen,
-                    Screen::Snapshots,
-                    icons::labelled(icons::SNAPSHOTS, "Snapshots"),
-                )
-                .on_hover_text("Ctrl+2, or Ctrl+Tab to switch");
-            });
+                ui.add_space(18.0);
+                ui.add_enabled_ui(self.idle(), |ui| {
+                    ui.selectable_value(
+                        &mut self.screen,
+                        Screen::Clean,
+                        icons::labelled(icons::CLEAN, "Clean"),
+                    )
+                    .on_hover_text("Ctrl+1, or Ctrl+Tab to switch");
+                    ui.selectable_value(
+                        &mut self.screen,
+                        Screen::Snapshots,
+                        icons::labelled(icons::SNAPSHOTS, "Snapshots"),
+                    )
+                    .on_hover_text("Ctrl+2, or Ctrl+Tab to switch");
+                });
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(icons::ABOUT)
-                    .on_hover_text("About osu!lazer Cleaner")
-                    .clicked()
-                {
-                    self.about = true;
-                }
-                if let Some(root) = &self.library {
-                    ui.label(
-                        egui::RichText::new(root.display().to_string())
-                            .small()
-                            .color(theme::MUTED),
-                    );
-                }
-            });
-        });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(icons::ABOUT)
+                        .on_hover_text("About osu!lazer Cleaner")
+                        .clicked()
+                    {
+                        self.about = true;
+                    }
+                    if let Some(root) = &self.library {
+                        ui.label(
+                            egui::RichText::new(root.display().to_string())
+                                .small()
+                                .color(theme::MUTED),
+                        );
+                    }
+                });
+            },
+        );
     }
 
     /// The library, what it is made of, and what to take out of it.
