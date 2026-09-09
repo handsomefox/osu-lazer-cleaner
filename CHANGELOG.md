@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.0
+
+- Keep the copies of `client.realm` taken before a compaction, each named for when it was taken,
+  instead of one copy that the next compaction overwrote. The newest three are kept. The
+  snapshots screen lists them and deletes them one at a time.
+- Open the log folder from the About window through the shell. The button did nothing on
+  Windows, and said so only in the log it was meant to open.
+- Say what is under way on the clean screen while a clean runs, rather than falling back to
+  "Nothing scanned yet" over a status line counting files into a snapshot.
+- Say when a restore or a snapshot deletion finishes. The status line used to keep the last
+  progress message, so a finished restore read as though it had stopped three files short.
+- Drop the scan results after a restore, which puts back files the scan was taken without.
+- Line the title up with the buttons beside it, and run the osu!lazer warning to the full width.
+
 ## 1.3.0
 
 - Fix the totals blanking to zero when the beatmap-set list opens, and the tick that holds a set
