@@ -87,6 +87,32 @@ impl Activity {
             Self::Compacting => "rewriting the database",
         }
     }
+
+    /// How to name it at the top of a screen with nothing else on it.
+    fn headline(self) -> &'static str {
+        match self {
+            Self::Scanning => "Reading your library",
+            Self::ListingSnapshots => "Reading your snapshots",
+            Self::Cleaning => "Moving files into a snapshot",
+            Self::Restoring => "Moving files back into the library",
+            Self::Deleting => "Deleting a snapshot",
+            Self::Compacting => "Rewriting the database",
+        }
+    }
+
+    /// What is worth knowing while it runs.
+    fn assurance(self) -> &'static str {
+        match self {
+            Self::Scanning => "Scanning reads your library. It changes nothing.",
+            Self::ListingSnapshots => "Reading what the snapshot folder holds.",
+            Self::Cleaning => {
+                "Nothing is deleted. The snapshot holds every file until you delete it."
+            }
+            Self::Restoring => "The snapshot keeps its copy until every file is back.",
+            Self::Deleting => "This is the one thing that cannot be undone.",
+            Self::Compacting => "client.realm is copied first, and the copy is kept.",
+        }
+    }
 }
 
 /// A question the user has to answer before anything happens.
@@ -595,6 +621,15 @@ impl App {
             // rather than in the corner.
             ui.add_space(ui.available_height() / 4.0);
             ui.vertical_centered(|ui| {
+                // A clean hands its plan to the worker, so this screen has nothing left to draw
+                // while one runs. Naming the work beats offering a scan that will not start.
+                if let Some(activity) = self.activity {
+                    ui.label(theme::figure(activity.headline()));
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(activity.assurance()).color(theme::MUTED));
+                    return;
+                }
+
                 ui.label(theme::figure("Nothing scanned yet"));
                 ui.add_space(6.0);
                 ui.label(
