@@ -16,7 +16,13 @@ The workspace is layered so that everything portable stays testable on Linux.
   stays testable anywhere.
 - `cleaner-app` holds both interfaces and builds the one executable. It is the only crate
   allowed to depend on egui. `main` opens the window when there are no arguments and hands over
-  to `cli` when there are.
+  to `cli` when there are. `assets/` carries the icon and the vendored fonts, and `build.rs`
+  compiles `app.rc` so the executable carries the icon, the version, and the manifest.
+
+The vendored Inter files have their Private Use Area cmap entries stripped. Upstream Inter maps
+stylistic-set alternates into U+E000..U+F8FF, where the Phosphor icon glyphs live, and Inter
+sits earlier in the family, so re-vendoring Inter from upstream turns every icon into a Latin
+alternate. `theme::install_fonts` carries the same warning.
 
 A category is data in `cleaner_core::Category`, not a function that removes files. Adding one
 means adding a variant and teaching `scan::categorise` to recognise it, not adding a new

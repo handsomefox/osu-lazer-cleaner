@@ -37,10 +37,50 @@ pub(crate) const GOOD: egui::Color32 = egui::Color32::from_rgb(0x7d, 0xd6, 0xa8)
 /// Something went wrong.
 pub(crate) const BAD: egui::Color32 = egui::Color32::from_rgb(0xff, 0x8b, 0x7d);
 
-/// Applies the palette and type scale.
+/// Applies the fonts, the palette, and the type scale.
 pub(crate) fn apply(ctx: &egui::Context) {
+    install_fonts(ctx);
     ctx.set_theme(egui::Theme::Dark);
     ctx.all_styles_mut(style);
+}
+
+// The vendored Inter files have their Private Use Area cmap entries stripped (upstream Inter
+// maps ~1.5k stylistic-set alternates into U+E000..U+F8FF, which would shadow the Phosphor icon
+// glyphs that live in the same range because Inter sits earlier in the family). Re-vendoring
+// Inter from upstream without stripping them turns every icon into a Latin alternate.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "inter".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf")).into(),
+    );
+    fonts.font_data.insert(
+        "inter-bold".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Bold.ttf")).into(),
+    );
+    fonts.font_data.insert(
+        "phosphor".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/Phosphor.ttf")).into(),
+    );
+
+    let proportional = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
+    proportional.insert(0, "inter".to_owned());
+    // Phosphor is a fallback, so glyphs render inside ordinary text runs.
+    proportional.insert(1, "phosphor".to_owned());
+    fonts.families.insert(
+        egui::FontFamily::Name("bold".into()),
+        vec!["inter-bold".to_owned(), "phosphor".to_owned()],
+    );
+
+    ctx.set_fonts(fonts);
+}
+
+/// The bold Inter family, for headings and the numbers worth reading first.
+pub(crate) fn bold() -> egui::FontFamily {
+    egui::FontFamily::Name("bold".into())
 }
 
 /// Fills in the palette and type scale on a style.
