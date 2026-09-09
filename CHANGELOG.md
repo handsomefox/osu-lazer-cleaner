@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.1
+
+- Log every operation with its outcome, duration, and throughput: library discovery, scans with
+  their phase timings, cleans, restores, snapshot deletions, and compaction.
+- Log failures with the whole error chain. Every failure the window reported reached the screen
+  and nothing else, so an attached log could not explain one.
+- Write the command line's log to the same file as the window, at `info`, while stderr keeps
+  showing warnings only.
+- Add per-blob detail under `RUST_LOG=debug`.
+
 ## 1.2.0
 
 - Give the executable and the window an icon.
