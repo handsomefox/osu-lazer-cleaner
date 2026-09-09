@@ -300,39 +300,49 @@ impl App {
 
     /// Keeps the plan's selection in step with the checkboxes, then recounts.
     fn apply_selection(&mut self) {
-        let Some(plan) = self.plan.as_mut() else {
-            self.selected_totals = Totals::default();
-            self.category_totals = Vec::new();
-            self.sets = Vec::new();
+        // Nothing to apply against, so leave the last totals alone. Zeroing them here used to
+        // blank the whole table whenever a handler ran while the screen held the plan.
+        let Some(mut plan) = self.plan.take() else {
             return;
         };
+        self.apply_to(&mut plan);
+        self.plan = Some(plan);
+    }
 
+    /// Applies the category selection to `plan` and recomputes what it would free.
+    ///
+    /// The screen owns the plan while it draws, so every handler that runs mid-frame takes it
+    /// as an argument rather than reaching for `self.plan`, which is `None` until the frame
+    /// puts it back.
+    fn apply_to(&mut self, plan: &mut Plan) {
         for category in Category::ALL {
             plan.select(*category, self.selected.contains(category));
         }
+        self.recompute(plan);
+    }
 
+    /// Recomputes the totals and the open browse list from `plan`.
+    fn recompute(&mut self, plan: &Plan) {
         self.selected_totals = plan.selected_totals();
         self.category_totals = plan.totals_by_category();
         self.sets = self.browsing.map(|c| plan.sets_in(c)).unwrap_or_default();
     }
 
     /// Opens or closes the beatmap-set list under one category.
-    fn browse(&mut self, category: Option<Category>) {
+    fn browse(&mut self, plan: &Plan, category: Option<Category>) {
         self.browsing = if self.browsing == category {
             None
         } else {
             category
         };
         self.search.clear();
-        self.apply_selection();
+        self.recompute(plan);
     }
 
     /// Takes one beatmap set out of the clean, or puts it back.
-    fn exclude(&mut self, set: cleaner_core::SetId, excluded: bool) {
-        if let Some(plan) = self.plan.as_mut() {
-            plan.exclude(set, excluded);
-        }
-        self.apply_selection();
+    fn exclude(&mut self, plan: &mut Plan, set: cleaner_core::SetId, excluded: bool) {
+        plan.exclude(set, excluded);
+        self.recompute(plan);
     }
 
     /// Applies the keyboard shortcuts, whatever has focus.
@@ -356,7 +366,10 @@ impl App {
         if escape {
             // Innermost first: a question, then the browse list.
             if self.modal.take().is_none() && self.browsing.is_some() {
-                self.browse(None);
+                // Outside the frame that holds the plan, so the ordinary path applies.
+                self.browsing = None;
+                self.search.clear();
+                self.apply_selection();
             }
         }
 
@@ -449,6 +462,17 @@ impl eframe::App for App {
                     ui.label(egui::RichText::new(&self.status).color(theme::MUTED));
                 });
             });
+
+        if self.screen == Screen::Clean && self.plan.is_some() {
+            egui::Panel::bottom("actions")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::BASE)
+                        .stroke(egui::Stroke::new(1.0, theme::LINE))
+                        .inner_margin(egui::Margin::symmetric(18, 10)),
+                )
+                .show(root, |ui| self.action_bar(ui));
+        }
 
         egui::CentralPanel::default()
             .frame(
@@ -566,27 +590,31 @@ impl App {
             ui.add_space(14.0);
         }
 
-        let Some(plan) = self.plan.take() else {
-            ui.label(theme::figure("Nothing scanned yet"));
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new("Scanning reads your library. It changes nothing.")
-                    .color(theme::MUTED),
-            );
-            ui.add_space(16.0);
-            ui.add_enabled_ui(self.idle() && self.library.is_some(), |ui| {
-                if ui
-                    .button(icons::labelled(icons::SCAN, "Scan library"))
-                    .clicked()
-                {
-                    self.scan();
-                }
+        let Some(mut plan) = self.plan.take() else {
+            // Nothing else is on the screen, so the one thing to do belongs in the middle of it
+            // rather than in the corner.
+            ui.add_space(ui.available_height() / 4.0);
+            ui.vertical_centered(|ui| {
+                ui.label(theme::figure("Nothing scanned yet"));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Scanning reads your library. It changes nothing.")
+                        .color(theme::MUTED),
+                );
+                ui.add_space(16.0);
+                ui.add_enabled_ui(self.idle() && self.library.is_some(), |ui| {
+                    if ui
+                        .button(icons::labelled(icons::SCAN, "Scan library"))
+                        .clicked()
+                    {
+                        self.scan();
+                    }
+                });
             });
             return;
         };
 
         let removing = self.selected_totals.bytes;
-        let previous_selection = self.selected.clone();
 
         ui.horizontal(|ui| {
             ui.label(theme::figure(human_bytes(plan.bytes_total)));
@@ -620,15 +648,22 @@ impl App {
         composition_bar(ui, plan.bytes_total, removing);
         ui.add_space(18.0);
 
-        self.category_table(ui, &plan);
+        self.category_table(ui, &mut plan);
 
-        ui.add_space(16.0);
-        ui.separator();
-        ui.add_space(10.0);
+        self.plan = Some(plan);
+    }
+
+    /// The one destructive action, on a bar of its own above the status line.
+    ///
+    /// It sits outside the scrolling table because a library with seven categories and an open
+    /// browse list is taller than the window, and the button that starts a clean should never
+    /// be somewhere the user has to go looking for it.
+    fn action_bar(&mut self, ui: &mut egui::Ui) {
+        let removing = self.selected_totals.bytes;
+        let references = self.selected_totals.references;
+        let enabled = self.idle() && references > 0;
 
         ui.horizontal(|ui| {
-            let references = self.selected_totals.references;
-            let enabled = self.idle() && references > 0;
             ui.add_enabled_ui(enabled, |ui| {
                 let label = if references == 0 {
                     "Nothing selected".to_owned()
@@ -655,26 +690,25 @@ impl App {
                     .color(theme::MUTED),
             );
         });
-        self.plan = Some(plan);
-        if self.selected != previous_selection {
-            self.apply_selection();
-        }
     }
 
     /// One row per category: tick, name, what it means, how much space, how many files.
-    fn category_table(&mut self, ui: &mut egui::Ui, plan: &Plan) {
+    fn category_table(&mut self, ui: &mut egui::Ui, plan: &mut Plan) {
         column_headings(ui);
-        for (index, group) in plan.groups.iter().enumerate() {
+        for index in 0..plan.groups.len() {
+            // Read what the row needs before the row borrows the plan to change it.
+            let category = plan.groups[index].category;
+            let found = !plan.groups[index].is_empty();
             let totals = self
                 .category_totals
                 .iter()
-                .find(|(category, _)| *category == group.category)
+                .find(|(other, _)| *other == category)
                 .map_or_else(Totals::default, |(_, totals)| *totals);
 
-            self.category_row(ui, group, totals, index % 2 == 1);
+            self.category_row(ui, plan, category, found, totals, index % 2 == 1);
 
-            if self.browsing == Some(group.category) {
-                self.browse_list(ui, group.category);
+            if self.browsing == Some(category) {
+                self.browse_list(ui, plan, category);
             }
         }
 
@@ -697,7 +731,9 @@ impl App {
     fn category_row(
         &mut self,
         ui: &mut egui::Ui,
-        group: &cleaner_core::Group,
+        plan: &mut Plan,
+        category: Category,
+        found: bool,
         totals: Totals,
         striped: bool,
     ) {
@@ -705,8 +741,7 @@ impl App {
         // text rather than over it.
         let band = ui.painter().add(egui::Shape::Noop);
 
-        let found = !group.is_empty();
-        let on = self.selected.contains(&group.category);
+        let on = self.selected.contains(&category);
         let tint = if !found {
             theme::LINE
         } else if on {
@@ -724,7 +759,7 @@ impl App {
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     ui.set_width(text_width);
-                    self.category_label(ui, group, found, on);
+                    self.category_label(ui, plan, category, found, on);
                 },
             );
 
@@ -741,24 +776,22 @@ impl App {
     fn category_label(
         &mut self,
         ui: &mut egui::Ui,
-        group: &cleaner_core::Group,
+        plan: &mut Plan,
+        category: Category,
         found: bool,
         on: bool,
     ) {
-        let category = group.category;
-
         ui.horizontal(|ui| {
             ui.add_enabled_ui(found && self.idle(), |ui| {
                 let mut ticked = on;
-                let label = egui::RichText::new(icons::labelled(
-                    icons::category(category),
-                    category.label(),
-                ))
-                .color(if on && found {
-                    theme::REMOVE
-                } else {
-                    theme::TEXT
-                });
+                let label =
+                    theme::row(icons::labelled(icons::category(category), category.label())).color(
+                        if on && found {
+                            theme::REMOVE
+                        } else {
+                            theme::TEXT
+                        },
+                    );
 
                 if ui.checkbox(&mut ticked, label).changed() {
                     if ticked {
@@ -766,7 +799,7 @@ impl App {
                     } else {
                         self.selected.remove(&category);
                     }
-                    self.apply_selection();
+                    self.apply_to(plan);
                 }
             });
 
@@ -775,16 +808,20 @@ impl App {
                 return;
             }
 
-            ui.add_enabled_ui(self.idle(), |ui| {
-                let open = self.browsing == Some(category);
-                let label = if open { "Hide sets" } else { "Browse sets" };
-                if ui
-                    .small_button(label)
-                    .on_hover_text("Pick which beatmap sets this category cleans")
-                    .clicked()
-                {
-                    self.browse(Some(category));
-                }
+            // Right-aligned, so the buttons line up down the table instead of following each
+            // category name to wherever it happens to end.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_enabled_ui(self.idle(), |ui| {
+                    let open = self.browsing == Some(category);
+                    let label = if open { "Hide sets" } else { "Browse sets" };
+                    if ui
+                        .small_button(label)
+                        .on_hover_text("Pick which beatmap sets this category cleans")
+                        .clicked()
+                    {
+                        self.browse(plan, Some(category));
+                    }
+                });
             });
         });
 
@@ -800,7 +837,7 @@ impl App {
     /// A category can hold well over a hundred thousand references across tens of thousands of
     /// sets, so the list is searchable and shows the largest [`BROWSE_LIMIT`] matches. Sorting
     /// by size puts the sets worth deciding about at the top, where a limit cannot hide them.
-    fn browse_list(&mut self, ui: &mut egui::Ui, category: Category) {
+    fn browse_list(&mut self, ui: &mut egui::Ui, plan: &mut Plan, category: Category) {
         egui::Frame::new()
             .fill(theme::SURFACE)
             .corner_radius(egui::CornerRadius::same(4))
@@ -829,10 +866,10 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_enabled_ui(self.idle() && !matches.is_empty(), |ui| {
                             if ui.small_button("Keep all shown").clicked() {
-                                self.set_all(&matches, true);
+                                self.set_all(plan, &matches, true);
                             }
                             if ui.small_button("Clean all shown").clicked() {
-                                self.set_all(&matches, false);
+                                self.set_all(plan, &matches, false);
                             }
                         });
                     });
@@ -867,7 +904,7 @@ impl App {
                     .auto_shrink([false, true])
                     .show_rows(ui, row_height, shown, |ui, range| {
                         for position in range {
-                            self.browse_row(ui, matches[position], position % 2 == 1);
+                            self.browse_row(ui, plan, matches[position], position % 2 == 1);
                         }
                     });
 
@@ -888,7 +925,7 @@ impl App {
     }
 
     /// One beatmap set: whether it is being cleaned, its name, and what it holds.
-    fn browse_row(&mut self, ui: &mut egui::Ui, index: usize, striped: bool) {
+    fn browse_row(&mut self, ui: &mut egui::Ui, plan: &mut Plan, index: usize, striped: bool) {
         let Some(entry) = self.sets.get(index).cloned() else {
             return;
         };
@@ -927,7 +964,7 @@ impl App {
                             ))
                             .changed()
                         {
-                            self.exclude(entry.set, !cleaning);
+                            self.exclude(plan, entry.set, !cleaning);
                         }
                     });
                 });
@@ -940,23 +977,55 @@ impl App {
     }
 
     /// Includes or excludes every set the search currently shows.
-    fn set_all(&mut self, matches: &[usize], keep: bool) {
+    fn set_all(&mut self, plan: &mut Plan, matches: &[usize], keep: bool) {
         let sets: Vec<_> = matches
             .iter()
             .filter_map(|index| self.sets.get(*index))
             .map(|entry| entry.set)
             .collect();
 
-        if let Some(plan) = self.plan.as_mut() {
-            for set in sets {
-                plan.exclude(set, keep);
-            }
+        for set in sets {
+            plan.exclude(set, keep);
         }
-        self.apply_selection();
+        self.recompute(plan);
     }
 
     /// Snapshots, newest first, with restore and delete.
     fn snapshots_screen(&mut self, ui: &mut egui::Ui) {
+        // Two things live here and neither belongs under the other: snapshots hold the files a
+        // clean removed, the database section holds the file itself.
+        let gap = 28.0;
+        let total = ui.available_width();
+        let right = (total * 0.36).clamp(300.0, 460.0);
+        let left = (total - right - gap).max(320.0);
+
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(left, 0.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.set_width(left);
+                    self.snapshot_list(ui);
+                },
+            );
+
+            ui.add_space(gap / 2.0);
+            ui.separator();
+            ui.add_space(gap / 2.0);
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(right, 0.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.set_width(right);
+                    self.database_section(ui);
+                },
+            );
+        });
+    }
+
+    /// The snapshots themselves, newest first.
+    fn snapshot_list(&mut self, ui: &mut egui::Ui) {
         ui.label(theme::figure("Snapshots"));
         ui.add_space(6.0);
         ui.label(
@@ -985,11 +1054,6 @@ impl App {
                 self.snapshot_row(ui, entry, position == 0, position % 2 == 1);
             }
         }
-
-        ui.add_space(22.0);
-        ui.separator();
-        ui.add_space(14.0);
-        self.database_section(ui);
     }
 
     /// One snapshot: when it was taken, what it holds, and the two things to do with it.
@@ -1049,7 +1113,7 @@ impl App {
     /// to the button is the only way that stops looking like the tool did nothing.
     fn database_section(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Database").heading());
+            ui.label(theme::figure("Database"));
             ui.add_space(6.0);
             if self.database_bytes > 0 {
                 ui.label(theme::number(human_bytes(self.database_bytes)).color(theme::MUTED));
@@ -1061,6 +1125,14 @@ impl App {
             egui::RichText::new(
                 "client.realm keeps the space its removed rows used until it is rewritten. \
                  Close osu!lazer first.",
+            )
+            .color(theme::MUTED),
+        );
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new(
+                "Compacting copies client.realm first and keeps the copy until you delete it, so \
+                 a rewrite osu!lazer will not open costs nothing but the time to put it back.",
             )
             .small()
             .color(theme::MUTED),

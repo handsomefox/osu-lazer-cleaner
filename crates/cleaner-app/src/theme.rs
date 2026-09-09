@@ -96,6 +96,11 @@ fn style(style: &mut egui::Style) {
             egui::TextStyle::Heading,
             egui::FontId::new(16.0, egui::FontFamily::Proportional),
         ),
+        // The category names, which are the thing being chosen between.
+        (
+            egui::TextStyle::Name("Row".into()),
+            egui::FontId::new(15.5, egui::FontFamily::Proportional),
+        ),
         (
             egui::TextStyle::Body,
             egui::FontId::new(13.5, egui::FontFamily::Proportional),
@@ -115,6 +120,10 @@ fn style(style: &mut egui::Style) {
         ),
     ]
     .into();
+
+    // Labels are chrome, not text to copy. Without this, dragging across the library path in
+    // the header leaves it highlighted in the selection colour, which reads as an error.
+    style.interaction.selectable_labels = false;
 
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.button_padding = egui::vec2(14.0, 7.0);
@@ -163,6 +172,11 @@ fn style(style: &mut egui::Style) {
     visuals.widgets.active.weak_bg_fill = REMOVE_DIM;
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, REMOVE);
     visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, TEXT);
+}
+
+/// Text in the row size, for a category name.
+pub(crate) fn row(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text).text_style(egui::TextStyle::Name("Row".into()))
 }
 
 /// Text in the figure size, for the library total.
