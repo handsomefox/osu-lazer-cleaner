@@ -120,6 +120,12 @@ reclaims the space left by removed database rows. It reports when another open h
 the rewrite. A copy of `client.realm` is taken first and kept until you delete it, so a rewrite
 osu!lazer will not open costs nothing but the time to rename the copy back.
 
+## Diagnostics
+
+The window writes a dated log to `%LOCALAPPDATA%\osu-lazer-cleaner\logs\` on Windows and to
+`~/.local/share/osu-lazer-cleaner/logs/` elsewhere, keeping the last seven days. **About** has a
+button that opens the folder. Attach the newest file to an issue.
+
 ## Command line
 
 One executable holds both interfaces. Run it with no arguments and the window opens; give it a
@@ -152,7 +158,8 @@ The workspace is layered so that everything portable stays testable on Linux:
   realm-core is vendored as a submodule and built from source. Clone with
   `git clone --recurse-submodules`.
 - `cleaner-core` holds storage discovery, `.osu` and `.osb` parsing, scanning, and snapshots.
-  It has no platform or interface dependencies.
+  It depends on no interface, and touches a platform only in `storage`, `running`, and
+  `folders`, each behind a `cfg` with a portable fallback.
 - `cleaner-app` holds both interfaces and builds the one executable. It is the only crate that
   depends on egui. `assets/` carries the icon, Inter, and Phosphor; `app.rc` and `app.manifest`
   put the icon, the version, and the DPI settings into the Windows executable.

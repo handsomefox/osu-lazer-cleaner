@@ -20,6 +20,7 @@ mod durability;
 mod end_to_end;
 pub mod error;
 pub mod execute;
+pub mod folders;
 pub mod format;
 mod operation;
 pub mod osu;

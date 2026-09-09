@@ -156,8 +156,8 @@ fn default_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
     if cfg!(windows) {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            roots.push(PathBuf::from(appdata).join("osu"));
+        if let Some(appdata) = crate::folders::roaming_app_data() {
+            roots.push(appdata.join("osu"));
         }
     } else {
         if let Some(home) = std::env::var_os("HOME") {

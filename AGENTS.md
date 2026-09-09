@@ -11,9 +11,9 @@ The workspace is layered so that everything portable stays testable on Linux.
   `crates/cleaner-realm/vendor/`, pinned to the tag matching the Realm .NET version osu!lazer
   uses. `build.rs` compiles it and generates the bindings.
 - `cleaner-core` holds every rule: storage discovery, `.osu` and `.osb` parsing, category
-  assignment, scanning, and snapshots. It depends on no interface. The two places it touches a
-  platform are `storage` and `running`, both behind `cfg` with a portable fallback, so the rest
-  stays testable anywhere.
+  assignment, scanning, and snapshots. It depends on no interface. The three places it touches a
+  platform are `storage`, `running`, and `folders`, each behind `cfg` with a portable fallback,
+  so the rest stays testable anywhere.
 - `cleaner-app` holds both interfaces and builds the one executable. It is the only crate
   allowed to depend on egui. `main` opens the window when there are no arguments and hands over
   to `cli` when there are. `assets/` carries the icon and the vendored fonts, and `build.rs`

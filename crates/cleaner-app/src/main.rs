@@ -24,7 +24,14 @@ fn main() -> ExitCode {
     }
 
     console::release();
-    diagnostics::install();
+    let log_path = diagnostics::install();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "osu-lazer-cleaner starting"
+    );
+    if let Some(path) = &log_path {
+        tracing::info!("logging to {}", path.display());
+    }
     gui()
 }
 
