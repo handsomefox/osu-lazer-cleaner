@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-cleaner-core = { version = "=1.2.1", path = "../cleaner-core" }
+cleaner-core = { version = "=1.3.0", path = "../cleaner-core" }
 crossbeam-channel.workspace = true
 jiff.workspace = true
 eframe.workspace = true
@@ -29,7 +29,7 @@ tracing-subscriber.workspace = true
 embed-resource = "=3.0.11"
 
 [dev-dependencies]
-cleaner-realm = { version = "=1.2.1", path = "../cleaner-realm", features = ["test-support"] }
+cleaner-realm = { version = "=1.3.0", path = "../cleaner-realm", features = ["test-support"] }
 tempfile.workspace = true
 
 # Referenced by build.rs; cargo-machete does not inspect build-script source.

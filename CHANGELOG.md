@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.0
+
+- Fix the totals blanking to zero when the beatmap-set list opens, and the tick that holds a set
+  back doing nothing at all. The screen owns the plan while it draws, and the handlers that ran
+  during the frame were reaching for a plan that was not there.
+- Index each beatmap set's filenames once instead of folding the whole list on every lookup.
+  A custom sample index re-ran that scan for every timing point and every hit object naming one,
+  which on a set with a thousand files was hundreds of millions of comparisons. The scan log now
+  reports the files opened and the bytes read.
+- Move the button that starts a clean to a bar of its own above the status line, so a long
+  category list cannot scroll it out of reach.
+- Give the categories a larger name, and line their beatmap-set buttons up down the table.
+- Centre the empty screen on the one thing there is to do.
+- Split the snapshots screen: snapshots on the left, the database and its compaction on the
+  right, which now says up front that compacting keeps a copy of `client.realm`.
+- Stop labels rendering as selected text when a drag passes over them.
+
 ## 1.2.1
 
 - Log every operation with its outcome, duration, and throughput: library discovery, scans with
