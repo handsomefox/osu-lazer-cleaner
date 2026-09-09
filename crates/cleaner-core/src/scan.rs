@@ -78,7 +78,7 @@ pub fn build_plan(
 
     let classify_started = std::time::Instant::now();
     let total_sets = sets.len();
-    let (mut candidates, sets_parsed) =
+    let (mut candidates, read) =
         classify_sets(library, &sets, &sizes, &usage_counts, &mut progress);
     let classify_ms = elapsed_ms(classify_started);
 
@@ -91,13 +91,15 @@ pub fn build_plan(
         measure_ms,
         database_ms,
         classify_ms,
-        sets_parsed,
+        sets_parsed: read.sets,
     };
 
     let total_ms = elapsed_ms(started);
     tracing::info!(
         sets = total_sets,
-        parsed = sets_parsed,
+        parsed = read.sets,
+        files_read = read.files,
+        bytes_read = read.bytes,
         blobs = plan.blobs_total,
         bytes = plan.bytes_total,
         candidates = plan
@@ -132,8 +134,10 @@ fn classify_sets(
     sizes: &HashMap<String, u64>,
     usage_counts: &HashMap<String, u32>,
     progress: &mut impl FnMut(Progress),
-) -> (Vec<Candidate>, usize) {
+) -> (Vec<Candidate>, Read) {
     let parsed = std::sync::atomic::AtomicUsize::new(0);
+    let files_read = std::sync::atomic::AtomicUsize::new(0);
+    let bytes_read = std::sync::atomic::AtomicU64::new(0);
     let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let done = std::sync::atomic::AtomicUsize::new(0);
@@ -152,11 +156,12 @@ fn classify_sets(
                     };
 
                     for set in *chunk {
-                        let (candidates, was_parsed) =
-                            classify_set(library, set, sizes, usage_counts);
+                        let (candidates, read) = classify_set(library, set, sizes, usage_counts);
                         local.extend(candidates);
-                        if was_parsed {
+                        if read.files > 0 {
                             parsed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            files_read.fetch_add(read.files, std::sync::atomic::Ordering::Relaxed);
+                            bytes_read.fetch_add(read.bytes, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     done.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
@@ -188,8 +193,26 @@ fn classify_sets(
 
     (
         candidates,
-        parsed.load(std::sync::atomic::Ordering::Relaxed),
+        Read {
+            sets: parsed.load(std::sync::atomic::Ordering::Relaxed),
+            files: files_read.load(std::sync::atomic::Ordering::Relaxed),
+            bytes: bytes_read.load(std::sync::atomic::Ordering::Relaxed),
+        },
     )
+}
+
+/// What the classification had to read from disk.
+///
+/// Opening difficulty files is nearly all of a scan's time on a large library, so this is what
+/// the log reports when someone asks why a scan took as long as it did.
+#[derive(Debug, Clone, Copy, Default)]
+struct Read {
+    /// Beatmap sets whose files were opened.
+    sets: usize,
+    /// Difficulty and storyboard files opened.
+    files: usize,
+    /// Bytes read from them.
+    bytes: u64,
 }
 
 /// Classifies one beatmap set's files.
@@ -200,7 +223,7 @@ fn classify_set(
     set: &cleaner_realm::BeatmapSet,
     sizes: &HashMap<String, u64>,
     usage_counts: &HashMap<String, u32>,
-) -> (Vec<Candidate>, bool) {
+) -> (Vec<Candidate>, Read) {
     // Start from what the database already knows, which costs nothing to read.
     let mut references = osu::References {
         audio: set.audio.iter().cloned().collect(),
@@ -212,10 +235,13 @@ fn classify_set(
     // sets are just difficulties, one audio track, and one background, and reading those
     // files was over 99% of a scan's time on a large library. Building the name index costs
     // one allocation per file, so it waits until something is going to use it.
-    let parsed = needs_parsing(set, &ReferenceIndex::from(&references));
-    if parsed {
-        let owned: BTreeSet<String> = set.files.iter().map(|f| f.filename.clone()).collect();
-        references.absorb(read_references(library, set, &owned));
+    let index = ReferenceIndex::from(&references);
+    let mut read = Read::default();
+    if needs_parsing(set, &index) {
+        let (found, counts) = read_references(library, set);
+        references.absorb(found);
+        read = counts;
+        read.sets = 1;
     }
 
     // Files a beatmap cannot play without. These are never candidates, whatever category else
@@ -251,7 +277,7 @@ fn classify_set(
         })
         .collect();
 
-    (candidates, parsed)
+    (candidates, read)
 }
 
 /// Reports whether a set owns anything that only its difficulty files can explain.
@@ -337,13 +363,10 @@ fn categorise(filename: &str, references: &ReferenceIndex) -> Option<Category> {
 /// library took, against 0.4 seconds walking its 454,820 files. Almost all of those bytes are
 /// `[HitObjects]`, and for most sets that section can name nothing the rest of the file does
 /// not, so `sample_depth` decides whether to read it at all.
-fn read_references(
-    library: &Library,
-    set: &cleaner_realm::BeatmapSet,
-    owned: &BTreeSet<String>,
-) -> osu::References {
+fn read_references(library: &Library, set: &cleaner_realm::BeatmapSet) -> (osu::References, Read) {
     let depth = sample_depth(set);
 
+    let index = osu::FileIndex::new(set.files.iter().map(|file| file.filename.as_str()));
     let sources: Vec<(String, SourceKind)> = set
         .files
         .iter()
@@ -365,7 +388,15 @@ fn read_references(
         })
         .collect();
 
-    osu::parse_all(sources.iter().map(|(t, k)| (t.as_str(), *k)), owned)
+    let read = Read {
+        sets: 0,
+        files: sources.len(),
+        bytes: sources.iter().map(|(text, _)| text.len() as u64).sum(),
+    };
+    (
+        osu::parse_all(sources.iter().map(|(t, k)| (t.as_str(), *k)), &index),
+        read,
+    )
 }
 
 /// How much of a difficulty has to be read.
@@ -885,8 +916,8 @@ mod tests {
         )
         .unwrap();
 
-        let owned = set.files.iter().map(|f| f.filename.clone()).collect();
-        let references = read_references(&library, &set, &owned);
+        let (references, read) = read_references(&library, &set);
+        assert!(read.files > 0, "the difficulty file was opened");
         assert!(
             references.storyboard.contains("bg.jpg"),
             "everything before the hit objects is still read"
@@ -1012,8 +1043,8 @@ mod tests {
         )
         .unwrap();
 
-        let (candidates, parsed) = classify_set(&library, &set, &HashMap::new(), &HashMap::new());
-        assert!(parsed);
+        let (candidates, read) = classify_set(&library, &set, &HashMap::new(), &HashMap::new());
+        assert_eq!(read.sets, 1, "the set's files had to be opened");
         let roles: Vec<_> = candidates
             .iter()
             .map(|c| (c.filename.as_str(), c.category))

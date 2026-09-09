@@ -5,6 +5,113 @@
 
 use std::collections::BTreeSet;
 
+/// The filenames one beatmap set owns, indexed the way lazer looks them up.
+///
+/// Built once per set. Before this existed, every lookup walked the whole file list and folded
+/// each name as it went, and `hitsounds` did that 36 times for every timing point and every hit
+/// object naming a custom sample index. A set with a thousand files and a difficulty with
+/// thousands of hit objects turned that into hundreds of millions of comparisons.
+pub struct FileIndex {
+    /// Owned names, spelled as the set spells them, in the order a sorted set gives.
+    ///
+    /// Ordered rather than hashed because `read_animation` walks the whole list looking for
+    /// numbered frames, and a stable order keeps a scan's output stable.
+    exact: BTreeSet<String>,
+    /// Folded key to the owned spelling.
+    folded: std::collections::HashMap<String, String>,
+    /// Hitsound names already synthesised for a custom sample index.
+    ///
+    /// The answer depends only on the index and the files the set owns, so it is worth keeping
+    /// for the rest of the set. One set is parsed by one thread, so a `RefCell` is enough.
+    hitsounds: std::cell::RefCell<std::collections::HashMap<u32, Vec<String>>>,
+}
+
+impl FileIndex {
+    /// Indexes the names a set owns.
+    #[must_use]
+    pub fn new<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut exact = BTreeSet::new();
+        let mut folded = std::collections::HashMap::new();
+        for name in names {
+            folded
+                .entry(filename_key(name))
+                .or_insert_with(|| name.to_owned());
+            exact.insert(name.to_owned());
+        }
+        Self {
+            exact,
+            folded,
+            hitsounds: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Finds a filename in the set, comparing case-insensitively as lazer's lookups do.
+    ///
+    /// Returns the name as the set spells it, so callers can match it against realm entries.
+    fn lookup(&self, name: &str) -> Option<String> {
+        if self.exact.contains(name) {
+            return Some(name.to_owned());
+        }
+        self.folded.get(&filename_key(name)).cloned()
+    }
+
+    /// Every name the set owns.
+    fn names(&self) -> impl Iterator<Item = &String> {
+        self.exact.iter()
+    }
+
+    /// How many names the set owns.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.exact.len()
+    }
+
+    /// Whether the set owns no files at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty()
+    }
+
+    /// The hitsound filenames a custom sample index can refer to.
+    ///
+    /// `HitSampleInfo.LookupNames` resolves a sample to `{bank}-{name}{suffix}`, where the
+    /// suffix is the custom index when it is not zero. The resulting filename never appears in
+    /// the `.osu` text, so the candidates have to be generated and matched against the files
+    /// the set owns.
+    fn hitsounds(&self, index: u32) -> Vec<String> {
+        if let Some(names) = self.hitsounds.borrow().get(&index) {
+            return names.clone();
+        }
+
+        let suffix = if index <= 1 {
+            String::new()
+        } else {
+            index.to_string()
+        };
+
+        let mut names = Vec::new();
+        for bank in SAMPLE_BANKS {
+            for sound in HIT_SOUNDS {
+                for extension in AUDIO_EXTENSIONS {
+                    if let Some(owned) = self.lookup(&format!("{bank}-{sound}{suffix}{extension}"))
+                    {
+                        names.push(owned);
+                    }
+                }
+            }
+        }
+
+        self.hitsounds.borrow_mut().insert(index, names.clone());
+        names
+    }
+}
+
+impl From<&BTreeSet<String>> for FileIndex {
+    fn from(names: &BTreeSet<String>) -> Self {
+        Self::new(names.iter().map(String::as_str))
+    }
+}
+
 /// Key for a filename lookup, independent of case and path separators.
 ///
 /// `RealmBackedResourceStore` standardises paths and lowercases both lookup names and owned
@@ -96,11 +203,11 @@ pub enum SourceKind {
 
 /// Extracts every file a difficulty or storyboard refers to.
 ///
-/// `known_files` is the set of filenames the beatmap set actually owns. It resolves the two
+/// `known` is the set of filenames the beatmap set actually owns. It resolves the two
 /// cases where a reference does not name a file directly: storyboard references without an
 /// extension, and hitsounds implied by a sample bank index.
 #[must_use]
-pub fn parse(text: &str, kind: SourceKind, known_files: &BTreeSet<String>) -> References {
+pub fn parse(text: &str, kind: SourceKind, known: &FileIndex) -> References {
     let mut references = References::default();
     let mut section = String::new();
 
@@ -117,16 +224,16 @@ pub fn parse(text: &str, kind: SourceKind, known_files: &BTreeSet<String>) -> Re
 
         match section.as_str() {
             "general" => read_general(trimmed, &mut references),
-            "events" => read_event(line, known_files, &mut references),
+            "events" => read_event(line, known, &mut references),
             "hitobjects" if kind == SourceKind::Difficulty => {
-                read_hit_object(trimmed, known_files, &mut references);
+                read_hit_object(trimmed, known, &mut references);
             }
             "timingpoints" if kind == SourceKind::Difficulty => {
-                read_timing_point(trimmed, known_files, &mut references);
+                read_timing_point(trimmed, known, &mut references);
             }
             // A `.osb` has no section header before its events, so treat bare lines as events.
             "" if kind == SourceKind::Storyboard => {
-                read_event(line, known_files, &mut references);
+                read_event(line, known, &mut references);
             }
             _ => {}
         }
@@ -139,11 +246,11 @@ pub fn parse(text: &str, kind: SourceKind, known_files: &BTreeSet<String>) -> Re
 #[must_use]
 pub fn parse_all<'a>(
     sources: impl IntoIterator<Item = (&'a str, SourceKind)>,
-    known_files: &BTreeSet<String>,
+    known: &FileIndex,
 ) -> References {
     let mut references = References::default();
     for (text, kind) in sources {
-        references.absorb(parse(text, kind, known_files));
+        references.absorb(parse(text, kind, known));
     }
     references
 }
@@ -162,7 +269,7 @@ fn read_general(line: &str, references: &mut References) {
 ///
 /// Event type codes come from `LegacyEventType`: `Background = 0`, `Video = 1`, `Sprite = 4`,
 /// `Sample = 5`, `Animation = 6`. The filename sits at a different field for each.
-fn read_event(line: &str, known_files: &BTreeSet<String>, references: &mut References) {
+fn read_event(line: &str, known: &FileIndex, references: &mut References) {
     // Command lines inside a storyboard are indented with spaces or underscores and never
     // name a file.
     if line.starts_with([' ', '_']) {
@@ -189,7 +296,7 @@ fn read_event(line: &str, known_files: &BTreeSet<String>, references: &mut Refer
             if let Some(name) = field(&fields, 3) {
                 references
                     .storyboard
-                    .extend(resolve_extension(&name, known_files));
+                    .extend(resolve_extension(&name, known));
             }
         }
         "5" | "Sample" => {
@@ -197,7 +304,7 @@ fn read_event(line: &str, known_files: &BTreeSet<String>, references: &mut Refer
                 references.storyboard.insert(name);
             }
         }
-        "6" | "Animation" => read_animation(&fields, known_files, references),
+        "6" | "Animation" => read_animation(&fields, known, references),
         _ => {}
     }
 }
@@ -209,7 +316,7 @@ fn read_event(line: &str, known_files: &BTreeSet<String>, references: &mut Refer
 /// `Animation.Path.Replace(".", $"{i}.")`, so `sb/foo.png` with three frames means
 /// `sb/foo0.png`, `sb/foo1.png`, and `sb/foo2.png`. Missing this is the difference between
 /// keeping an animation and deleting every frame of it.
-fn read_animation(fields: &[&str], known_files: &BTreeSet<String>, references: &mut References) {
+fn read_animation(fields: &[&str], known: &FileIndex, references: &mut References) {
     let Some(path) = field(fields, 3) else {
         return;
     };
@@ -221,14 +328,14 @@ fn read_animation(fields: &[&str], known_files: &BTreeSet<String>, references: &
     // Keep the literal path too: some storyboards ship it alongside the numbered frames.
     references
         .storyboard
-        .extend(resolve_extension(&path, known_files));
+        .extend(resolve_extension(&path, known));
 
     let Some((prefix, _)) = path.split_once('.') else {
         return;
     };
     // Work is bounded by the files the set owns, even if an untrusted storyboard claims
     // billions of frames. lazer inserts the frame number before every dot in the path.
-    for owned in known_files {
+    for owned in known.names() {
         let Some(head) = owned.get(..prefix.len()) else {
             continue;
         };
@@ -256,7 +363,7 @@ fn read_animation(fields: &[&str], known_files: &BTreeSet<String>, references: &
 /// The final comma-separated field is `normalSet:additionSet:index:volume:filename`, per
 /// `ConvertHitObjectParser.readCustomSampleBanks`. An explicit filename in the fifth position
 /// names a file outright. Otherwise the sample set and index imply one.
-fn read_hit_object(line: &str, known_files: &BTreeSet<String>, references: &mut References) {
+fn read_hit_object(line: &str, known: &FileIndex, references: &mut References) {
     let Some(sample) = line.rsplit(',').next() else {
         return;
     };
@@ -276,9 +383,7 @@ fn read_hit_object(line: &str, known_files: &BTreeSet<String>, references: &mut 
 
     let index = parts.get(2).and_then(|i| i.trim().parse::<u32>().ok());
     if let Some(index) = index {
-        references
-            .hitsounds
-            .extend(synthesise_hitsounds(index, known_files));
+        references.hitsounds.extend(known.hitsounds(index));
     }
 }
 
@@ -287,41 +392,13 @@ fn read_hit_object(line: &str, known_files: &BTreeSet<String>, references: &mut 
 /// Fields are `time,beatLength,meter,sampleSet,sampleIndex,volume,uninherited,effects`. The
 /// custom sample index at position 4 implies hitsound filenames that appear nowhere in the
 /// file's text.
-fn read_timing_point(line: &str, known_files: &BTreeSet<String>, references: &mut References) {
+fn read_timing_point(line: &str, known: &FileIndex, references: &mut References) {
     let fields: Vec<&str> = line.split(',').collect();
     let Some(index) = fields.get(4).and_then(|i| i.trim().parse::<u32>().ok()) else {
         return;
     };
 
-    references
-        .hitsounds
-        .extend(synthesise_hitsounds(index, known_files));
-}
-
-/// Builds the hitsound filenames a custom sample index can refer to.
-///
-/// `HitSampleInfo.LookupNames` resolves a sample to `{bank}-{name}{suffix}`, where the suffix
-/// is the custom index when it is not zero. The resulting filename never appears in the `.osu`
-/// text, so the candidates have to be generated and matched against the files the set owns.
-fn synthesise_hitsounds(index: u32, known_files: &BTreeSet<String>) -> Vec<String> {
-    let suffix = if index <= 1 {
-        String::new()
-    } else {
-        index.to_string()
-    };
-
-    let mut names = Vec::new();
-    for bank in SAMPLE_BANKS {
-        for sound in HIT_SOUNDS {
-            for extension in AUDIO_EXTENSIONS {
-                let candidate = format!("{bank}-{sound}{suffix}{extension}");
-                if let Some(owned) = lookup(&candidate, known_files) {
-                    names.push(owned);
-                }
-            }
-        }
-    }
-    names
+    references.hitsounds.extend(known.hitsounds(index));
 }
 
 /// Resolves a storyboard reference that may have no extension.
@@ -329,8 +406,8 @@ fn synthesise_hitsounds(index: u32, known_files: &BTreeSet<String>) -> Vec<Strin
 /// `Storyboard.GetStoragePathFromStoryboardPath` uses the path as-is when it has an extension,
 /// and otherwise tries each image extension in turn. A file can therefore be live without its
 /// name appearing verbatim anywhere in the storyboard.
-fn resolve_extension(path: &str, known_files: &BTreeSet<String>) -> Vec<String> {
-    if let Some(owned) = lookup(path, known_files) {
+fn resolve_extension(path: &str, known: &FileIndex) -> Vec<String> {
+    if let Some(owned) = known.lookup(path) {
         return vec![owned];
     }
 
@@ -341,24 +418,9 @@ fn resolve_extension(path: &str, known_files: &BTreeSet<String>) -> Vec<String> 
 
     IMAGE_EXTENSIONS
         .iter()
-        .filter_map(|extension| lookup(&format!("{path}{extension}"), known_files))
+        .filter_map(|extension| known.lookup(&format!("{path}{extension}")))
         .take(1)
         .collect()
-}
-
-/// Finds a filename in the set, comparing case-insensitively as lazer's lookups do.
-///
-/// Returns the name as the set spells it, so callers can match it against realm entries.
-fn lookup(name: &str, known_files: &BTreeSet<String>) -> Option<String> {
-    if known_files.contains(name) {
-        return Some(name.to_owned());
-    }
-
-    let key = filename_key(name);
-    known_files
-        .iter()
-        .find(|owned| filename_key(owned) == key)
-        .cloned()
 }
 
 /// Reads a comma-separated field and cleans it, returning `None` when empty.
@@ -384,8 +446,8 @@ fn clean_filename(raw: &str) -> String {
 mod tests {
     use super::*;
 
-    fn files(names: &[&str]) -> BTreeSet<String> {
-        names.iter().map(|n| (*n).to_owned()).collect()
+    fn files(names: &[&str]) -> FileIndex {
+        FileIndex::new(names.iter().copied())
     }
 
     #[test]
