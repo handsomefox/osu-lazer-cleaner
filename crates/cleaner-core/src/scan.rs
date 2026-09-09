@@ -93,6 +93,25 @@ pub fn build_plan(
         classify_ms,
         sets_parsed,
     };
+
+    let total_ms = elapsed_ms(started);
+    tracing::info!(
+        sets = total_sets,
+        parsed = sets_parsed,
+        blobs = plan.blobs_total,
+        bytes = plan.bytes_total,
+        candidates = plan
+            .groups
+            .iter()
+            .map(|g| g.candidates.len())
+            .sum::<usize>(),
+        measure_ms,
+        database_ms,
+        classify_ms,
+        total_ms,
+        sets_per_s = crate::format::per_second(total_sets as u64, total_ms),
+        "scan finished"
+    );
     Ok(plan)
 }
 

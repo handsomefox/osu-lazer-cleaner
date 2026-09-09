@@ -307,8 +307,12 @@ pub(crate) fn preserve_blob(
             Ok(Some(bytes))
         }
         // The blob went away between the check above and the link.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(hash, "blob vanished before it could be preserved");
+            Ok(None)
+        }
+        Err(error) => {
+            tracing::debug!(hash, %error, "hard link refused, copying instead");
             // Every other failure is treated as "this filesystem has no hard links". Copying
             // refuses an existing destination, so a substituted symlink cannot be written
             // through.
@@ -369,9 +373,15 @@ pub(crate) fn release_blob(
     }
 
     match std::fs::remove_file(&source) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            tracing::debug!(hash, bytes, "released a library link");
+            Ok(true)
+        }
         // Already gone: lazer's own cleanup, or a previous run, got there first.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(hash, "library link was already gone");
+            Ok(false)
+        }
         Err(error) => Err(SnapshotError::Io {
             action: "removing a file from the library",
             path: source,
@@ -773,7 +783,17 @@ pub fn delete(library: &Library, snapshot: &Snapshot) -> Result<(), SnapshotErro
             }
         }
     }
-    remove_restored(library, &current)
+
+    let blobs = current.manifest.blobs.len();
+    let bytes = current.manifest.bytes();
+    remove_restored(library, &current)?;
+    tracing::info!(
+        snapshot = %current.dir.display(),
+        blobs,
+        bytes,
+        "snapshot deleted"
+    );
+    Ok(())
 }
 
 /// Removes recovery links after restoration commits. The caller holds the operation lock.

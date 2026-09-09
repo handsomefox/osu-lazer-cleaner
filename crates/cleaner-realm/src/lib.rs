@@ -377,10 +377,18 @@ impl Realm {
         };
 
         if ptr.is_null() {
-            return Err(last_error());
+            let error = last_error();
+            tracing::error!(path = %path.display(), "failed to open the database: {error}");
+            return Err(error);
         }
 
-        Ok(Self { ptr })
+        let realm = Self { ptr };
+        tracing::debug!(
+            path = %path.display(),
+            schema_version = realm.schema_version(),
+            "opened the database"
+        );
+        Ok(realm)
     }
 
     /// Returns the schema version recorded in the file.

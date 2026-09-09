@@ -101,6 +101,13 @@ pub fn run(
 
     check_database_path(library)?;
     let _lock = OperationLock::acquire(library)?;
+    let started = std::time::Instant::now();
+    tracing::info!(
+        candidates = candidates.len(),
+        bytes = plan.selected_bytes(),
+        library = %library.root().display(),
+        "clean started"
+    );
     let snapshot_dir = snapshot::begin(library)?;
 
     // `finalise` renames the directory before the commit, so a failure has to be able to find
@@ -123,19 +130,42 @@ pub fn run(
             if let Some(dir) = finalised.take() {
                 snapshot::abandon(library, &dir);
             }
+            tracing::error!(
+                ms = elapsed_ms(started),
+                "clean failed, snapshot abandoned: {}",
+                crate::error::chain(&error)
+            );
             return Err(error);
         }
     };
 
     release_unreferenced(library, &final_dir, &blobs, &mut progress)?;
 
+    let bytes: u64 = blobs.iter().map(|(_, size)| size).sum();
+    let ms = elapsed_ms(started);
+    tracing::info!(
+        snapshot = %final_dir.display(),
+        rows = removals,
+        blobs = blobs.len(),
+        bytes,
+        ms,
+        blobs_per_s = crate::format::per_second(blobs.len() as u64, ms),
+        mb_per_s = crate::format::megabytes_per_second(bytes, ms),
+        "clean finished"
+    );
+
     Ok(Outcome {
         detached: removals,
         stashed: blobs.len(),
-        bytes: blobs.iter().map(|(_, size)| size).sum(),
+        bytes,
         snapshot: Some(final_dir),
         dry_run: false,
     })
+}
+
+/// Milliseconds since `started`, saturating rather than panicking on a huge value.
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// What a committed clean produced: usages detached, where the snapshot went, and what it holds.
@@ -313,10 +343,19 @@ pub fn compact(library: &Library) -> Result<Compaction, SnapshotError> {
             .map(|meta| meta.len())
     };
 
+    let started = std::time::Instant::now();
     let before = measure("measuring the database")?;
     let backup = back_up_database(library)?;
     let rewritten = Realm::open_for_write(&path)?.compact()?;
     let after = measure("measuring the database")?;
+    tracing::info!(
+        rewritten,
+        before,
+        after,
+        saved = before.saturating_sub(after),
+        ms = elapsed_ms(started),
+        "compaction finished"
+    );
 
     Ok(Compaction {
         rewritten,
@@ -563,7 +602,9 @@ pub fn restore(
 ) -> Result<usize, SnapshotError> {
     check_database_path(library)?;
     let _lock = OperationLock::acquire(library)?;
+    let started = std::time::Instant::now();
     let snapshot = snapshot::reload(library, snapshot)?;
+    tracing::info!(snapshot = %snapshot.dir.display(), "restore started");
 
     let restorations: Vec<Restoration> = snapshot
         .manifest
@@ -595,7 +636,15 @@ pub fn restore(
     // Every restored usage now owns its library link. Only now may the recovery links go.
     snapshot::remove_restored(library, &snapshot)?;
 
-    tracing::info!(blobs, rows, "restored a snapshot");
+    let ms = elapsed_ms(started);
+    tracing::info!(
+        snapshot = %snapshot.dir.display(),
+        blobs,
+        rows,
+        ms,
+        blobs_per_s = crate::format::per_second(blobs as u64, ms),
+        "restore finished"
+    );
     Ok(blobs)
 }
 

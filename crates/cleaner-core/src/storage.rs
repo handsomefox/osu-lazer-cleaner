@@ -45,6 +45,14 @@ impl Library {
             });
         }
 
+        tracing::info!(
+            root = %resolved.display(),
+            redirected = resolved != root,
+            database_bytes = std::fs::metadata(resolved.join(DATABASE_FILENAME))
+                .map(|meta| meta.len())
+                .unwrap_or_default(),
+            "library opened"
+        );
         Ok(Self { root: resolved })
     }
 
@@ -60,8 +68,10 @@ impl Library {
             if let Ok(library) = Self::open(candidate) {
                 return Ok(library);
             }
+            tracing::debug!(path = %candidate.display(), "no library here");
         }
 
+        tracing::warn!(tried = candidates.len(), "no osu!lazer library found");
         Err(StorageError::NotFound { tried: candidates })
     }
 

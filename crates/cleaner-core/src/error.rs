@@ -146,3 +146,46 @@ fn format_paths(paths: &[PathBuf]) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+/// Renders an error with every source behind it.
+///
+/// `Display` alone shows the outermost message, which is usually the one that says least. A log
+/// line that has to be enough to diagnose from needs the chain.
+#[must_use]
+pub fn chain(error: &dyn std::error::Error) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(current) = source {
+        // Writing to a String cannot fail, so the result carries no information.
+        let _ = write!(text, ": {current}");
+        source = current.source();
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chain;
+
+    #[test]
+    fn a_chain_carries_every_source() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access is denied");
+        let error = super::SnapshotError::Io {
+            action: "linking a file into the snapshot",
+            path: std::path::PathBuf::from("/library/files/a/ab/abcdef"),
+            source: io,
+        };
+
+        let text = chain(&error);
+        assert!(text.contains("linking a file into the snapshot"), "{text}");
+        assert!(text.ends_with("access is denied"), "{text}");
+    }
+
+    #[test]
+    fn an_error_with_no_source_is_just_its_message() {
+        let error = super::SnapshotError::OperationInProgress;
+        assert_eq!(chain(&error), error.to_string());
+    }
+}
