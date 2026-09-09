@@ -1075,6 +1075,11 @@ impl App {
             ui.separator();
             ui.add_space(gap / 2.0);
 
+            // What is left after the divider, rather than the width asked for above. The
+            // separator and the spacing either side of it take room that the split did not
+            // account for, and asking for more than that ran the database column's text off
+            // the edge of the window.
+            let right = ui.available_width();
             ui.allocate_ui_with_layout(
                 egui::vec2(right, 0.0),
                 egui::Layout::top_down(egui::Align::LEFT),
