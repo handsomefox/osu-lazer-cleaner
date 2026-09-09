@@ -101,6 +101,17 @@ pub(crate) enum Event {
         /// The copy of the database a compaction kept, if there is one.
         backup: Option<BackupSummary>,
     },
+    /// A snapshot operation finished.
+    ///
+    /// Restores and deletions report nothing of their own beyond a refreshed snapshot list, so
+    /// without this the status line kept the last progress message it was sent and read as
+    /// though the operation had stalled just short of the end.
+    Finished {
+        /// What to put in the status line.
+        message: &'static str,
+        /// Whether the library now holds files the last scan did not see.
+        library_changed: bool,
+    },
     /// Something went wrong.
     Failed {
         /// Message to show.
@@ -231,7 +242,11 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
 
         Command::RestoreSnapshot { id } => {
             let reporter = events.clone();
-            act_on_snapshot(library.as_ref(), &id, events, move |library, snapshot| {
+            let done = Event::Finished {
+                message: "Restore finished",
+                library_changed: true,
+            };
+            act_on_snapshot(library.as_ref(), &id, events, done, move |library, snapshot| {
                 cleaner_core::restore(library, snapshot, |progress| {
                     let _ = reporter.send(Event::Progress {
                         message: describe_clean(progress),
@@ -242,7 +257,11 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
         }
 
         Command::DeleteSnapshot { id } => {
-            act_on_snapshot(library.as_ref(), &id, events, snapshot::delete);
+            let done = Event::Finished {
+                message: "Snapshot deleted",
+                library_changed: false,
+            };
+            act_on_snapshot(library.as_ref(), &id, events, done, snapshot::delete);
         }
 
         Command::Compact => {
@@ -342,6 +361,7 @@ fn act_on_snapshot(
     library: Option<&Library>,
     id: &str,
     events: &Sender<Event>,
+    done: Event,
     operation: impl FnOnce(&Library, &Snapshot) -> Result<(), cleaner_core::SnapshotError>,
 ) {
     let Some(library) = library else {
@@ -366,6 +386,7 @@ fn act_on_snapshot(
         return;
     }
 
+    let _ = events.send(done);
     let _ = events.send(snapshot_event(library));
 }
 

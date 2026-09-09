@@ -293,6 +293,19 @@ impl App {
                     self.backup = backup;
                     self.activity = None;
                 }
+                Event::Finished {
+                    message,
+                    library_changed,
+                } => {
+                    message.clone_into(&mut self.status);
+                    if library_changed {
+                        // The library holds files the plan on screen was built without, so the
+                        // totals beside every category no longer describe what is there.
+                        self.plan = None;
+                        self.last_result = None;
+                        self.browsing = None;
+                    }
+                }
                 Event::Failed { message } => {
                     self.error = Some(message);
                     self.activity = None;
