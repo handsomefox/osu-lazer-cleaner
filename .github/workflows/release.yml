@@ -23,9 +23,11 @@ env:
   CARGO_AUDIT_VERSION: 0.22.2
   CARGO_XWIN_VERSION: 0.23.0
   CARGO_MACHETE_VERSION: 0.9.2
-  CARGO_EXECUTABLE: osu-lazer-cleaner.exe
-  RELEASE_EXECUTABLE: "osu!lazer Cleaner.exe"
-  RELEASE_ARCHIVE: osu-lazer-cleaner-windows-x86_64.zip
+  WINDOWS_CARGO_EXECUTABLE: osu-lazer-cleaner.exe
+  WINDOWS_EXECUTABLE: "osu!lazer Cleaner.exe"
+  WINDOWS_ARCHIVE: osu-lazer-cleaner-windows-x86_64.zip
+  LINUX_EXECUTABLE: osu-lazer-cleaner
+  LINUX_ARCHIVE: osu-lazer-cleaner-linux-x86_64.tar.gz
 
 defaults:
   run:
@@ -65,7 +67,7 @@ jobs:
       - name: Audit committed lockfile
         run: cargo audit --file Cargo.lock
 
-  build:
+  windows:
     name: Windows build and package
     needs: audit
     permissions:
@@ -115,33 +117,21 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build native release
         run: cargo build --workspace --release --locked
-      - name: Package and verify release assets
+      - name: Package and verify Windows assets
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $dist = Join-Path $PWD 'dist'
           if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
           New-Item -ItemType Directory -Path $dist | Out-Null
-          $exe = $env:RELEASE_EXECUTABLE
-          $zip = $env:RELEASE_ARCHIVE
-          $artifact = Join-Path $PWD "target/release/$env:CARGO_EXECUTABLE"
+          $exe = $env:WINDOWS_EXECUTABLE
+          $zip = $env:WINDOWS_ARCHIVE
+          $artifact = Join-Path $PWD "target/release/$env:WINDOWS_CARGO_EXECUTABLE"
           Copy-Item -LiteralPath $artifact -Destination (Join-Path $dist $exe)
           Compress-Archive -CompressionLevel Optimal -LiteralPath (Join-Path $dist $exe) -DestinationPath (Join-Path $dist $zip)
-          $hashAssets = @($exe, $zip)
-          $checksumLines = @($hashAssets | ForEach-Object {
-            $hash = (Get-FileHash (Join-Path $dist $_) -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash  $_"
-          })
-          $checksumText = ($checksumLines -join "`n") + "`n"
-          [IO.File]::WriteAllText((Join-Path $dist 'SHA256SUMS'), $checksumText, [Text.Encoding]::ASCII)
-          $expectedFiles = @('SHA256SUMS', $exe, $zip) | Sort-Object
+          $expectedFiles = @($exe, $zip) | Sort-Object
           $actualFiles = @(Get-ChildItem $dist -File | Select-Object -ExpandProperty Name | Sort-Object)
-          if (@(Compare-Object $expectedFiles $actualFiles).Count -ne 0) { throw 'Release asset set is incorrect' }
-          foreach ($line in Get-Content (Join-Path $dist 'SHA256SUMS')) {
-            if ($line -cnotmatch '^([0-9a-f]{64})  (.+)$') { throw "Invalid checksum line: $line" }
-            $actual = (Get-FileHash (Join-Path $dist $Matches[2]) -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($Matches[1] -cne $actual) { throw "Checksum mismatch: $($Matches[2])" }
-          }
+          if (@(Compare-Object $expectedFiles $actualFiles).Count -ne 0) { throw 'Windows asset set is incorrect' }
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $archive = [IO.Compression.ZipFile]::OpenRead((Join-Path $dist $zip))
           try {
@@ -150,20 +140,126 @@ jobs:
           } finally {
             $archive.Dispose()
           }
+      - name: Upload Windows assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: osu-lazer-cleaner-windows-assets
+          path: |
+            dist/${{ env.WINDOWS_EXECUTABLE }}
+            dist/${{ env.WINDOWS_ARCHIVE }}
+          if-no-files-found: error
+
+  linux:
+    name: Linux build and package
+    needs: audit
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    # The release binary needs the glibc it was linked against. Building in 22.04 holds the
+    # floor at 2.35; a newer image raises it.
+    container: ubuntu:22.04
+    steps:
+      # Before checkout: without git, actions/checkout downloads a tarball with no submodule.
+      - name: Install build tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl build-essential cmake clang libclang-dev
+          git config --global --add safe.directory '*'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+      - name: Install pinned Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Trace build tools
+        run: |
+          ldd --version | head -n 1
+          gcc --version | head -n 1
+          cmake --version | head -n 1
+          rustc --version
+          cargo --version
+      - name: Test complete workspace
+        run: cargo test --workspace --no-fail-fast --locked
+      - name: Build native release
+        run: cargo build --workspace --release --locked
+      - name: Check glibc floor and linked libraries
+        run: scripts/check-linux-floor.sh target/release/osu-lazer-cleaner
+      - name: Package and verify Linux assets
+        run: |
+          rm -rf dist
+          mkdir dist
+          install -m 755 target/release/osu-lazer-cleaner "dist/$LINUX_EXECUTABLE"
+          tar -czf "dist/$LINUX_ARCHIVE" --owner=0 --group=0 --numeric-owner -C dist "$LINUX_EXECUTABLE"
+          rm "dist/$LINUX_EXECUTABLE"
+          mapfile -t actual_assets < <(find dist -maxdepth 1 -type f -printf '%f\n')
+          [[ ${#actual_assets[@]} -eq 1 && "${actual_assets[0]}" == "$LINUX_ARCHIVE" ]]
+          mapfile -t entries < <(tar -tvzf "dist/$LINUX_ARCHIVE")
+          [[ ${#entries[@]} -eq 1 ]]
+          read -r mode _ _ _ _ name <<< "${entries[0]}"
+          [[ "$mode" == -rwxr-xr-x && "$name" == "$LINUX_EXECUTABLE" ]]
+      - name: Upload Linux assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: osu-lazer-cleaner-linux-assets
+          path: dist/${{ env.LINUX_ARCHIVE }}
+          if-no-files-found: error
+
+  assemble:
+    name: Checksum and verify
+    needs: [windows, linux]
+    permissions: {}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download Windows assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: osu-lazer-cleaner-windows-assets
+          path: dist
+      - name: Download Linux assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: osu-lazer-cleaner-linux-assets
+          path: dist
+      - name: Write checksums
+        working-directory: dist
+        run: sha256sum -- "$WINDOWS_EXECUTABLE" "$WINDOWS_ARCHIVE" "$LINUX_ARCHIVE" > SHA256SUMS
+      - name: Verify release assets
+        run: |
+          mapfile -t expected_assets < <(printf '%s\n' SHA256SUMS "$WINDOWS_EXECUTABLE" "$WINDOWS_ARCHIVE" "$LINUX_ARCHIVE" | sort)
+          mapfile -t actual_assets < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
+          [[ "${actual_assets[*]}" == "${expected_assets[*]}" ]]
+          mapfile -t expected_hash_assets < <(printf '%s\n' "$WINDOWS_EXECUTABLE" "$WINDOWS_ARCHIVE" "$LINUX_ARCHIVE" | sort)
+          mapfile -t actual_hash_assets < <(cut -c67- dist/SHA256SUMS | sort)
+          [[ "${actual_hash_assets[*]}" == "${expected_hash_assets[*]}" ]]
+          awk 'length($1) != 64 || $1 !~ /^[0-9a-f]+$/ { exit 1 } END { if (NR != 3) exit 1 }' dist/SHA256SUMS
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+          unzip -tq "dist/$WINDOWS_ARCHIVE"
+          mapfile -t zip_entries < <(unzip -Z1 "dist/$WINDOWS_ARCHIVE")
+          [[ ${#zip_entries[@]} -eq 1 && "${zip_entries[0]}" == "$WINDOWS_EXECUTABLE" ]]
+          mapfile -t tar_entries < <(tar -tvzf "dist/$LINUX_ARCHIVE")
+          [[ ${#tar_entries[@]} -eq 1 ]]
+          read -r mode _ _ _ _ name <<< "${tar_entries[0]}"
+          [[ "$mode" == -rwxr-xr-x && "$name" == "$LINUX_EXECUTABLE" ]]
       - name: Upload release assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: osu-lazer-cleaner-release-assets
           path: |
-            dist/${{ env.RELEASE_EXECUTABLE }}
-            dist/${{ env.RELEASE_ARCHIVE }}
+            dist/${{ env.WINDOWS_EXECUTABLE }}
+            dist/${{ env.WINDOWS_ARCHIVE }}
+            dist/${{ env.LINUX_ARCHIVE }}
             dist/SHA256SUMS
           if-no-files-found: error
 
   publish:
     name: Attest and publish
     if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
-    needs: build
+    needs: assemble
     permissions:
       attestations: write # Publish provenance for each release asset.
       contents: write # Create the GitHub release and upload assets.
@@ -177,19 +273,21 @@ jobs:
           path: dist
       - name: Independently verify release assets
         run: |
-          exe="$RELEASE_EXECUTABLE"
-          zip="$RELEASE_ARCHIVE"
-          mapfile -t expected_assets < <(printf '%s\n' SHA256SUMS "$exe" "$zip" | sort)
+          mapfile -t expected_assets < <(printf '%s\n' SHA256SUMS "$WINDOWS_EXECUTABLE" "$WINDOWS_ARCHIVE" "$LINUX_ARCHIVE" | sort)
           mapfile -t actual_assets < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
           [[ "${actual_assets[*]}" == "${expected_assets[*]}" ]]
-          mapfile -t expected_hash_assets < <(printf '%s\n' "$exe" "$zip" | sort)
+          mapfile -t expected_hash_assets < <(printf '%s\n' "$WINDOWS_EXECUTABLE" "$WINDOWS_ARCHIVE" "$LINUX_ARCHIVE" | sort)
           mapfile -t actual_hash_assets < <(cut -c67- dist/SHA256SUMS | sort)
           [[ "${actual_hash_assets[*]}" == "${expected_hash_assets[*]}" ]]
-          awk 'length($1) != 64 || $1 !~ /^[0-9a-f]+$/ { exit 1 } END { if (NR != 2) exit 1 }' dist/SHA256SUMS
+          awk 'length($1) != 64 || $1 !~ /^[0-9a-f]+$/ { exit 1 } END { if (NR != 3) exit 1 }' dist/SHA256SUMS
           (cd dist && sha256sum --check --strict SHA256SUMS)
-          unzip -tq "dist/$zip"
-          mapfile -t entries < <(unzip -Z1 "dist/$zip")
-          [[ ${#entries[@]} -eq 1 && "${entries[0]}" == "$exe" ]]
+          unzip -tq "dist/$WINDOWS_ARCHIVE"
+          mapfile -t zip_entries < <(unzip -Z1 "dist/$WINDOWS_ARCHIVE")
+          [[ ${#zip_entries[@]} -eq 1 && "${zip_entries[0]}" == "$WINDOWS_EXECUTABLE" ]]
+          mapfile -t tar_entries < <(tar -tvzf "dist/$LINUX_ARCHIVE")
+          [[ ${#tar_entries[@]} -eq 1 ]]
+          read -r mode _ _ _ _ name <<< "${tar_entries[0]}"
+          [[ "$mode" == -rwxr-xr-x && "$name" == "$LINUX_EXECUTABLE" ]]
       - name: Attest release assets
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
@@ -201,8 +299,9 @@ jobs:
           TAG_NAME: ${{ inputs.release_tag || github.ref_name }}
         run: >-
           gh release create "$TAG_NAME"
-          "dist/$RELEASE_EXECUTABLE"
-          "dist/$RELEASE_ARCHIVE"
+          "dist/$WINDOWS_EXECUTABLE"
+          "dist/$WINDOWS_ARCHIVE"
+          "dist/$LINUX_ARCHIVE"
           dist/SHA256SUMS
           --verify-tag
           --generate-notes

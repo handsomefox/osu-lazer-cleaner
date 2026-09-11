@@ -11,7 +11,7 @@ version = "1.4.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/handsomefox/osu-lazer-cleaner"
-description = "A Windows desktop app that safely removes unwanted beatmap content from an osu!lazer library"
+description = "A desktop app that safely removes unwanted beatmap content from an osu!lazer library"
 
 [workspace.dependencies]
 bindgen = "=0.73.1"

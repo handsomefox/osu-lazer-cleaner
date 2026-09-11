@@ -75,6 +75,9 @@ that already cost a release: Windows refuses `FlushFileBuffers` on a read-only h
 `File::open` followed by `sync_all` passes every test here and fails every test on Windows. Open
 for writing when the point is to flush.
 
+The Linux release builds in an `ubuntu:22.04` container, which holds its glibc floor at 2.35. A
+newer image raises the floor, and `scripts/check-linux-floor.sh` fails the build when it does.
+
 ## Tests
 
 Tests are inline `#[cfg(test)] mod tests` blocks using `tempfile`. There is no `tests/`

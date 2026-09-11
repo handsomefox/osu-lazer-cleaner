@@ -112,9 +112,24 @@ Restore the newer snapshot first, or delete the dependent older snapshot first.
 ## Install
 
 Download the latest release from the
-[releases page](https://github.com/handsomefox/osu-lazer-cleaner/releases) and run
-`osu-lazer-cleaner.exe`. It finds your library automatically, including when `storage.ini`
-points somewhere other than the default location.
+[releases page](https://github.com/handsomefox/osu-lazer-cleaner/releases). It finds your
+library automatically, including when `storage.ini` points somewhere other than the default
+location.
+
+On Windows, run `osu!lazer Cleaner.exe`, or take it out of
+`osu-lazer-cleaner-windows-x86_64.zip` first. It looks for the library in `%APPDATA%\osu`.
+
+On Linux, unpack the archive and run the executable inside it:
+
+```
+tar -xzf osu-lazer-cleaner-linux-x86_64.tar.gz
+./osu-lazer-cleaner
+```
+
+It needs glibc 2.35 or later, which means Ubuntu 22.04, Debian 12, Fedora 36, or anything
+newer, and an X11 or Wayland session with OpenGL for the window. It looks for the library in
+`$XDG_DATA_HOME/osu`, then `~/.local/share/osu`, where the AppImage keeps it, then
+`~/.var/app/sh.ppy.osu/data/osu`, where the Flathub build does.
 
 Close osu!lazer before cleaning, restoring, or compacting the database. The window watches for
 the game and says so while it is open.
