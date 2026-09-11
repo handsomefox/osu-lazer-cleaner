@@ -116,15 +116,19 @@ Download the latest release from the
 library automatically, including when `storage.ini` points somewhere other than the default
 location.
 
-On Windows, run `osu!lazer Cleaner.exe`, or take it out of
-`osu-lazer-cleaner-windows-x86_64.zip` first. It looks for the library in `%APPDATA%\osu`.
+On Windows, unpack `osu-lazer-cleaner-<version>-windows-x86_64.zip` and run
+`osu-lazer-cleaner.exe` from the folder inside it. It looks for the library in `%APPDATA%\osu`.
 
-On Linux, unpack the archive and run the executable inside it:
+On Linux, unpack the archive and run the executable in the folder inside it:
 
 ```
-tar -xzf osu-lazer-cleaner-linux-x86_64.tar.gz
-./osu-lazer-cleaner
+tar -xzf osu-lazer-cleaner-<version>-linux-x86_64.tar.gz
+./osu-lazer-cleaner-<version>-linux-x86_64/osu-lazer-cleaner
 ```
+
+`SHA256SUMS` beside the archives holds their checksums. Each archive also carries a build
+provenance attestation, which `gh attestation verify <archive> -R handsomefox/osu-lazer-cleaner`
+checks.
 
 It needs glibc 2.35 or later, which means Ubuntu 22.04, Debian 12, Fedora 36, or anything
 newer, and an X11 or Wayland session with OpenGL for the window. It looks for the library in
@@ -211,8 +215,8 @@ cargo run -p cleaner-core --example demo_library -- /tmp/demo
 It invents 240 beatmap sets and writes their files as sparse files, so the sizes the window
 reports are real while the directory costs two megabytes.
 
-Cross-compile a Windows executable from Linux with `scripts/package-windows.sh`, which needs
-`cargo-xwin`. The same tool lints against the Windows target, which is worth running before
+Cross-compile the Windows release archive from Linux with `scripts/package-windows.sh`, which
+needs `cargo-xwin` 0.23.1 and packs `dist/` the way a release does. The same tool lints against the Windows target, which is worth running before
 pushing because some differences appear only there:
 
 ```

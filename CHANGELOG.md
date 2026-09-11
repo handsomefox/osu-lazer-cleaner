@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Ship `osu-lazer-cleaner-<version>-windows-x86_64.zip` and
+  `osu-lazer-cleaner-<version>-linux-x86_64.tar.gz`, beside a `SHA256SUMS` file. Each archive
+  holds a folder of the same name with the executable, `README.md`, and `LICENSE` in it. The
+  Windows executable used to be `osu!lazer Cleaner.exe`, and was also attached on its own. It
+  is now `osu-lazer-cleaner.exe`, and Windows still shows it as osu!lazer Cleaner.
+
 ## 1.5.0
 
 - Ship a Linux build, `osu-lazer-cleaner-linux-x86_64.tar.gz`, beside the Windows one. It runs
