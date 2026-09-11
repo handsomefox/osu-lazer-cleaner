@@ -98,3 +98,22 @@ Make the slim copy once with:
 cargo run -p cleaner-realm --features test-support --example slim -- \
     ref/client.realm ref/client-slim.realm 400
 ```
+
+## Bump CI pins by hand
+
+`scripts/install-ci-tool.sh` downloads cargo-audit, cargo-machete, actionlint, and zizmor from
+their release pages and checks each archive against a pinned SHA-256 before it extracts
+anything. The Linux jobs run in `ubuntu:22.04` pinned by digest, and install rustup from a
+`rustup-init` pinned by hash. Dependabot cannot bump any of these. To bump a tool, change its row
+in the script and take the new hash from the digest GitHub records for the asset:
+
+```
+gh release view <tag> -R <owner>/<repo> --json assets --jq '.assets[] | select(.name == "<asset>") | .digest'
+```
+
+`docker buildx imagetools inspect ubuntu:22.04` prints the image's current digest.
+`https://static.rust-lang.org/rustup/archive/<version>/x86_64-unknown-linux-gnu/rustup-init.sha256`
+holds the hash for a rustup release.
+
+CI runs actionlint, shellcheck, and `zizmor --persona pedantic` on every push. Run all three
+before you push a workflow change.

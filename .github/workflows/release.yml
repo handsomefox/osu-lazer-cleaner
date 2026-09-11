@@ -156,7 +156,8 @@ jobs:
     timeout-minutes: 45
     # The release binary needs the glibc it was linked against. Building in 22.04 holds the
     # floor at 2.35; a newer image raises it.
-    container: ubuntu:22.04
+    # Pinned by digest. AGENTS.md says how to refresh it.
+    container: ubuntu:22.04@sha256:829f6df217bcbae2b371026e81711d1a787c61b2967ad09d015063663ebafbf7
     steps:
       # Before checkout: without git, actions/checkout downloads a tarball with no submodule.
       # archive.ubuntu.com throttles GitHub's runners to a crawl; the Azure mirror is the one

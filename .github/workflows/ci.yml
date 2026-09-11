@@ -29,6 +29,28 @@ defaults:
     shell: bash
 
 jobs:
+  workflows:
+    name: Workflows
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint and zizmor
+        run: scripts/install-ci-tool.sh actionlint zizmor
+      - name: Lint workflows
+        run: actionlint
+      - name: Lint scripts
+        run: shellcheck scripts/*.sh
+      # The pedantic persona is the one that reports unpinned container images.
+      - name: Audit workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --persona pedantic --format github .github/workflows .github/dependabot.yml
+
   portable:
     name: Portable
     permissions:
@@ -89,7 +111,8 @@ jobs:
     # The release binary needs the glibc it was linked against. Building in 22.04 holds the
     # floor at 2.35; a newer image raises it. The tests run in Portable, so this job only
     # builds and checks what the binary links, as an early warning before a release.
-    container: ubuntu:22.04
+    # Pinned by digest. AGENTS.md says how to refresh it.
+    container: ubuntu:22.04@sha256:829f6df217bcbae2b371026e81711d1a787c61b2967ad09d015063663ebafbf7
     steps:
       # Before checkout: without git, actions/checkout downloads a tarball with no submodule.
       # archive.ubuntu.com throttles GitHub's runners to a crawl; the Azure mirror is the one
