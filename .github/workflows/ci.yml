@@ -102,6 +102,51 @@ jobs:
           path: target/release/osu-lazer-cleaner.exe
           if-no-files-found: error
 
+  linux:
+    name: Linux
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    # The release binary needs the glibc it was linked against. Building in 22.04 holds the
+    # floor at 2.35; a newer image raises it.
+    container: ubuntu:22.04
+    steps:
+      # Before checkout: without git, actions/checkout downloads a tarball with no submodule.
+      - name: Install build tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl build-essential cmake clang libclang-dev
+          git config --global --add safe.directory '*'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install pinned Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Trace build tools
+        run: |
+          ldd --version | head -n 1
+          gcc --version | head -n 1
+          cmake --version | head -n 1
+          rustc --version
+          cargo --version
+      - name: Test complete workspace
+        run: cargo test --workspace --no-fail-fast --locked
+      - name: Build native release
+        run: cargo build --workspace --release --locked
+      - name: Check glibc floor and linked libraries
+        run: scripts/check-linux-floor.sh target/release/osu-lazer-cleaner
+      - name: Upload Linux executable
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: osu-lazer-cleaner-linux-x86_64
+          path: target/release/osu-lazer-cleaner
+          if-no-files-found: error
+
   audit:
     name: Audit
     permissions:
