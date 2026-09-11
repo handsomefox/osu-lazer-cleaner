@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.0
+
+- Ship a Linux build, `osu-lazer-cleaner-linux-x86_64.tar.gz`, beside the Windows one. It runs
+  on glibc 2.35 or later, which is Ubuntu 22.04 and anything newer, and opens its window on
+  X11 or Wayland.
+- Find a library under `$XDG_DATA_HOME/osu`, where osu!lazer puts it when that variable is set,
+  and in the Flathub build's `~/.var/app/sh.ppy.osu/data/osu`, as well as in
+  `~/.local/share/osu`.
+- Write the log under `$XDG_DATA_HOME/osu-lazer-cleaner` on Linux, rather than always under
+  `~/.local/share`.
+- Keep the right-hand column of the snapshots screen inside the window. At 1024 pixels wide its
+  paragraphs ran off the edge and lost the last words of each line.
+
 ## 1.4.0
 
 - Keep the copies of `client.realm` taken before a compaction, each named for when it was taken,
