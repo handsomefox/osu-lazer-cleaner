@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.1
 
 - Ship `osu-lazer-cleaner-<version>-windows-x86_64.zip` and
   `osu-lazer-cleaner-<version>-linux-x86_64.tar.gz`, beside a `SHA256SUMS` file. Each archive
