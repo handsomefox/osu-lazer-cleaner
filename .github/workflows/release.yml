@@ -155,15 +155,20 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     # The release binary needs the glibc it was linked against. Building in 22.04 holds the
     # floor at 2.35; a newer image raises it.
     container: ubuntu:22.04
     steps:
       # Before checkout: without git, actions/checkout downloads a tarball with no submodule.
+      # archive.ubuntu.com throttles GitHub's runners to a crawl; the Azure mirror is the one
+      # the runner images themselves use.
       - name: Install build tools
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
+          sed -i -E 's#http://(archive|security)\.ubuntu\.com/ubuntu#http://azure.archive.ubuntu.com/ubuntu#g' /etc/apt/sources.list
+          printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\n' > /etc/apt/apt.conf.d/80-ci
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates curl build-essential cmake clang libclang-dev
           git config --global --add safe.directory '*'
