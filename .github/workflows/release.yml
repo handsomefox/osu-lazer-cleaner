@@ -183,9 +183,10 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Trace build tools
         run: |
-          ldd --version | head -n 1
-          gcc --version | head -n 1
-          cmake --version | head -n 1
+          # sed reads to the end; head would close the pipe early and pipefail reports SIGPIPE.
+          ldd --version | sed -n 1p
+          gcc --version | sed -n 1p
+          cmake --version | sed -n 1p
           rustc --version
           cargo --version
       - name: Test complete workspace
