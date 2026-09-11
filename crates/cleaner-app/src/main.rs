@@ -28,10 +28,17 @@ fn main() -> ExitCode {
     gui()
 }
 
+/// Names the application to eframe and to the desktop.
+///
+/// eframe keeps the window's saved state in a directory named after it, so changing it loses
+/// the screen the window reopens on. Wayland compositors match it against a `.desktop` file.
+const APP_ID: &str = "osu-lazer-cleaner";
+
 /// Opens the window.
 fn gui() -> ExitCode {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_app_id(APP_ID)
             .with_inner_size([1024.0, 680.0])
             .with_min_inner_size([760.0, 520.0])
             .with_title("osu!lazer Cleaner")
@@ -40,7 +47,7 @@ fn gui() -> ExitCode {
     };
 
     let started = eframe::run_native(
-        "osu-lazer-cleaner",
+        APP_ID,
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     );
