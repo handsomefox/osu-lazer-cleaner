@@ -170,14 +170,41 @@ fn default_roots() -> Vec<PathBuf> {
             roots.push(appdata.join("osu"));
         }
     } else {
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            roots.push(home.join(".local/share/osu"));
-            roots.push(home.join("Library/Application Support/osu"));
-        }
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from);
+        roots.extend(unix_roots(
+            home.as_deref(),
+            crate::folders::data_home().as_deref(),
+        ));
 
-        // Running under WSL against a Windows install is the common case for this project.
+        // A Linux build under WSL can also reach a Windows install through `/mnt`.
         roots.extend(windows_roots_from_wsl());
+    }
+
+    roots
+}
+
+/// Where lazer keeps its data on Linux and macOS, given `$HOME` and the XDG data directory.
+///
+/// osu-framework stores under `LocalApplicationData`, which .NET resolves to
+/// `$XDG_DATA_HOME`, so that comes first, with the usual default after it in case the variable
+/// was set differently when lazer ran. The Flathub build sees its own `XDG_DATA_HOME` inside
+/// `~/.var/app/sh.ppy.osu`.
+fn unix_roots(home: Option<&Path>, data_home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(data_home) = data_home {
+        roots.push(data_home.join("osu"));
+    }
+
+    if let Some(home) = home {
+        let default = home.join(".local/share/osu");
+        if !roots.contains(&default) {
+            roots.push(default);
+        }
+        roots.push(home.join(".var/app/sh.ppy.osu/data/osu"));
+        roots.push(home.join("Library/Application Support/osu"));
     }
 
     roots
@@ -245,5 +272,41 @@ mod tests {
             "/mnt/e/Games/osu!lazer"
         );
         assert_eq!(translate_path("/already/unix"), "/already/unix");
+    }
+
+    #[test]
+    fn the_xdg_data_directory_is_tried_before_the_default() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            unix_roots(Some(home), Some(Path::new("/data"))),
+            [
+                PathBuf::from("/data/osu"),
+                home.join(".local/share/osu"),
+                home.join(".var/app/sh.ppy.osu/data/osu"),
+                home.join("Library/Application Support/osu"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_default_data_directory_is_tried_once() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            unix_roots(Some(home), Some(&home.join(".local/share"))),
+            [
+                home.join(".local/share/osu"),
+                home.join(".var/app/sh.ppy.osu/data/osu"),
+                home.join("Library/Application Support/osu"),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_home_leaves_only_the_xdg_data_directory() {
+        assert_eq!(
+            unix_roots(None, Some(Path::new("/data"))),
+            [PathBuf::from("/data/osu")]
+        );
+        assert!(unix_roots(None, None).is_empty());
     }
 }

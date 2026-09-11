@@ -134,8 +134,9 @@ osu!lazer will not open costs nothing but the time to rename the copy back.
 ## Diagnostics
 
 Both interfaces write a dated log to `%LOCALAPPDATA%\osu-lazer-cleaner\logs\` on Windows and
-to `~/.local/share/osu-lazer-cleaner/logs/` elsewhere, keeping the last seven days. **About**
-has a button that opens the folder. Attach the newest file to an issue.
+to `$XDG_DATA_HOME/osu-lazer-cleaner/logs/` on Linux, which is
+`~/.local/share/osu-lazer-cleaner/logs/` unless you have set the variable. The last seven days
+are kept. **About** has a button that opens the folder. Attach the newest file to an issue.
 
 Every operation records what it did and how long it took: the library it opened, the sets and
 candidates a scan found with its phase timings, and the rows, blobs, bytes, and throughput of a

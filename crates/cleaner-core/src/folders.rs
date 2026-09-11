@@ -2,11 +2,12 @@
 //!
 //! Windows answers where `AppData` lives through `SHGetKnownFolderPath`, not through the
 //! environment: `%APPDATA%` is absent from a service's environment and stale after a profile
-//! redirection. The environment stays as the fallback, and every other platform has only the
-//! environment, so this is the third place after `storage` and `running` where a `cfg` picks a
+//! redirection. The environment stays as the fallback. Linux has only the environment, and
+//! follows the XDG rule .NET applies to `LocalApplicationData`, which is where osu!lazer keeps
+//! its data there. This is the third place after `storage` and `running` where a `cfg` picks a
 //! platform and a portable path picks up the rest.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `%APPDATA%`, where osu!lazer keeps its own data.
 #[must_use]
@@ -34,16 +35,34 @@ pub fn local_app_data() -> Option<PathBuf> {
     }
 }
 
+/// `$XDG_DATA_HOME`, or `~/.local/share` when it is unset, empty, or relative.
+///
+/// .NET resolves `LocalApplicationData` this way off Windows, and osu-framework's
+/// `GameHost.UserStoragePaths` puts osu!lazer's data under it. The XDG specification says a
+/// relative value is invalid and must be ignored.
+#[must_use]
+pub fn data_home() -> Option<PathBuf> {
+    resolve_data_home(env_path("XDG_DATA_HOME"), env_path("HOME").as_deref())
+}
+
+fn resolve_data_home(xdg: Option<PathBuf>, home: Option<&Path>) -> Option<PathBuf> {
+    xdg.filter(|path| path.is_absolute())
+        .or_else(|| home.map(|home| home.join(".local/share")))
+}
+
 /// This tool's own data directory.
 ///
-/// `%LOCALAPPDATA%\osu-lazer-cleaner` on Windows, `~/.local/share/osu-lazer-cleaner` elsewhere,
-/// which is where the interface already writes its log while it is being developed on Linux.
+/// `%LOCALAPPDATA%\osu-lazer-cleaner` on Windows, `$XDG_DATA_HOME/osu-lazer-cleaner` elsewhere.
+/// eframe keeps the window's saved state in the same directory, because `eframe::storage_dir`
+/// follows the same rule.
 #[must_use]
 pub fn app_data_dir() -> Option<PathBuf> {
-    if let Some(local) = local_app_data() {
-        return Some(local.join("osu-lazer-cleaner"));
-    }
-    env_path("HOME").map(|home| home.join(".local/share/osu-lazer-cleaner"))
+    let base = if cfg!(windows) {
+        local_app_data()
+    } else {
+        data_home()
+    };
+    base.map(|base| base.join("osu-lazer-cleaner"))
 }
 
 /// Directory the diagnostics log is written to.
@@ -123,5 +142,30 @@ mod tests {
         assert_eq!(env_path("CLEANER_EMPTY_TEST_VAR"), None);
         // SAFETY: as above.
         unsafe { std::env::remove_var("CLEANER_EMPTY_TEST_VAR") };
+    }
+
+    // `/xdg` is absolute only on Unix, and the rule being tested is the XDG one.
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_xdg_data_home_wins_over_home() {
+        assert_eq!(
+            resolve_data_home(Some(PathBuf::from("/xdg")), Some(Path::new("/home/me"))),
+            Some(PathBuf::from("/xdg"))
+        );
+        assert_eq!(
+            resolve_data_home(None, Some(Path::new("/home/me"))),
+            Some(PathBuf::from("/home/me/.local/share"))
+        );
+        assert_eq!(resolve_data_home(None, None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_xdg_data_home_is_ignored() {
+        assert_eq!(
+            resolve_data_home(Some(PathBuf::from("xdg")), Some(Path::new("/home/me"))),
+            Some(PathBuf::from("/home/me/.local/share"))
+        );
+        assert_eq!(resolve_data_home(Some(PathBuf::from("xdg")), None), None);
     }
 }
