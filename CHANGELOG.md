@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.6.0
+
+- Update egui to 0.36.2, along with smaller dependencies.
+
 ## 1.5.1
 
 - Ship `osu-lazer-cleaner-<version>-windows-x86_64.zip` and
