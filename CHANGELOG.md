@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.6.2
+
+- Update thiserror to 2.0.21, and replace the yanked yoke-derive 0.8.3 with 0.8.4.
+
 ## 1.6.1
 
 - Fix the **Project page** link in About, which did not open.
