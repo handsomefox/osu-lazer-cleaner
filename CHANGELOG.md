@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.6.3
+
+- Update jiff to 0.2.38, serde_json to 1.0.154, and embed-resource to 3.0.12.
+
 ## 1.6.2
 
 - Update thiserror to 2.0.21, and replace the yanked yoke-derive 0.8.3 with 0.8.4.
