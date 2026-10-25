@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.6.4
+
+- Replace the yanked clipboard-win 5.4.1 with 5.4.3.
+
 ## 1.6.3
 
 - Update jiff to 0.2.38, serde_json to 1.0.154, and embed-resource to 3.0.12.
