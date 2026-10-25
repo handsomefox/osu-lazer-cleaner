@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.7.0
+
+- osu!lazer Cleaner can now update itself from its GitHub releases, on Windows and Linux. It
+  checks once a day, and when a new version is out, a chip in the header names it. Click the chip
+  to read what changed since your version, then download the update, skip that version, or leave
+  it for later. The download must match its published SHA-256 checksums before it replaces the
+  app, and a restart finishes the install. A restart waits for a running scan, clean, restore, or
+  snapshot delete. To check more or less often, or never, open **About** > **App updates**. The
+  command line never checks.
+- Getting 1.7.0 itself is still a manual download. Later versions install from inside the app.
+
 ## 1.6.5
 
 - Retry the Linux release build's package install when a mirror stalls, which used to hang the
