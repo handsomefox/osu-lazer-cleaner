@@ -180,6 +180,13 @@ pub(crate) struct App {
     last_result: Option<String>,
     /// Whether the About modal is open.
     about: bool,
+    /// Checks GitHub for a new version of this app. Only the window has one, so the command
+    /// line never reaches the network.
+    updater: app_update::Updater,
+    /// How often to check, and what the user skipped. Saved with the window's state.
+    update_settings: app_update::Settings,
+    /// Whether the update window is open.
+    update_window: bool,
 }
 
 impl App {
@@ -195,6 +202,12 @@ impl App {
             .and_then(|storage| storage.get_string(SCREEN_KEY))
             .and_then(|key| Screen::from_key(&key))
             .unwrap_or(Screen::Clean);
+        // Missing or unreadable settings fall back to the defaults rather than failing.
+        let update_settings = cc
+            .storage
+            .and_then(|storage| storage.get_string(crate::update::SETTINGS_KEY))
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
 
         let worker = Worker::spawn(ctx.clone());
         worker.send(Command::OpenLibrary { path: None });
@@ -226,6 +239,12 @@ impl App {
             pending_snapshot: None,
             last_result: None,
             about: false,
+            updater: app_update::Updater::new(crate::update::APP_INFO, {
+                let ctx = ctx.clone();
+                move || ctx.request_repaint()
+            }),
+            update_settings,
+            update_window: false,
         }
     }
 
@@ -478,6 +497,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.absorb_events();
+        self.updater.poll(&mut self.update_settings);
         let ctx = root.ctx().clone();
         self.guard_close(&ctx);
         self.shortcuts(&ctx);
@@ -540,12 +560,27 @@ impl eframe::App for App {
             });
 
         self.show_modal(&ctx);
-        crate::about::show(&ctx, &mut self.about);
+        if crate::about::show(&ctx, &mut self.about) {
+            self.update_window = true;
+        }
+        let idle = self.idle();
+        crate::update::show(
+            &ctx,
+            &mut self.update_window,
+            &mut self.updater,
+            &mut self.update_settings,
+            idle,
+        );
     }
 
-    /// Remembers the open screen, so the window comes back where it was left.
+    /// Remembers the open screen, so the window comes back where it was left, and the update
+    /// settings.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(SCREEN_KEY, self.screen.key().to_owned());
+        match serde_json::to_string(&self.update_settings) {
+            Ok(json) => storage.set_string(crate::update::SETTINGS_KEY, json),
+            Err(error) => tracing::warn!("failed to save the update settings: {error}"),
+        }
     }
 }
 
@@ -614,6 +649,9 @@ impl App {
                         .clicked()
                     {
                         self.about = true;
+                    }
+                    if crate::update::chip(ui, &self.updater, &self.update_settings) {
+                        self.update_window = true;
                     }
                     if let Some(root) = &self.library {
                         ui.label(

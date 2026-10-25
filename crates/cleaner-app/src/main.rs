@@ -12,6 +12,7 @@ mod console;
 mod diagnostics;
 mod icons;
 mod theme;
+mod update;
 mod worker;
 
 use std::process::ExitCode;
@@ -51,6 +52,12 @@ fn gui() -> ExitCode {
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     );
+
+    // eframe saves the app's state before `run_native` returns, so the updated copy starts
+    // from everything this one knew.
+    if let Err(error) = app_update::restart_if_requested() {
+        tracing::error!("failed to start the updated app: {error}");
+    }
 
     match started {
         Ok(()) => ExitCode::SUCCESS,

@@ -26,6 +26,9 @@ pub(crate) const RESTORE: &str = "\u{E038}"; // ARROW_COUNTER_CLOCKWISE
 pub(crate) const DELETE: &str = "\u{E4A6}"; // TRASH
 pub(crate) const COMPACT: &str = "\u{E1DE}"; // DATABASE
 pub(crate) const ABOUT: &str = "\u{E2CE}"; // INFO
+pub(crate) const UPDATE: &str = "\u{E030}"; // ARROW_CIRCLE_UP
+pub(crate) const DOWNLOAD: &str = "\u{E20C}"; // DOWNLOAD_SIMPLE
+pub(crate) const LINK: &str = "\u{E5DE}"; // ARROW_SQUARE_OUT
 
 // States.
 pub(crate) const SUCCESS: &str = "\u{E184}"; // CHECK_CIRCLE

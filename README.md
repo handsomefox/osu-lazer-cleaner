@@ -150,6 +150,24 @@ reclaims the space left by removed database rows. It reports when another open h
 the rewrite. A copy of `client.realm` is taken first and kept until you delete it, so a rewrite
 osu!lazer will not open costs nothing but the time to rename the copy back.
 
+## Updates
+
+The window checks this repository's GitHub releases for a new version once a day. To check
+more or less often, or never, open **About** > **App updates**. A check is one request to the
+GitHub API, and it sends nothing about you or your library. The command line never checks.
+
+When a new version is out, a chip in the header names it. Click the chip to read the notes of
+every release since yours, then choose **Download update**, **Skip this version**, or
+**Not now**. The download must match both the release's `SHA256SUMS` and the SHA-256 that
+GitHub records for the file. On Windows the app downloads the `.zip`, and on Linux the
+`.tar.gz`. **Restart to update** waits until no scan, clean, restore, deletion, or compaction
+is running. It then moves the new executable into place and reopens the app. The replaced
+executable stays beside it as `osu-lazer-cleaner.exe.old`, or `osu-lazer-cleaner.old` on Linux,
+until the next start.
+
+The install needs write access to the app's folder. If the app lives somewhere it cannot write,
+download the new release by hand instead.
+
 ## Diagnostics
 
 Both interfaces write a dated log to `%LOCALAPPDATA%\osu-lazer-cleaner\logs\` on Windows and

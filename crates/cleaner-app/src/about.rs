@@ -7,12 +7,15 @@ use eframe::egui::{self, RichText};
 const REPOSITORY: &str = "https://github.com/handsomefox/osu-lazer-cleaner";
 
 /// Draws the About window while `open` is set, and clears it when the user closes it.
-pub(crate) fn show(ctx: &egui::Context, open: &mut bool) {
+///
+/// Returns true when the user asked for the update window, which replaces this one.
+pub(crate) fn show(ctx: &egui::Context, open: &mut bool) -> bool {
     if !*open {
-        return;
+        return false;
     }
 
     let mut close = false;
+    let mut updates = false;
     let response = egui::Modal::new(egui::Id::new("about")).show(ctx, |ui| {
         ui.set_max_width(440.0);
 
@@ -53,6 +56,13 @@ pub(crate) fn show(ctx: &egui::Context, open: &mut bool) {
             {
                 open_log_folder();
             }
+            if ui
+                .button(crate::icons::labelled(crate::icons::UPDATE, "App updates"))
+                .on_hover_text("Check for a new version and choose how often to check")
+                .clicked()
+            {
+                updates = true;
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Close").clicked() {
@@ -62,9 +72,11 @@ pub(crate) fn show(ctx: &egui::Context, open: &mut bool) {
         });
     });
 
-    if close || response.should_close() {
+    // Two modals cannot both take input, so the update window takes this one's place.
+    if close || updates || response.should_close() {
         *open = false;
     }
+    updates
 }
 
 /// Opens the log directory in the system file manager, so the user can pick up the file rather

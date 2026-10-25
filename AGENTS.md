@@ -18,6 +18,10 @@ The workspace is layered so that everything portable stays testable on Linux.
   allowed to depend on egui. `main` opens the window when there are no arguments and hands over
   to `cli` when there are. `assets/` carries the icon and the vendored fonts, and `build.rs`
   compiles `app.rc` so the executable carries the icon, the version, and the manifest.
+- `app-update` updates the app itself from its GitHub releases, on Windows and Linux. Its
+  `lib.rs` is byte-for-byte the same in all five apps, so change it in every app at once.
+  `cleaner-app/src/update.rs` holds this app's chip and window around it. Only the window
+  creates an updater, so the command line never contacts GitHub.
 
 The vendored Inter files have their Private Use Area cmap entries stripped. Upstream Inter maps
 stylistic-set alternates into U+E000..U+F8FF, where the Phosphor icon glyphs live, and Inter
