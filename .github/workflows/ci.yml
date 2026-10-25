@@ -129,14 +129,27 @@ jobs:
       # Before checkout: without git, actions/checkout downloads a tarball with no submodule.
       # archive.ubuntu.com throttles GitHub's runners to a crawl; the Azure mirror is the one
       # the runner images themselves use.
+      # A mirror connection that trickles bytes slips past apt's read timeout and has hung this
+      # step for over 15 minutes. Each attempt gets 5 minutes, and apt-get resumes partial
+      # downloads on the next one.
       - name: Install build tools
+        timeout-minutes: 17
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sed -i -E 's#http://(archive|security)\.ubuntu\.com/ubuntu#http://azure.archive.ubuntu.com/ubuntu#g' /etc/apt/sources.list
           printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\n' > /etc/apt/apt.conf.d/80-ci
-          apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates curl build-essential cmake clang libclang-dev
+          for attempt in 1 2 3; do
+            if timeout 300 apt-get update &&
+              timeout 300 apt-get install -y --no-install-recommends git ca-certificates curl build-essential cmake clang libclang-dev; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "apt-get failed or stalled on attempt $attempt; retrying"
+            dpkg --configure -a
+          done
           git config --global --add safe.directory '*'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
