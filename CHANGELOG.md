@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.5
+
+- Retry the Linux release build's package install when a mirror stalls, which used to hang the
+  build. The app is unchanged from 1.6.4.
+
 ## 1.6.4
 
 - Replace the yanked clipboard-win 5.4.1 with 5.4.3.
