@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.7.2
+
+- New installs check for a new version each time the window opens. Existing installs keep their
+  setting. To change it, open **About** > **App updates**.
+- Keep a found update visible after a restart. With a check period of a day or longer, a restart
+  hid the new version until the next check was due.
+- Remove the line in **App updates** that said no check had run, which appeared beside the time
+  of the last check.
+
 ## 1.7.1
 
 - Give osu!lazer Cleaner a new icon.
