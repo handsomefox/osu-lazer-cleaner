@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.1
+
+- Give osu!lazer Cleaner a new icon.
+- Update eframe and egui_extras to 0.37. The first launch after this update opens at the default
+  window size and position. Later launches remember the window again.
+- Update flate2 to 1.1.10, sha2 to 0.11.1, and zip to 9.2.0.
+
 ## 1.7.0
 
 - osu!lazer Cleaner can now update itself from its GitHub releases, on Windows and Linux. It
