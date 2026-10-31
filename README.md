@@ -152,8 +152,8 @@ osu!lazer will not open costs nothing but the time to rename the copy back.
 
 ## Updates
 
-The window checks this repository's GitHub releases for a new version once a day. To check
-more or less often, or never, open **About** > **App updates**. A check is one request to the
+The window checks this repository's GitHub releases for a new version each time it starts. To
+check less often, or never, open **About** > **App updates**. A check is one request to the
 GitHub API, and it sends nothing about you or your library. The command line never checks.
 
 When a new version is out, a chip in the header names it. Click the chip to read the notes of

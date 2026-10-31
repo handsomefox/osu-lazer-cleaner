@@ -144,12 +144,7 @@ fn status(ui: &mut egui::Ui, updater: &Updater, settings: &Settings) {
             .color(theme::GOOD),
         );
     } else {
-        ui.label(
-            RichText::new(format!(
-                "You have version {current}. It has not checked for a new version yet."
-            ))
-            .color(theme::MUTED),
-        );
+        ui.label(RichText::new(format!("You have version {current}.")).color(theme::MUTED));
     }
 }
 
