@@ -1407,7 +1407,7 @@ impl App {
 
         let (title, body, action, danger) = self.wording(modal);
 
-        egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
             ui.set_width(430.0);
             ui.label(egui::RichText::new(title).heading());
             ui.add_space(10.0);

@@ -69,7 +69,7 @@ pub(crate) fn show(
     let mut action = None;
     let mut close = false;
     let height = (ctx.content_rect().height() - 260.0).max(160.0);
-    let response = egui::Modal::new(egui::Id::new("app-update")).show(ctx, |ui| {
+    let response = egui::Modal::new(egui::Id::unique("app-update")).show(ctx, |ui| {
         ui.set_width(520.0);
         ui.label(
             RichText::new(icons::labelled(icons::UPDATE, "App updates"))
