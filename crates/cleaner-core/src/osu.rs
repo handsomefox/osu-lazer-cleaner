@@ -60,18 +60,6 @@ impl FileIndex {
         self.exact.iter()
     }
 
-    /// How many names the set owns.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.exact.len()
-    }
-
-    /// Whether the set owns no files at all.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.exact.is_empty()
-    }
-
     /// The hitsound filenames a custom sample index can refer to.
     ///
     /// `HitSampleInfo.LookupNames` resolves a sample to `{bank}-{name}{suffix}`, where the
@@ -103,12 +91,6 @@ impl FileIndex {
 
         self.hitsounds.borrow_mut().insert(index, names.clone());
         names
-    }
-}
-
-impl From<&BTreeSet<String>> for FileIndex {
-    fn from(names: &BTreeSet<String>) -> Self {
-        Self::new(names.iter().map(String::as_str))
     }
 }
 
@@ -173,22 +155,6 @@ impl References {
         self.videos.extend(other.videos);
         self.storyboard.extend(other.storyboard);
         self.hitsounds.extend(other.hitsounds);
-    }
-
-    /// Every filename mentioned, whatever its role.
-    #[must_use]
-    pub fn all(&self) -> BTreeSet<String> {
-        let mut all = BTreeSet::new();
-        for set in [
-            &self.audio,
-            &self.backgrounds,
-            &self.videos,
-            &self.storyboard,
-            &self.hitsounds,
-        ] {
-            all.extend(set.iter().cloned());
-        }
-        all
     }
 }
 
@@ -494,7 +460,7 @@ mod tests {
         let refs = parse(&text, SourceKind::Difficulty, &known);
         assert!(refs.storyboard.contains("sb/foo999999.png"));
         assert!(!refs.storyboard.contains("other.png"));
-        assert!(refs.storyboard.len() <= known.len());
+        assert!(refs.storyboard.len() <= known.names().count());
     }
 
     #[test]
