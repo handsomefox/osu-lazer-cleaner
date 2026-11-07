@@ -522,47 +522,11 @@ pub fn restore_blobs(
         expected.entry(&candidate.hash).or_insert(candidate.bytes);
     }
     let blobs: Vec<_> = expected.into_iter().collect();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let done = std::sync::atomic::AtomicUsize::new(0);
-    let failure: std::sync::Mutex<Option<SnapshotError>> = std::sync::Mutex::new(None);
-
-    std::thread::scope(|scope| {
-        let workers = std::thread::available_parallelism()
-            .map_or(4, std::num::NonZero::get)
-            .min(blobs.len());
-        let mut handles = Vec::with_capacity(workers);
-
-        for _ in 0..workers {
-            handles.push(scope.spawn(|| {
-                loop {
-                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some((hash, bytes)) = blobs.get(index) else {
-                        break;
-                    };
-
-                    if let Err(error) = restore_one(library, &snapshot.dir, hash, *bytes) {
-                        let mut slot = failure.lock().expect("restore mutex was poisoned");
-                        if slot.is_none() {
-                            *slot = Some(error);
-                        }
-                        break;
-                    }
-
-                    done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }));
-        }
-
-        // Report from this thread, so the caller's closure never has to be `Sync`.
-        while handles.iter().any(|handle| !handle.is_finished()) {
-            progress(done.load(std::sync::atomic::Ordering::Relaxed), blobs.len());
-            std::thread::sleep(std::time::Duration::from_millis(120));
-        }
-    });
-
-    if let Some(error) = failure.into_inner().expect("restore mutex was poisoned") {
-        return Err(error);
-    }
+    let restored = each_blob(
+        &blobs,
+        |hash, bytes| restore_one(library, &snapshot.dir, hash, bytes).map(|()| Some(bytes)),
+        progress,
+    )?;
 
     let directories: std::collections::HashSet<_> = blobs
         .iter()
@@ -579,7 +543,80 @@ pub fn restore_blobs(
         })?;
     }
 
-    Ok(done.load(std::sync::atomic::Ordering::Relaxed))
+    Ok(restored.len())
+}
+
+/// Runs one filesystem operation over every blob, across every core.
+///
+/// Reports progress from this thread, so the caller's closure never has to be `Sync`. The
+/// first error stops the other workers rather than letting them finish a queue that can hold
+/// hundreds of thousands of entries.
+pub(crate) fn each_blob(
+    blobs: &[(&str, u64)],
+    operation: impl Fn(&str, u64) -> Result<Option<u64>, SnapshotError> + Sync,
+    progress: &mut impl FnMut(usize, usize),
+) -> Result<Vec<(String, u64)>, SnapshotError> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let collected = std::sync::Mutex::new(Vec::new());
+    let failure: std::sync::Mutex<Option<SnapshotError>> = std::sync::Mutex::new(None);
+
+    std::thread::scope(|scope| {
+        let workers = std::thread::available_parallelism()
+            .map_or(4, std::num::NonZero::get)
+            .min(blobs.len());
+        let mut handles = Vec::with_capacity(workers);
+
+        for _ in 0..workers {
+            handles.push(scope.spawn(|| {
+                let mut local = Vec::new();
+
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&(hash, size)) = blobs.get(index) else {
+                        break;
+                    };
+
+                    match operation(hash, size) {
+                        Ok(Some(size)) => local.push((hash.to_owned(), size)),
+                        Ok(None) => {}
+                        Err(error) => {
+                            let mut slot = failure.lock().expect("blob mutex was poisoned");
+                            if slot.is_none() {
+                                *slot = Some(error);
+                            }
+                            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                    }
+
+                    done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                collected
+                    .lock()
+                    .expect("blob mutex was poisoned")
+                    .push(local);
+            }));
+        }
+
+        while handles.iter().any(|handle| !handle.is_finished()) {
+            progress(done.load(std::sync::atomic::Ordering::Relaxed), blobs.len());
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
+    });
+
+    if let Some(error) = failure.into_inner().expect("blob mutex was poisoned") {
+        return Err(error);
+    }
+
+    Ok(collected
+        .into_inner()
+        .expect("blob mutex was poisoned")
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 /// Installs one blob without giving up the snapshot's recovery link.
