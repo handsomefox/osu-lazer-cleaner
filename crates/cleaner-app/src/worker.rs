@@ -211,28 +211,29 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
     // The name only: a Clean carries the whole plan, which is megabytes of Debug output.
     tracing::info!(command = command.name(), "handling a command");
 
+    // The window locks its input until the worker answers, so every command that needs a
+    // library has to report its absence rather than return without a word.
+    let Some(current) = library.as_ref() else {
+        match command {
+            Command::OpenLibrary => open(library, events),
+            _ => report(failed_message("no library is open".to_owned())),
+        }
+        return;
+    };
+
     match command {
         Command::OpenLibrary => open(library, events),
 
-        Command::Scan { selected } => match library.as_ref() {
-            Some(library) => report(scan(library, &selected, events)),
-            None => report(failed_message("no library is open".to_owned())),
-        },
+        Command::Scan { selected } => report(scan(current, &selected, events)),
 
         Command::Clean { plan } => {
-            if let Some(library) = library.as_ref() {
-                report(clean(library, &plan, events));
-                // A clean that fails after its commit still leaves a snapshot, and the window
-                // has to offer it rather than showing only the error.
-                report(snapshot_event(library));
-            }
+            report(clean(current, &plan, events));
+            // A clean that fails after its commit still leaves a snapshot, and the window
+            // has to offer it rather than showing only the error.
+            report(snapshot_event(current));
         }
 
-        Command::ListSnapshots => {
-            if let Some(library) = library.as_ref() {
-                report(snapshot_event(library));
-            }
-        }
+        Command::ListSnapshots => report(snapshot_event(current)),
 
         Command::RestoreSnapshot { id } => {
             let reporter = events.clone();
@@ -240,20 +241,14 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
                 message: "Restore finished",
                 library_changed: true,
             };
-            act_on_snapshot(
-                library.as_ref(),
-                &id,
-                events,
-                done,
-                move |library, snapshot| {
-                    cleaner_core::restore(library, snapshot, |progress| {
-                        let _ = reporter.send(Event::Progress {
-                            message: describe_clean(progress),
-                        });
-                    })
-                    .map(|_| ())
-                },
-            );
+            act_on_snapshot(current, &id, events, done, move |library, snapshot| {
+                cleaner_core::restore(library, snapshot, |progress| {
+                    let _ = reporter.send(Event::Progress {
+                        message: describe_clean(progress),
+                    });
+                })
+                .map(|_| ())
+            });
         }
 
         Command::DeleteSnapshot { id } => {
@@ -261,33 +256,25 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
                 message: "Snapshot deleted",
                 library_changed: false,
             };
-            act_on_snapshot(library.as_ref(), &id, events, done, snapshot::delete);
+            act_on_snapshot(current, &id, events, done, snapshot::delete);
         }
 
         Command::Compact => {
-            let Some(library) = library.as_ref() else {
-                return;
-            };
-
-            report(match cleaner_core::compact(library) {
+            report(match cleaner_core::compact(current) {
                 Ok(result) => Event::Compacted { result },
                 Err(error) => failed(&error),
             });
-            report(snapshot_event(library));
+            report(snapshot_event(current));
         }
 
         Command::RemoveDatabaseBackup { name } => {
-            let Some(library) = library.as_ref() else {
-                return;
-            };
-
-            match cleaner_core::remove_database_backup(library, &name) {
+            match cleaner_core::remove_database_backup(current, &name) {
                 Ok(()) => {
                     report(Event::Finished {
                         message: "Copy deleted",
                         library_changed: false,
                     });
-                    report(snapshot_event(library));
+                    report(snapshot_event(current));
                 }
                 Err(error) => report(failed(&error)),
             }
@@ -359,16 +346,12 @@ fn database_bytes(library: &Library) -> u64 {
 
 /// Applies an operation to the named snapshot, then refreshes the list.
 fn act_on_snapshot(
-    library: Option<&Library>,
+    library: &Library,
     id: &str,
     events: &Sender<Event>,
     done: Event,
     operation: impl FnOnce(&Library, &Snapshot) -> Result<(), cleaner_core::SnapshotError>,
 ) {
-    let Some(library) = library else {
-        return;
-    };
-
     let entries = match snapshot::list(library) {
         Ok(entries) => entries,
         Err(error) => {
@@ -456,4 +439,43 @@ fn failed(error: &dyn std::error::Error) -> Event {
 fn failed_message(message: String) -> Event {
     tracing::error!("{message}");
     Event::Failed { message }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Everything `handle` reported for one command.
+    fn events_for(library: &mut Option<Library>, command: Command) -> Vec<Event> {
+        let (sender, receiver) = unbounded();
+        handle(library, command, &sender);
+        receiver.try_iter().collect()
+    }
+
+    #[test]
+    fn every_command_without_a_library_reports_a_failure() {
+        let commands = [
+            Command::Scan {
+                selected: HashSet::new(),
+            },
+            Command::Clean {
+                plan: Box::default(),
+            },
+            Command::ListSnapshots,
+            Command::RestoreSnapshot { id: "x".to_owned() },
+            Command::DeleteSnapshot { id: "x".to_owned() },
+            Command::Compact,
+            Command::RemoveDatabaseBackup {
+                name: "x".to_owned(),
+            },
+        ];
+        for command in commands {
+            let name = command.name();
+            let events = events_for(&mut None, command);
+            assert!(
+                matches!(events.as_slice(), [Event::Failed { .. }]),
+                "{name} reported {events:?}"
+            );
+        }
+    }
 }
