@@ -11,6 +11,7 @@
 
 use crate::durability;
 use crate::error::SnapshotError;
+use crate::format::elapsed_ms;
 use crate::operation::OperationLock;
 use crate::plan::{Options, Plan};
 use crate::snapshot::{self, Manifest, Snapshot};
@@ -161,11 +162,6 @@ pub fn run(
         snapshot: Some(final_dir),
         dry_run: false,
     })
-}
-
-/// Milliseconds since `started`, saturating rather than panicking on a huge value.
-fn elapsed_ms(started: std::time::Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// What a committed clean produced: usages detached, where the snapshot went, and what it holds.

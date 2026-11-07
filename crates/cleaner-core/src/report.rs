@@ -5,7 +5,7 @@
 //! it to the numbers worth looking at, with a handful of examples per category so the
 //! classifier's decisions can be checked by eye.
 
-use crate::format::human_bytes;
+use crate::format::{human_bytes, seconds};
 use crate::plan::{Plan, Timings};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -208,16 +208,6 @@ pub fn render(report: &Report) -> String {
     }
 
     out
-}
-
-/// Formats milliseconds as seconds with one decimal.
-fn seconds(ms: u64) -> String {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "display-only approximation of a duration"
-    )]
-    let value = ms as f64 / 1000.0;
-    format!("{value:.1}s")
 }
 
 /// Lowercase extension of a filename, or a placeholder when it has none.

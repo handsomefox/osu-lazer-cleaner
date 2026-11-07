@@ -6,6 +6,7 @@
 
 use crate::catalog::{self, Category};
 use crate::error::ScanError;
+use crate::format::elapsed_ms;
 use crate::osu::{self, SourceKind};
 use crate::plan::{Candidate, Group, NO_SET, NO_SET_INDEX, Plan, Progress, SetId, Timings};
 use crate::skin;
@@ -115,11 +116,6 @@ pub fn build_plan(
         "scan finished"
     );
     Ok(plan)
-}
-
-/// Milliseconds since `started`, saturating rather than panicking on a huge value.
-fn elapsed_ms(started: std::time::Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Classifies every set, reading their difficulty files in parallel.

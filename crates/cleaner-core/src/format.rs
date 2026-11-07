@@ -17,6 +17,34 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Formats milliseconds as seconds with one decimal.
+#[must_use]
+pub fn seconds(ms: u64) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "display-only approximation of a duration"
+    )]
+    let value = ms as f64 / 1000.0;
+    format!("{value:.1}s")
+}
+
+/// When something happened, to the minute, in the reader's own time zone.
+///
+/// Snapshots and database copies record UTC, which displayed raw reads as
+/// `2026-09-07T21:29:16.7635384Z`. Nobody needs sub-second precision to recognise which clean
+/// they are looking at.
+#[must_use]
+pub fn local_time(at: jiff::Timestamp) -> String {
+    at.to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%Y-%m-%d %H:%M")
+        .to_string()
+}
+
+/// Milliseconds since `started`, saturating rather than panicking on a huge value.
+pub(crate) fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Items per second, for a log line that has to show whether a machine is slow.
 ///
 /// An operation that finished inside a millisecond is measured as one millisecond, so the rate

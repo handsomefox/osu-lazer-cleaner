@@ -9,6 +9,7 @@
 )]
 
 use clap::{Parser, Subcommand};
+use cleaner_core::format::{local_time, seconds};
 use cleaner_core::{Category, Library, Options, Plan, human_bytes, snapshot};
 use std::collections::HashSet;
 use std::io::Write;
@@ -314,16 +315,6 @@ fn report_clean(progress: cleaner_core::CleanProgress) {
     }
 }
 
-/// Formats milliseconds as seconds with one decimal.
-fn seconds(ms: u64) -> String {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "display-only approximation of a duration"
-    )]
-    let value = ms as f64 / 1000.0;
-    format!("{value:.1}s")
-}
-
 /// Removes the selected categories.
 fn clean(
     cli: &Cli,
@@ -512,11 +503,7 @@ fn list_snapshots(
             entry.id(),
             entry.manifest.blobs.len(),
             human_bytes(entry.manifest.bytes()),
-            entry
-                .manifest
-                .created
-                .to_zoned(jiff::tz::TimeZone::system())
-                .strftime("%Y-%m-%d %H:%M")
+            local_time(entry.manifest.created)
         )?;
     }
     Ok(())

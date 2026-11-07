@@ -3,6 +3,7 @@
 use crate::icons;
 use crate::theme;
 use crate::worker::{BackupSummary, Command, Event, SnapshotSummary, Worker};
+use cleaner_core::format::seconds;
 use cleaner_core::{Category, Plan, SetEntry, Totals, human_bytes};
 use eframe::egui;
 use std::collections::HashSet;
@@ -1609,16 +1610,6 @@ fn scan_timings(plan: &Plan) -> String {
         theme::grouped(timings.sets_parsed),
         theme::grouped(plan.sets_scanned)
     )
-}
-
-/// Formats milliseconds as seconds with one decimal.
-fn seconds(ms: u64) -> String {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "display-only approximation of a duration"
-    )]
-    let value = ms as f64 / 1000.0;
-    format!("{value:.1}s")
 }
 
 /// Positions of the beatmap sets whose title contains `search`, ignoring case.
