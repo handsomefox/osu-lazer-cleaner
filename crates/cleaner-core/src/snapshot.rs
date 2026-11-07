@@ -14,7 +14,7 @@ use crate::error::SnapshotError;
 use crate::operation::OperationLock;
 use crate::plan::Candidate;
 use crate::safety::is_safe_path;
-use crate::storage::Library;
+use crate::storage::{Library, is_blob_hash};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ fn guard(library: &Library, path: &Path) -> Result<(), SnapshotError> {
 }
 
 fn validate_hash(hash: &str) -> Result<(), SnapshotError> {
-    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !is_blob_hash(hash) {
         return Err(SnapshotError::OutsideLibrary {
             path: PathBuf::from(hash),
         });

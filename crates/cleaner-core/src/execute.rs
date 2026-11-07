@@ -15,7 +15,7 @@ use crate::format::elapsed_ms;
 use crate::operation::OperationLock;
 use crate::plan::{Options, Plan};
 use crate::snapshot::{self, Manifest, Snapshot};
-use crate::storage::Library;
+use crate::storage::{Library, is_blob_hash};
 use cleaner_realm::{Realm, Removal, Restoration};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -237,7 +237,7 @@ fn validate_candidates<'a>(
     let mut remaining = current.usage_counts.clone();
     let mut seen = std::collections::HashSet::new();
     for candidate in candidates {
-        if candidate.hash.len() != 64 || !candidate.hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !is_blob_hash(&candidate.hash) {
             return Err(SnapshotError::StalePlan);
         }
         if candidate.set_index == crate::plan::NO_SET_INDEX {

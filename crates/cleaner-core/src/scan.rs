@@ -10,7 +10,7 @@ use crate::format::elapsed_ms;
 use crate::osu::{self, SourceKind};
 use crate::plan::{Candidate, Group, NO_SET, NO_SET_INDEX, Plan, Progress, SetId, Timings};
 use crate::skin;
-use crate::storage::Library;
+use crate::storage::{Library, is_blob_hash};
 use cleaner_realm::Realm;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -645,7 +645,7 @@ fn measure_shard(
         };
 
         // Blob names are hex SHA-256. Anything else is lazer's own README.
-        if !is_blob_name(name) {
+        if !is_blob_hash(name) {
             continue;
         }
 
@@ -670,11 +670,6 @@ fn copy_database(library: &Library, scratch: &Path) -> Result<std::path::PathBuf
     })?;
 
     Ok(destination)
-}
-
-/// Reports whether a name is a 64-character lowercase hex digest.
-fn is_blob_name(name: &str) -> bool {
-    name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Case-insensitive extension test, matching how lazer compares filenames.
@@ -1119,13 +1114,6 @@ mod tests {
             ),
             Some(Category::Storyboards)
         );
-    }
-
-    #[test]
-    fn blob_names_are_full_hex_digests() {
-        assert!(is_blob_name(&"a".repeat(64)));
-        assert!(!is_blob_name(&"a".repeat(63)));
-        assert!(!is_blob_name("IMPORTANT READ ME.txt"));
     }
 
     #[test]

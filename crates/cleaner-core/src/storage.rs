@@ -104,6 +104,11 @@ impl Library {
     }
 }
 
+/// Reports whether a name is a 64-character hex SHA-256, the only name a blob can have.
+pub(crate) fn is_blob_hash(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Builds the `files/`-relative path for a hash.
 #[must_use]
 pub fn blob_relative_path(hash: &str) -> PathBuf {
@@ -224,6 +229,13 @@ fn windows_roots_from_wsl() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blob_names_are_full_hex_digests() {
+        assert!(is_blob_hash(&"a".repeat(64)));
+        assert!(!is_blob_hash(&"a".repeat(63)));
+        assert!(!is_blob_hash("IMPORTANT READ ME.txt"));
+    }
 
     #[test]
     fn blob_path_nests_by_hash_prefix() {
