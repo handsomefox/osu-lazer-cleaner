@@ -14,12 +14,6 @@ pub const FILES_DIRECTORY: &str = "files";
 /// File that redirects to a custom data directory, read by `StorageConfigManager`.
 const STORAGE_CONFIG: &str = "storage.ini";
 
-/// Suffixes realm-core owns beside the database. Never move, copy, or delete these.
-///
-/// The same list appears in lazer's `OsuStorage.IgnoreSuffixes`, where the comment reads
-/// "Realm pipe files don't play well with copy operations".
-pub const REALM_SIDECAR_SUFFIXES: &[&str] = &[".lock", ".note", ".management"];
-
 /// A located osu!lazer data directory.
 #[derive(Debug, Clone)]
 pub struct Library {

@@ -210,7 +210,7 @@ impl App {
             .unwrap_or_default();
 
         let worker = Worker::spawn(ctx.clone());
-        worker.send(Command::OpenLibrary { path: None });
+        worker.send(Command::OpenLibrary);
 
         Self {
             worker,

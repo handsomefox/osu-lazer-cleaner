@@ -1,7 +1,6 @@
 //! What a scan found and what a clean would do.
 
 use crate::catalog::Category;
-use crate::format::human_bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -397,13 +396,6 @@ impl Plan {
             Some(title) if !title.is_empty() => title.clone(),
             _ => "Untitled beatmap set".to_owned(),
         }
-    }
-
-    /// A short human summary of what is selected.
-    #[must_use]
-    pub fn summary(&self) -> String {
-        let totals = self.selected_totals();
-        format!("{} files, {}", totals.files, human_bytes(totals.bytes))
     }
 }
 

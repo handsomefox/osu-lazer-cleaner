@@ -14,7 +14,7 @@ use crate::error::SnapshotError;
 use crate::operation::OperationLock;
 use crate::plan::Candidate;
 use crate::safety::is_safe_path;
-use crate::storage::{Library, blob_relative_path};
+use crate::storage::Library;
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -869,13 +869,6 @@ fn unique_dir(temp_dir: &Path, created: jiff::Timestamp) -> PathBuf {
     candidate
 }
 
-/// Where a blob lives inside the library, relative to `files/`. Re-exported for callers that
-/// build paths without a [`Library`].
-#[must_use]
-pub fn blob_location(hash: &str) -> PathBuf {
-    blob_relative_path(hash)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -887,7 +880,7 @@ mod tests {
 
         let blob = root
             .join(crate::storage::FILES_DIRECTORY)
-            .join(blob_relative_path(hash));
+            .join(crate::storage::blob_relative_path(hash));
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
         std::fs::write(&blob, bytes).unwrap();
 

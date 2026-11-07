@@ -37,10 +37,6 @@ pub enum ScanError {
         /// Underlying cause.
         source: std::io::Error,
     },
-
-    /// osu!lazer is running, or another process holds the database.
-    #[error("the osu!lazer database is in use; close osu!lazer and try again")]
-    DatabaseInUse,
 }
 
 /// Failures while creating, restoring, or deleting a snapshot.

@@ -5,11 +5,10 @@
 //! it to the numbers worth looking at, with a handful of examples per category so the
 //! classifier's decisions can be checked by eye.
 
-use crate::catalog::Category;
 use crate::format::human_bytes;
 use crate::plan::{Plan, Timings};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 /// How many example filenames to keep per category.
 const EXAMPLES: usize = 12;
@@ -230,20 +229,10 @@ fn extension_of(filename: &str) -> String {
     )
 }
 
-/// Counts how many distinct files each category would remove, keyed by slug.
-///
-/// Exposed for callers that want the totals without the rest of the report.
-#[must_use]
-pub fn files_by_category(plan: &Plan) -> HashMap<Category, usize> {
-    plan.totals_by_category()
-        .into_iter()
-        .map(|(category, totals)| (category, totals.files))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Category;
     use crate::plan::{Candidate, Group};
 
     fn candidate(hash: &str, name: &str, usages: u32) -> Candidate {

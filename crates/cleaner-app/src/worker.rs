@@ -13,11 +13,8 @@ use std::path::PathBuf;
 /// Work the interface asks for.
 #[derive(Debug)]
 pub(crate) enum Command {
-    /// Find a library, either at `path` or in the default locations.
-    OpenLibrary {
-        /// Explicit directory, or `None` to search.
-        path: Option<PathBuf>,
-    },
+    /// Find a library in the default locations.
+    OpenLibrary,
     /// Scan the open library.
     Scan {
         /// Categories that start selected.
@@ -53,7 +50,7 @@ impl Command {
     /// A short name for the log. The command itself is too large to print.
     fn name(&self) -> &'static str {
         match self {
-            Self::OpenLibrary { .. } => "open library",
+            Self::OpenLibrary => "open library",
             Self::Scan { .. } => "scan",
             Self::Clean { .. } => "clean",
             Self::ListSnapshots => "list snapshots",
@@ -225,7 +222,7 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
     tracing::info!(command = command.name(), "handling a command");
 
     match command {
-        Command::OpenLibrary { path } => open(library, path.as_deref(), events),
+        Command::OpenLibrary => open(library, events),
 
         Command::Scan { selected } => match library.as_ref() {
             Some(library) => report(scan(library, &selected, events)),
@@ -309,13 +306,8 @@ fn handle(library: &mut Option<Library>, command: Command, events: &Sender<Event
 }
 
 /// Finds a library and keeps it for every command that follows.
-fn open(library: &mut Option<Library>, path: Option<&std::path::Path>, events: &Sender<Event>) {
-    let opened = match path {
-        Some(path) => Library::open(path),
-        None => Library::discover(),
-    };
-
-    match opened {
+fn open(library: &mut Option<Library>, events: &Sender<Event>) {
+    match Library::discover() {
         Ok(found) => {
             let _ = events.send(Event::LibraryOpened {
                 root: found.root().to_path_buf(),
