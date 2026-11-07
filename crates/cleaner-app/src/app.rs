@@ -117,14 +117,14 @@ impl Activity {
 }
 
 /// A question the user has to answer before anything happens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Question {
     /// About to remove files.
     Clean,
-    /// About to delete a snapshot, which cannot be undone.
-    Delete,
-    /// About to move a snapshot's files back into the library.
-    Restore,
+    /// About to delete the named snapshot, which cannot be undone.
+    Delete(String),
+    /// About to move the named snapshot's files back into the library.
+    Restore(String),
     /// Closing while work is in flight.
     Quit(Activity),
 }
@@ -176,8 +176,6 @@ pub(crate) struct App {
     /// What the last compaction did, if one has run.
     compaction: Option<cleaner_core::Compaction>,
     modal: Option<Question>,
-    /// Snapshot the open question refers to, for restore and delete.
-    pending_snapshot: Option<String>,
     last_result: Option<String>,
     /// Whether the About modal is open.
     about: bool,
@@ -237,7 +235,6 @@ impl App {
             database_bytes: 0,
             compaction: None,
             modal: None,
-            pending_snapshot: None,
             last_result: None,
             about: false,
             updater: app_update::Updater::new(crate::update::APP_INFO, {
@@ -1185,8 +1182,7 @@ impl App {
                         .button(icons::labelled(icons::DELETE, "Delete"))
                         .clicked()
                     {
-                        self.pending_snapshot = Some(entry.id.clone());
-                        self.modal = Some(Question::Delete);
+                        self.modal = Some(Question::Delete(entry.id.clone()));
                     }
                 });
 
@@ -1195,8 +1191,7 @@ impl App {
                     if !newest {
                         button.on_disabled_hover_text("Restore the snapshot above this one first.");
                     } else if button.clicked() {
-                        self.pending_snapshot = Some(entry.id.clone());
-                        self.modal = Some(Question::Restore);
+                        self.modal = Some(Question::Restore(entry.id.clone()));
                     }
                 });
 
@@ -1318,7 +1313,7 @@ impl App {
     ///
     /// Returns the title, the body, the label on the acting button, and whether that button
     /// should read as dangerous.
-    fn wording(&self, modal: Question) -> (&'static str, String, &'static str, bool) {
+    fn wording(&self, modal: &Question) -> (&'static str, String, &'static str, bool) {
         match modal {
             Question::Clean => {
                 let totals = self.selected_totals;
@@ -1355,11 +1350,8 @@ impl App {
                     false,
                 )
             }
-            Question::Restore => {
-                let entry = self
-                    .pending_snapshot
-                    .as_ref()
-                    .and_then(|id| self.snapshots.iter().find(|s| &s.id == id));
+            Question::Restore(id) => {
+                let entry = self.snapshots.iter().find(|s| &s.id == id);
                 let files = entry.map_or(0, |s| s.files);
                 let size = entry.map_or_else(String::new, |s| human_bytes(s.bytes));
                 (
@@ -1373,11 +1365,11 @@ impl App {
                     false,
                 )
             }
-            Question::Delete => {
+            Question::Delete(id) => {
                 let size = self
-                    .pending_snapshot
-                    .as_ref()
-                    .and_then(|id| self.snapshots.iter().find(|s| &s.id == id))
+                    .snapshots
+                    .iter()
+                    .find(|s| &s.id == id)
                     .map_or_else(String::new, |s| human_bytes(s.bytes));
                 (
                     "Delete this snapshot?",
@@ -1404,11 +1396,11 @@ impl App {
 
     /// Draws whichever question is open.
     fn show_modal(&mut self, ctx: &egui::Context) {
-        let Some(modal) = self.modal else {
+        let Some(modal) = self.modal.clone() else {
             return;
         };
 
-        let (title, body, action, danger) = self.wording(modal);
+        let (title, body, action, danger) = self.wording(&modal);
 
         egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
             ui.set_width(430.0);
@@ -1423,19 +1415,16 @@ impl App {
                     egui::Button::new(egui::RichText::new(action).color(theme::BASE)).fill(fill);
 
                 if ui.add(button).clicked() {
-                    match modal {
+                    match &modal {
                         Question::Clean => self.confirm_clean(),
-                        Question::Restore => {
-                            if let Some(id) = self.pending_snapshot.take() {
-                                self.activity = Some(Activity::Restoring);
-                                self.worker.send(Command::RestoreSnapshot { id });
-                            }
+                        Question::Restore(id) => {
+                            self.activity = Some(Activity::Restoring);
+                            self.worker
+                                .send(Command::RestoreSnapshot { id: id.clone() });
                         }
-                        Question::Delete => {
-                            if let Some(id) = self.pending_snapshot.take() {
-                                self.activity = Some(Activity::Deleting);
-                                self.worker.send(Command::DeleteSnapshot { id });
-                            }
+                        Question::Delete(id) => {
+                            self.activity = Some(Activity::Deleting);
+                            self.worker.send(Command::DeleteSnapshot { id: id.clone() });
                         }
                         Question::Quit(_) => {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1450,7 +1439,6 @@ impl App {
                     "Cancel"
                 };
                 if ui.button(cancel).clicked() {
-                    self.pending_snapshot = None;
                     self.modal = None;
                 }
             });
