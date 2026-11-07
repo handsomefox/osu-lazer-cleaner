@@ -299,14 +299,16 @@ impl App {
                     ));
                     "Clean finished".clone_into(&mut self.status);
                     self.plan = None;
+                    // The worker lists the snapshots straight after a clean, so the new one
+                    // shows up without asking for it.
                     self.activity = Some(Activity::ListingSnapshots);
-                    self.worker.send(Command::ListSnapshots);
                 }
                 Event::Compacted { result } => {
                     self.database_bytes = result.after;
                     "Compact finished".clone_into(&mut self.status);
                     self.compaction = Some(result);
-                    self.activity = None;
+                    // Followed by the snapshot list, which carries the new copy of the database.
+                    self.activity = Some(Activity::ListingSnapshots);
                 }
                 Event::Snapshots { entries, backups } => {
                     self.snapshots = entries;

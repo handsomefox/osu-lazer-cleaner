@@ -478,4 +478,27 @@ mod tests {
             );
         }
     }
+    /// The window waits on this list after a clean or a compaction instead of asking for it.
+    #[test]
+    fn a_clean_and_a_compaction_end_with_the_snapshot_list() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("client.realm"), b"stub").unwrap();
+        let mut library = Some(Library::open(directory.path()).unwrap());
+
+        let commands = [
+            Command::Clean {
+                plan: Box::default(),
+            },
+            // The stub is no database, so this one fails, and must still list.
+            Command::Compact,
+        ];
+        for command in commands {
+            let name = command.name();
+            let events = events_for(&mut library, command);
+            assert!(
+                matches!(events.as_slice(), [_, Event::Snapshots { .. }]),
+                "{name} reported {events:?}"
+            );
+        }
+    }
 }
