@@ -360,17 +360,17 @@ fn act_on_snapshot(
         }
     };
 
-    let Some(target) = entries.iter().find(|s| s.id() == id) else {
-        let _ = events.send(failed_message(format!("no snapshot named '{id}'")));
-        return;
+    let outcome = match entries.iter().find(|s| s.id() == id) {
+        Some(target) => match operation(library, target) {
+            Ok(()) => done,
+            Err(error) => failed(&error),
+        },
+        None => failed_message(format!("no snapshot named '{id}'")),
     };
+    let _ = events.send(outcome);
 
-    if let Err(error) = operation(library, target) {
-        let _ = events.send(failed(&error));
-        return;
-    }
-
-    let _ = events.send(done);
+    // Refreshed after a failure too. A snapshot the command line already removed, or one a
+    // failed operation left half gone, would otherwise stay on screen and fail every click.
     let _ = events.send(snapshot_event(library));
 }
 
@@ -497,6 +497,32 @@ mod tests {
             let events = events_for(&mut library, command);
             assert!(
                 matches!(events.as_slice(), [_, Event::Snapshots { .. }]),
+                "{name} reported {events:?}"
+            );
+        }
+    }
+    #[test]
+    fn a_failed_snapshot_operation_still_refreshes_the_list() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("client.realm"), b"stub").unwrap();
+        let mut library = Some(Library::open(directory.path()).unwrap());
+
+        let commands = [
+            Command::RestoreSnapshot {
+                id: "gone".to_owned(),
+            },
+            Command::DeleteSnapshot {
+                id: "gone".to_owned(),
+            },
+        ];
+        for command in commands {
+            let name = command.name();
+            let events = events_for(&mut library, command);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [Event::Failed { .. }, Event::Snapshots { .. }]
+                ),
                 "{name} reported {events:?}"
             );
         }
