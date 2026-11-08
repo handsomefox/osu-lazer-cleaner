@@ -380,7 +380,7 @@ pub fn compact(library: &Library) -> Result<Compaction, SnapshotError> {
     })
 }
 
-/// Copies `client.realm` beside the snapshots, replacing the previous copy.
+/// Copies `client.realm` beside the snapshots under a new name, then prunes the oldest copies.
 ///
 /// The copy lands under a temporary name and is renamed into place, so an interrupted copy
 /// never replaces a good one with a truncated file.

@@ -128,7 +128,7 @@ pub struct Restoration {
 /// A usage to detach from a beatmap set.
 #[derive(Debug, Clone, Copy)]
 pub struct Removal {
-    /// Index of the owning set, as reported by [`Realm::beatmap_sets`].
+    /// Index of the owning set, as reported by [`Realm::read_library`].
     pub set_index: usize,
     /// Index of the file within that set's list.
     pub file_index: usize,
@@ -331,7 +331,7 @@ impl Realm {
     /// declared one. `ADDITIVE_DISCOVERED` is that mode: combined with a null schema it adds
     /// nothing, and the migration callback only fires for `AUTOMATIC` and `MANUAL`.
     ///
-    /// `open_preserves_schema` asserts the property that matters — that a full
+    /// `writing_does_not_migrate_the_database` asserts the property that matters — that a full
     /// open/write/commit cycle leaves the schema version and class list untouched.
     ///
     /// # Errors
