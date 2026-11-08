@@ -11,6 +11,7 @@
 
 use crate::durability;
 use crate::error::SnapshotError;
+use crate::format::elapsed_ms;
 use crate::operation::OperationLock;
 use crate::plan::Candidate;
 use crate::safety::is_safe_path;
@@ -792,6 +793,7 @@ fn matches_hash(path: &Path, hash: &str) -> std::io::Result<bool> {
 /// library's snapshots directory, or [`SnapshotError::Io`] if removal fails.
 pub fn delete(library: &Library, snapshot: &Snapshot) -> Result<(), SnapshotError> {
     let _lock = OperationLock::acquire(library)?;
+    let started = std::time::Instant::now();
     validate_snapshot_dir(library, &snapshot.dir)?;
     // Read the current manifest under the operation lock, not a cached interface summary.
     let current = reload(library, snapshot)?;
@@ -828,6 +830,7 @@ pub fn delete(library: &Library, snapshot: &Snapshot) -> Result<(), SnapshotErro
         snapshot = %current.dir.display(),
         blobs,
         bytes,
+        ms = elapsed_ms(started),
         "snapshot deleted"
     );
     Ok(())
