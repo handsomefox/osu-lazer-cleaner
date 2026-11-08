@@ -104,21 +104,14 @@ cargo run -p cleaner-realm --features test-support --example slim -- \
     ref/client.realm ref/client-slim.realm 400
 ```
 
-## Bump CI pins by hand
+## CI and releases
 
-`scripts/install-ci-tool.sh` downloads cargo-audit, cargo-machete, actionlint, and zizmor from
-their release pages and checks each archive against a pinned SHA-256 before it extracts
-anything. The Linux jobs run in `ubuntu:22.04` pinned by digest, and install rustup from a
-`rustup-init` pinned by hash. Dependabot cannot bump any of these. To bump a tool, change its row
-in the script and take the new hash from the digest GitHub records for the asset:
+`.github/workflows/ci.yml` and `release.yml` only call the shared workflows in
+[handsomefox/app-workflows](https://github.com/handsomefox/app-workflows), pinned by commit. This app turns on
+their Linux build and glibc floor check, and recursive submodule checkouts. The checks, the
+release steps, the CI tool pins, and the pinned `ubuntu:22.04` image and `rustup-init` live
+there, and its `AGENTS.md` covers changing them. `scripts/check-linux-floor.sh` stays here,
+because only this app ships for Linux. Dependabot moves the pin when that repository releases.
 
-```
-gh release view <tag> -R <owner>/<repo> --json assets --jq '.assets[] | select(.name == "<asset>") | .digest'
-```
-
-`docker buildx imagetools inspect ubuntu:22.04` prints the image's current digest.
-`https://static.rust-lang.org/rustup/archive/<version>/x86_64-unknown-linux-gnu/rustup-init.sha256`
-holds the hash for a rustup release.
-
-CI runs actionlint, shellcheck, and `zizmor --persona pedantic` on every push. Run all three
-before you push a workflow change.
+CI runs actionlint and `zizmor --persona pedantic` on every push. Run both before you push a
+workflow change.

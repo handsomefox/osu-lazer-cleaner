@@ -214,9 +214,8 @@ cargo run -p cleaner-core --example demo_library -- /tmp/demo
 It invents 240 beatmap sets and writes their files as sparse files, so the sizes the window
 reports are real while the directory costs two megabytes.
 
-Cross-compile the Windows release archive from Linux with `scripts/package-windows.sh`, which
-needs `cargo-xwin` 0.23.1 and packs `dist/` the way a release does. The same tool lints against the Windows target, which is worth running before
-pushing because some differences appear only there:
+`cargo-xwin` lints against the Windows target from Linux, which is worth running before pushing
+because some differences appear only there:
 
 ```
 cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
