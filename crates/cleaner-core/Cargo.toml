@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 app-folders.workspace = true
-cleaner-realm = { version = "=1.7.4", path = "../cleaner-realm" }
+cleaner-realm = { version = "=1.7.5", path = "../cleaner-realm" }
 jiff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,7 +22,7 @@ tracing.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
-cleaner-realm = { version = "=1.7.4", path = "../cleaner-realm", features = ["test-support"] }
+cleaner-realm = { version = "=1.7.5", path = "../cleaner-realm", features = ["test-support"] }
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]

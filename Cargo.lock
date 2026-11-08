@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "cleaner-app"
-version = "1.7.4"
+version = "1.7.5"
 dependencies = [
  "app-diagnostics",
  "app-folders",
@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "cleaner-core"
-version = "1.7.4"
+version = "1.7.5"
 dependencies = [
  "app-folders",
  "cleaner-realm",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "cleaner-realm"
-version = "1.7.4"
+version = "1.7.5"
 dependencies = [
  "bindgen",
  "cmake",
