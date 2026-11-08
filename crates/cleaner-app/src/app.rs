@@ -129,6 +129,46 @@ enum Question {
     Quit(Activity),
 }
 
+/// The beatmap-set list open under one category.
+struct Browse {
+    /// Category whose sets are listed.
+    category: Category,
+    /// Search text for the list.
+    search: String,
+    /// Beatmap sets in the category, largest first.
+    sets: Vec<SetEntry>,
+    /// Positions in `sets` whose title matches `search`.
+    ///
+    /// Kept rather than recomputed every frame: matching folds the case of every title, and a
+    /// category can list tens of thousands of sets.
+    matches: Vec<usize>,
+}
+
+impl Browse {
+    /// Opens the list for `category`, with no search.
+    fn open(plan: &Plan, category: Category) -> Self {
+        let mut browse = Self {
+            category,
+            search: String::new(),
+            sets: Vec::new(),
+            matches: Vec::new(),
+        };
+        browse.refresh(plan);
+        browse
+    }
+
+    /// Re-reads the sets from `plan`, whose selection or exclusions changed.
+    fn refresh(&mut self, plan: &Plan) {
+        self.sets = plan.sets_in(self.category);
+        self.rematch();
+    }
+
+    /// Recomputes which sets the search shows.
+    fn rematch(&mut self) {
+        self.matches = matching(&self.sets, &self.search);
+    }
+}
+
 /// Gap between a table's columns.
 const COLUMN_GAP: f32 = 20.0;
 
@@ -158,12 +198,8 @@ pub(crate) struct App {
     selected_totals: Totals,
     /// What each category would free on its own, in the order the rows appear.
     category_totals: Vec<(Category, Totals)>,
-    /// Category whose beatmap sets are open for browsing.
-    browsing: Option<Category>,
-    /// Search text for the browse list.
-    search: String,
-    /// Beatmap sets in the open category, largest first.
-    sets: Vec<SetEntry>,
+    /// The beatmap-set list, while one is open.
+    browse: Option<Browse>,
     /// Whether osu!lazer was running at the last check.
     ///
     /// Written by the watcher thread, read every frame.
@@ -227,9 +263,7 @@ impl App {
             snapshots: Vec::new(),
             selected_totals: Totals::default(),
             category_totals: Vec::new(),
-            browsing: None,
-            search: String::new(),
-            sets: Vec::new(),
+            browse: None,
             lazer_running: watch_for_lazer(ctx.clone()),
             backups: Vec::new(),
             database_bytes: 0,
@@ -284,12 +318,11 @@ impl App {
                     self.status = format!("Scanned {} beatmap sets", plan.sets_scanned);
                     self.plan = Some(*plan);
                     self.activity = None;
-                    self.browsing = None;
-                    self.search.clear();
+                    self.browse = None;
                     self.apply_selection();
                 }
                 Event::Cleaned { files, bytes } => {
-                    self.browsing = None;
+                    self.browse = None;
                     self.last_result = Some(format!(
                         "Moved {files} files into a snapshot. Deleting it reclaims {}.",
                         human_bytes(bytes)
@@ -322,7 +355,7 @@ impl App {
                         // totals beside every category no longer describe what is there.
                         self.plan = None;
                         self.last_result = None;
-                        self.browsing = None;
+                        self.browse = None;
                     }
                 }
                 Event::Failed { message } => {
@@ -383,18 +416,25 @@ impl App {
     fn recompute(&mut self, plan: &Plan) {
         self.selected_totals = plan.selected_totals();
         self.category_totals = plan.totals_by_category();
-        self.sets = self.browsing.map(|c| plan.sets_in(c)).unwrap_or_default();
+        if let Some(browse) = &mut self.browse {
+            browse.refresh(plan);
+        }
+    }
+
+    /// Whether the beatmap-set list is open under `category`.
+    fn is_browsing(&self, category: Category) -> bool {
+        self.browse
+            .as_ref()
+            .is_some_and(|browse| browse.category == category)
     }
 
     /// Opens or closes the beatmap-set list under one category.
-    fn browse(&mut self, plan: &Plan, category: Option<Category>) {
-        self.browsing = if self.browsing == category {
+    fn browse(&mut self, plan: &Plan, category: Category) {
+        self.browse = if self.is_browsing(category) {
             None
         } else {
-            category
+            Some(Browse::open(plan, category))
         };
-        self.search.clear();
-        self.recompute(plan);
     }
 
     /// Takes one beatmap set out of the clean, or puts it back.
@@ -423,11 +463,8 @@ impl App {
 
         if escape {
             // Innermost first: a question, then the browse list.
-            if self.modal.take().is_none() && self.browsing.is_some() {
-                // Outside the frame that holds the plan, so the ordinary path applies.
-                self.browsing = None;
-                self.search.clear();
-                self.apply_selection();
+            if self.modal.take().is_none() {
+                self.browse = None;
             }
         }
 
@@ -807,8 +844,8 @@ impl App {
 
             self.category_row(ui, plan, category, found, totals, index % 2 == 1);
 
-            if self.browsing == Some(category) {
-                self.browse_list(ui, plan, category);
+            if self.is_browsing(category) {
+                self.browse_list(ui, plan);
             }
         }
 
@@ -912,14 +949,14 @@ impl App {
             // category name to wherever it happens to end.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_enabled_ui(self.idle(), |ui| {
-                    let open = self.browsing == Some(category);
+                    let open = self.is_browsing(category);
                     let label = if open { "Hide sets" } else { "Browse sets" };
                     if ui
                         .small_button(label)
                         .on_hover_text("Pick which beatmap sets this category cleans")
                         .clicked()
                     {
-                        self.browse(plan, Some(category));
+                        self.browse(plan, category);
                     }
                 });
             });
@@ -937,47 +974,63 @@ impl App {
     /// A category can hold well over a hundred thousand references across tens of thousands of
     /// sets, so the list is searchable and shows the largest [`BROWSE_LIMIT`] matches. Sorting
     /// by size puts the sets worth deciding about at the top, where a limit cannot hide them.
-    fn browse_list(&mut self, ui: &mut egui::Ui, plan: &mut Plan, category: Category) {
+    fn browse_list(&mut self, ui: &mut egui::Ui, plan: &mut Plan) {
         egui::Frame::new()
             .fill(theme::SURFACE)
             .corner_radius(egui::CornerRadius::same(4))
             .inner_margin(egui::Margin::symmetric(12, 10))
             .show(ui, |ui| {
-                let matches: Vec<usize> = matching(&self.sets, &self.search);
+                let idle = self.idle();
+                let Some(browse) = self.browse.as_mut() else {
+                    return;
+                };
+                let mut keep_all = None;
 
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Find").small().color(theme::MUTED));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.search)
+                    let search = ui.add(
+                        egui::TextEdit::singleline(&mut browse.search)
                             .hint_text("artist or title")
                             .desired_width(260.0),
                     );
+                    if search.changed() {
+                        browse.rematch();
+                    }
 
                     ui.label(
                         egui::RichText::new(format!(
                             "{} of {} beatmap sets",
-                            theme::grouped(matches.len()),
-                            theme::grouped(self.sets.len())
+                            theme::grouped(browse.matches.len()),
+                            theme::grouped(browse.sets.len())
                         ))
                         .small()
                         .color(theme::MUTED),
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_enabled_ui(self.idle() && !matches.is_empty(), |ui| {
+                        ui.add_enabled_ui(idle && !browse.matches.is_empty(), |ui| {
                             if ui.small_button("Keep all shown").clicked() {
-                                self.set_all(plan, &matches, true);
+                                keep_all = Some(true);
                             }
                             if ui.small_button("Clean all shown").clicked() {
-                                self.set_all(plan, &matches, false);
+                                keep_all = Some(false);
                             }
                         });
                     });
                 });
 
+                if let Some(keep) = keep_all {
+                    self.set_all(plan, keep);
+                }
+                let Some(browse) = self.browse.as_ref() else {
+                    return;
+                };
+                let category = browse.category;
+                let found = browse.matches.len();
+
                 ui.add_space(8.0);
 
-                if self.sets.is_empty() {
+                if browse.sets.is_empty() {
                     ui.label(
                         egui::RichText::new("No beatmap set contributes to this category.")
                             .small()
@@ -986,7 +1039,7 @@ impl App {
                     return;
                 }
 
-                if matches.is_empty() {
+                if found == 0 {
                     ui.label(
                         egui::RichText::new("Nothing matches that search.")
                             .small()
@@ -995,7 +1048,7 @@ impl App {
                     return;
                 }
 
-                let shown = matches.len().min(BROWSE_LIMIT);
+                let shown = found.min(BROWSE_LIMIT);
                 let row_height = ui.spacing().interact_size.y;
 
                 egui::ScrollArea::vertical()
@@ -1004,11 +1057,11 @@ impl App {
                     .auto_shrink([false, true])
                     .show_rows(ui, row_height, shown, |ui, range| {
                         for position in range {
-                            self.browse_row(ui, plan, matches[position], position % 2 == 1);
+                            self.browse_row(ui, plan, position, position % 2 == 1);
                         }
                     });
 
-                if matches.len() > shown {
+                if found > shown {
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new(format!(
@@ -1025,8 +1078,14 @@ impl App {
     }
 
     /// One beatmap set: whether it is being cleaned, its name, and what it holds.
-    fn browse_row(&mut self, ui: &mut egui::Ui, plan: &mut Plan, index: usize, striped: bool) {
-        let Some(entry) = self.sets.get(index).cloned() else {
+    ///
+    /// `position` counts through the sets the search shows.
+    fn browse_row(&mut self, ui: &mut egui::Ui, plan: &mut Plan, position: usize, striped: bool) {
+        let entry = self.browse.as_ref().and_then(|browse| {
+            let index = *browse.matches.get(position)?;
+            browse.sets.get(index).cloned()
+        });
+        let Some(entry) = entry else {
             return;
         };
 
@@ -1077,15 +1136,16 @@ impl App {
     }
 
     /// Includes or excludes every set the search currently shows.
-    fn set_all(&mut self, plan: &mut Plan, matches: &[usize], keep: bool) {
-        let sets: Vec<_> = matches
+    fn set_all(&mut self, plan: &mut Plan, keep: bool) {
+        let Some(browse) = &self.browse else {
+            return;
+        };
+        for entry in browse
+            .matches
             .iter()
-            .filter_map(|index| self.sets.get(*index))
-            .map(|entry| entry.set)
-            .collect();
-
-        for set in sets {
-            plan.exclude(set, keep);
+            .filter_map(|index| browse.sets.get(*index))
+        {
+            plan.exclude(entry.set, keep);
         }
         self.recompute(plan);
     }
