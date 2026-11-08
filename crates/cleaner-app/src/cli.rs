@@ -229,11 +229,7 @@ fn list_categories(json: bool, out: &mut impl Write) -> std::io::Result<()> {
                 })
             })
             .collect();
-        writeln!(
-            out,
-            "{}",
-            serde_json::to_string_pretty(&entries).unwrap_or_default()
-        )?;
+        writeln!(out, "{}", serde_json::to_string_pretty(&entries)?)?;
         return Ok(());
     }
 
@@ -342,8 +338,7 @@ fn clean(
                 "detached": outcome.detached,
                 "stashed": outcome.stashed,
                 "snapshot": outcome.snapshot,
-            }))
-            .unwrap_or_default()
+            }))?
         )?;
         return Ok(());
     }
@@ -481,11 +476,7 @@ fn list_snapshots(
                 })
             })
             .collect();
-        writeln!(
-            out,
-            "{}",
-            serde_json::to_string_pretty(&entries).unwrap_or_default()
-        )?;
+        writeln!(out, "{}", serde_json::to_string_pretty(&entries)?)?;
         return Ok(());
     }
 
