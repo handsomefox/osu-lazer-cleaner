@@ -6,7 +6,7 @@
 
 use cleaner_core::format::local_time;
 use cleaner_core::{Library, Options, Plan, Snapshot, snapshot};
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use eframe::egui;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -161,6 +161,8 @@ impl From<&Snapshot> for SnapshotSummary {
 pub(crate) struct Worker {
     commands: Sender<Command>,
     events: Receiver<Event>,
+    /// Whether the worker thread has gone, which only a panic does while the window is open.
+    stopped: bool,
 }
 
 impl Worker {
@@ -178,6 +180,7 @@ impl Worker {
         Self {
             commands: command_tx,
             events: event_rx,
+            stopped: false,
         }
     }
 
@@ -187,8 +190,34 @@ impl Worker {
     }
 
     /// Takes any events that have arrived.
-    pub(crate) fn drain(&self) -> Vec<Event> {
-        self.events.try_iter().collect()
+    ///
+    /// A worker that panicked never answers the command it was running, so its closed channel
+    /// is reported once as a failure rather than leaving the window waiting for ever.
+    pub(crate) fn drain(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+        loop {
+            match self.events.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.stopped {
+                        self.stopped = true;
+                        events.push(failed_message(
+                            "the background worker stopped unexpectedly; restart osu!lazer \
+                             Cleaner, and attach the newest log to an issue"
+                                .to_owned(),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+        events
+    }
+
+    /// Whether the worker thread has gone, so no command will ever be answered.
+    pub(crate) fn stopped(&self) -> bool {
+        self.stopped
     }
 }
 
@@ -526,5 +555,20 @@ mod tests {
                 "{name} reported {events:?}"
             );
         }
+    }
+    #[test]
+    fn a_worker_that_died_is_reported_once() {
+        let (commands, _) = unbounded();
+        let (sender, events) = unbounded();
+        drop(sender);
+        let mut worker = Worker {
+            commands,
+            events,
+            stopped: false,
+        };
+
+        assert!(matches!(worker.drain().as_slice(), [Event::Failed { .. }]));
+        assert!(worker.stopped());
+        assert!(worker.drain().is_empty());
     }
 }

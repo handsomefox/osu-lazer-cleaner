@@ -283,9 +283,10 @@ impl App {
     /// Whether the interface should accept input.
     ///
     /// Everything locks while the worker is busy. A second command sent mid-clean would queue
-    /// behind it and then act on a plan describing a library that no longer exists.
+    /// behind it and then act on a plan describing a library that no longer exists. A worker
+    /// that stopped would never answer one, so its absence locks everything too.
     fn idle(&self) -> bool {
-        self.activity.is_none()
+        self.activity.is_none() && !self.worker.stopped()
     }
 
     /// Applies everything the worker reported since the last frame.
