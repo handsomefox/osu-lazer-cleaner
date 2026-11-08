@@ -2,12 +2,12 @@
 
 ## 1.7.3
 
-- Remove a snapshot from the list when it no longer exists, for example after
-  `snapshot delete` on the command line. Clicking it failed every time.
+- Remove the command-line interface. osu!lazer Cleaner now only opens its window, and ignores
+  any arguments.
+- Remove a snapshot from the list when it no longer exists, for example after its folder was
+  deleted by hand. Clicking it failed every time.
 - After a compaction, keep the controls locked until the new database copy is listed.
 - Say so when the background worker stops unexpectedly. The window showed a spinner forever.
-- Fail a `--json` command with an error when its output cannot be written. It printed an empty
-  line.
 - Log how long a snapshot deletion took.
 - Refuse an app update whose checksum on GitHub cannot be read, instead of skipping that check.
 - Retry putting the current version back when installing an app update fails.
