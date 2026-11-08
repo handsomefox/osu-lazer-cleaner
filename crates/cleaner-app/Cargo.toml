@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 app-update.workspace = true
-cleaner-core = { version = "=1.7.3", path = "../cleaner-core" }
+cleaner-core = { version = "=1.7.4", path = "../cleaner-core" }
 crossbeam-channel.workspace = true
 jiff.workspace = true
 eframe.workspace = true

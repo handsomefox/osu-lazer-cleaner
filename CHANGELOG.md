@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.7.4
+
+- Get the self-updater from its own repository, [handsomefox/app-update](https://github.com/handsomefox/app-update), instead of a copy
+  inside this app. Checking for, downloading, and installing an update work as before.
+
 ## 1.7.3
 
 - Remove the command-line interface. osu!lazer Cleaner now only opens its window, and ignores
