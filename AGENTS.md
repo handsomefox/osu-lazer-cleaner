@@ -14,14 +14,14 @@ The workspace is layered so that everything portable stays testable on Linux.
   assignment, scanning, and snapshots. It depends on no interface. The three places it touches a
   platform are `storage`, `running`, and `folders`, each behind `cfg` with a portable fallback,
   so the rest stays testable anywhere.
-- `cleaner-app` holds both interfaces and builds the one executable. It is the only crate
-  allowed to depend on egui. `main` opens the window when there are no arguments and hands over
-  to `cli` when there are. `assets/` carries the icon and the vendored fonts, and `build.rs`
+- `cleaner-app` holds the window and builds the one executable. It is the only crate allowed
+  to depend on egui. `main` always opens the window and ignores any arguments; there is no
+  command-line interface. `assets/` carries the icon and the vendored fonts, and `build.rs`
   compiles `app.rc` so the executable carries the icon, the version, and the manifest.
 - `app-update` updates the app itself from its GitHub releases, on Windows and Linux. Its
   `lib.rs` is byte-for-byte the same in all five apps, so change it in every app at once.
-  `cleaner-app/src/update.rs` holds this app's chip and window around it. Only the window
-  creates an updater, so the command line never contacts GitHub.
+  `cleaner-app/src/update.rs` holds this app's chip and window around it, and the window
+  creates the updater.
 
 The vendored Inter files have their Private Use Area cmap entries stripped. Upstream Inter maps
 stylistic-set alternates into U+E000..U+F8FF, where the Phosphor icon glyphs live, and Inter

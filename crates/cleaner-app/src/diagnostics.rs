@@ -11,29 +11,12 @@ use std::path::{Path, PathBuf};
 /// Days of log files to keep.
 const MAX_LOG_FILES: usize = 7;
 
-/// Target for events the log file should carry but the terminal should not.
-///
-/// The command line prints its own error in its own words. Without this, the subscriber would
-/// print the same failure a second time, in tracing's format, immediately above it.
-pub(crate) const LOG_ONLY: &str = "osu_lazer_cleaner::log";
-
-/// Which interface is starting, which decides what reaches the terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Interface {
-    /// The window, which has no terminal to write to.
-    Window,
-    /// The command line, where the user reads stderr.
-    CommandLine,
-}
-
 /// Starts logging and installs a panic hook that records the panic before the process dies.
 ///
-/// Both interfaces write the same file at `info`, so a session that used the window and the
-/// command line reads in order. The command line also writes warnings to stderr, where the
-/// user is looking. Set `RUST_LOG` to override either level.
+/// The file gets everything at `info`. Set `RUST_LOG` to override the level.
 ///
 /// Returns the log file path when file logging could be set up.
-pub(crate) fn install(interface: Interface) -> Option<PathBuf> {
+pub(crate) fn install() -> Option<PathBuf> {
     use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
@@ -49,11 +32,7 @@ pub(crate) fn install(interface: Interface) -> Option<PathBuf> {
 
     // Without a file there is nowhere else for the window's own diagnostics to go, so it falls
     // back to stderr at the same level the file would have had.
-    let terminal = match (interface, file.is_some()) {
-        (Interface::CommandLine, _) => Some(format!("warn,{LOG_ONLY}=off")),
-        (Interface::Window, false) => Some(format!("info,{LOG_ONLY}=off")),
-        (Interface::Window, true) => None,
-    };
+    let terminal = file.is_none().then_some("info");
 
     let file_layer = file.map(|file| {
         tracing_subscriber::fmt::layer()
@@ -65,7 +44,7 @@ pub(crate) fn install(interface: Interface) -> Option<PathBuf> {
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_writer(std::io::stderr)
-            .with_filter(filter(&level))
+            .with_filter(filter(level))
     });
 
     tracing_subscriber::registry()
@@ -76,11 +55,6 @@ pub(crate) fn install(interface: Interface) -> Option<PathBuf> {
     install_panic_hook();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        interface = if interface == Interface::Window {
-            "window"
-        } else {
-            "command line"
-        },
         log = path.as_ref().map(|path| path.display().to_string()),
         "osu-lazer-cleaner starting"
     );

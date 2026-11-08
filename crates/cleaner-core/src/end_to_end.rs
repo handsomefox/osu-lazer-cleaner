@@ -521,5 +521,11 @@ fn a_version_one_restore_can_resume_after_its_blobs_were_moved() {
     crate::restore(&fixture.library, &snapshot, |_| {}).unwrap();
     assert!(fixture.holds(&video));
     assert!(!snapshot.dir.exists());
-    assert_eq!(fixture.scan(&[Category::Videos]).selected_references(), 1);
+    assert_eq!(
+        fixture
+            .scan(&[Category::Videos])
+            .selected_totals()
+            .references,
+        1
+    );
 }

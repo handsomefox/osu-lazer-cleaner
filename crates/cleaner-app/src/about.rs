@@ -109,11 +109,9 @@ fn open_log_folder() {
 
 /// Asks the shell to open a folder.
 ///
-/// `Command::new("explorer")` fails here with `ERROR_NOT_SUPPORTED`, which the sibling apps
-/// never see because they are linked for the window subsystem. This one is linked for the
-/// console subsystem and releases its console before the window opens, so it does not get to
-/// spawn Explorer the ordinary way. `ShellExecuteW` is the documented way to ask the shell to
-/// open something, and starts no process of ours.
+/// Spawning `explorer.exe` is unreliable: Explorer hands the path to the running shell and
+/// exits, so the launch can fail after `spawn` has already reported success. `ShellExecuteW`
+/// is the documented way to ask the shell to open something, and starts no process of ours.
 #[cfg(windows)]
 fn open_in_explorer(directory: &std::path::Path) {
     use std::os::windows::ffi::OsStrExt as _;

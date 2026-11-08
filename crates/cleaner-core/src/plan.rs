@@ -50,14 +50,6 @@ pub struct Candidate {
     pub usage_count: u32,
 }
 
-impl Candidate {
-    /// Whether something other than this usage also points at the blob.
-    #[must_use]
-    pub const fn is_shared(&self) -> bool {
-        self.usage_count > 1
-    }
-}
-
 /// A fast, non-cryptographic hasher for content hashes.
 ///
 /// Recounting a large library hashes a quarter of a million 64-character keys, several times
@@ -144,30 +136,6 @@ pub(crate) fn freed_blobs<'a>(candidates: impl Iterator<Item = &'a Candidate>) -
     totals
 }
 
-/// The distinct blobs a group of candidates would free, by hash.
-///
-/// Only the report needs the names; everything else needs the totals, which [`freed_blobs`]
-/// produces without building this.
-pub(crate) fn freed_hashes<'a>(
-    candidates: impl Iterator<Item = &'a Candidate>,
-) -> HashSet<&'a str, FastHash> {
-    let mut counts: HashMap<&str, (u32, u32), FastHash> = HashMap::default();
-
-    for candidate in candidates {
-        let entry = counts
-            .entry(candidate.hash.as_str())
-            .or_insert((0, candidate.usage_count));
-        entry.0 += 1;
-        entry.1 = entry.1.max(candidate.usage_count);
-    }
-
-    counts
-        .into_iter()
-        .filter(|(_, (detaching, owners))| detaching >= owners)
-        .map(|(hash, _)| hash)
-        .collect()
-}
-
 /// Candidates for one category.
 #[derive(Debug, Clone)]
 pub struct Group {
@@ -200,7 +168,7 @@ impl Group {
 ///
 /// Scanning a large library is dominated by the filesystem, and which part dominates depends
 /// on the machine. Reporting the split makes that visible instead of guessable.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Timings {
     /// Measuring every blob in the store.
     pub measure_ms: u64,
@@ -284,31 +252,10 @@ impl Plan {
         self.selected_totals().bytes
     }
 
-    /// Distinct files selected categories would remove from the library.
-    #[must_use]
-    pub fn selected_files(&self) -> usize {
-        self.selected_totals().files
-    }
-
-    /// References selected categories would detach from beatmap sets.
-    #[must_use]
-    pub fn selected_references(&self) -> usize {
-        self.selected_totals().references
-    }
-
     /// Everything the current selection would remove, counting each file once.
     #[must_use]
     pub fn selected_totals(&self) -> Totals {
         freed_blobs(self.selected_candidates())
-    }
-
-    /// What one category would free on its own, whether or not it is selected.
-    #[must_use]
-    pub fn category_totals(&self, category: Category) -> Totals {
-        self.groups
-            .iter()
-            .find(|group| group.category == category)
-            .map_or_else(Totals::default, |group| self.totals_of(group))
     }
 
     /// What every category would free on its own, in [`Category::ALL`] order.
@@ -570,12 +517,12 @@ mod tests {
 
         assert_eq!(plan.selected_bytes(), 0);
         assert_eq!(
-            plan.selected_files(),
+            plan.selected_totals().files,
             0,
             "a file that stays put is not removed"
         );
         assert_eq!(
-            plan.selected_references(),
+            plan.selected_totals().references,
             1,
             "but its reference is detached"
         );
@@ -633,8 +580,18 @@ mod tests {
 
         plan.exclude([2; 16], true);
         assert_eq!(plan.selected_bytes(), 100);
-        assert_eq!(plan.selected_references(), 1);
-        assert_eq!(plan.category_totals(Category::Videos).bytes, 100);
+        assert_eq!(plan.selected_totals().references, 1);
+        assert_eq!(
+            plan.totals_by_category(),
+            vec![(
+                Category::Videos,
+                Totals {
+                    files: 1,
+                    bytes: 100,
+                    references: 1
+                }
+            )]
+        );
 
         plan.exclude([2; 16], false);
         assert_eq!(plan.selected_bytes(), 800);
@@ -724,10 +681,17 @@ mod tests {
         )]);
 
         assert_eq!(plan.selected_bytes(), 0);
-        assert_eq!(plan.selected_files(), 0);
+        assert_eq!(plan.selected_totals().files, 0);
         assert_eq!(
-            plan.category_totals(Category::Videos).bytes,
-            700,
+            plan.totals_by_category()[0],
+            (
+                Category::Videos,
+                Totals {
+                    files: 1,
+                    bytes: 700,
+                    references: 1
+                }
+            ),
             "the row still reports what ticking it would free"
         );
     }

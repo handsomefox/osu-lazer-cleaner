@@ -51,26 +51,6 @@ impl Category {
         }
     }
 
-    /// Name used on the command line and in manifests.
-    #[must_use]
-    pub fn slug(self) -> &'static str {
-        match self {
-            Self::Videos => "videos",
-            Self::Storyboards => "storyboards",
-            Self::Backgrounds => "backgrounds",
-            Self::Hitsounds => "hitsounds",
-            Self::SkinElements => "skin-elements",
-            Self::Junk => "junk",
-            Self::Unreferenced => "unreferenced",
-        }
-    }
-
-    /// Parses a slug, as accepted on the command line.
-    #[must_use]
-    pub fn from_slug(slug: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|c| c.slug() == slug)
-    }
-
     /// One sentence describing what removing this category does.
     #[must_use]
     pub fn description(self) -> &'static str {
@@ -129,11 +109,26 @@ mod tests {
         assert!(!is_junk("audio.mp3"));
     }
 
+    /// Snapshot manifests record each category by this name, so a snapshot written by any
+    /// earlier version still restores.
     #[test]
-    fn slugs_round_trip() {
-        for category in Category::ALL {
-            assert_eq!(Category::from_slug(category.slug()), Some(*category));
-        }
+    fn manifests_name_categories_as_they_always_have() {
+        let names: Vec<String> = Category::ALL
+            .iter()
+            .map(|category| serde_json::to_string(category).unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "\"videos\"",
+                "\"storyboards\"",
+                "\"backgrounds\"",
+                "\"hitsounds\"",
+                "\"skin-elements\"",
+                "\"junk\"",
+                "\"unreferenced\"",
+            ]
+        );
     }
 
     #[test]

@@ -320,8 +320,6 @@ pub struct Compaction {
     pub before: u64,
     /// Size of the database after.
     pub after: u64,
-    /// Where the copy taken beforehand is kept.
-    pub backup: PathBuf,
 }
 
 impl Compaction {
@@ -360,7 +358,7 @@ pub fn compact(library: &Library) -> Result<Compaction, SnapshotError> {
 
     let started = std::time::Instant::now();
     let before = measure("measuring the database")?;
-    let backup = back_up_database(library)?;
+    back_up_database(library)?;
     let rewritten = Realm::open_for_write(&path)?.compact()?;
     let after = measure("measuring the database")?;
     tracing::info!(
@@ -376,7 +374,6 @@ pub fn compact(library: &Library) -> Result<Compaction, SnapshotError> {
         rewritten,
         before,
         after,
-        backup,
     })
 }
 

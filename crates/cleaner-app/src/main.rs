@@ -1,14 +1,10 @@
-//! osu-lazer-cleaner: one executable holding both interfaces.
-//!
-//! Run it with no arguments and it opens the window. Give it a subcommand and it runs
-//! headless, which is what makes the tool scriptable and lets a scan be checked against a real
-//! library without a graphical session.
+//! osu-lazer-cleaner: the window.
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use eframe::egui;
 mod about;
 mod app;
-mod cli;
-mod console;
 mod diagnostics;
 mod icons;
 mod theme;
@@ -17,15 +13,9 @@ mod worker;
 
 use std::process::ExitCode;
 
+/// Opens the window. Arguments are ignored: there is nothing to configure from a shell.
 fn main() -> ExitCode {
-    // `args_os().len() > 1` rather than clap's own detection: clap cannot tell "no arguments"
-    // from "arguments it rejects", and a typo must print an error rather than open a window.
-    if std::env::args_os().len() > 1 {
-        return cli::main();
-    }
-
-    console::release();
-    diagnostics::install(diagnostics::Interface::Window);
+    diagnostics::install();
     gui()
 }
 

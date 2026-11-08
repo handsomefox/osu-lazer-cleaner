@@ -721,19 +721,20 @@ mod tests {
             &sizes,
         );
 
-        let totals = plan.category_totals(Category::Videos);
+        let (category, totals) = plan.totals_by_category()[0];
+        assert_eq!(category, Category::Videos);
         assert_eq!((totals.files, totals.bytes, totals.references), (1, 500, 2));
         assert_eq!(plan.selected_totals().files, 1);
         assert_eq!(plan.selected_totals().bytes, 500);
 
-        let report = crate::report::summarise(&plan, "test");
-        let category = report
-            .categories
-            .iter()
-            .find(|group| group.category == "videos")
-            .unwrap();
-        assert_eq!(category.kept_shared, 0);
-        assert_eq!(report.sharing.shared_references, 2);
+        // Each reference carries the count across both owners, which is what lets the clean
+        // free the file only when both are detached.
+        assert!(
+            plan.groups[0]
+                .candidates
+                .iter()
+                .all(|candidate| candidate.usage_count == 2)
+        );
 
         assert_eq!(plan.sets_in(Category::Videos).len(), 2);
         assert_eq!(plan.sets_in(Category::Videos)[0].title, "Artist - First");

@@ -273,8 +273,7 @@ fn schedule(ui: &mut egui::Ui, updater: &Updater, settings: &mut Settings) -> bo
     );
     ui.label(
         RichText::new(format!(
-            "{last}. A check asks GitHub for this app's releases and sends nothing else. \
-             The command line never checks."
+            "{last}. A check asks GitHub for this app's releases and sends nothing else."
         ))
         .small()
         .color(theme::MUTED),

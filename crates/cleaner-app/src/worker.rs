@@ -398,7 +398,7 @@ fn act_on_snapshot(
     };
     let _ = events.send(outcome);
 
-    // Refreshed after a failure too. A snapshot the command line already removed, or one a
+    // Refreshed after a failure too. A snapshot another process already removed, or one a
     // failed operation left half gone, would otherwise stay on screen and fail every click.
     let _ = events.send(snapshot_event(library));
 }

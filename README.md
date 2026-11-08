@@ -154,7 +154,7 @@ osu!lazer will not open costs nothing but the time to rename the copy back.
 
 The window checks this repository's GitHub releases for a new version each time it starts. To
 check less often, or never, open **About** > **App updates**. A check is one request to the
-GitHub API, and it sends nothing about you or your library. The command line never checks.
+GitHub API, and it sends nothing about you or your library.
 
 When a new version is out, a chip in the header names it. Click the chip to read the notes of
 every release since yours, then choose **Download update**, **Skip this version**, or
@@ -170,7 +170,7 @@ download the new release by hand instead.
 
 ## Diagnostics
 
-Both interfaces write a dated log to `%LOCALAPPDATA%\osu-lazer-cleaner\logs\` on Windows and
+The app writes a dated log to `%LOCALAPPDATA%\osu-lazer-cleaner\logs\` on Windows and
 to `$XDG_DATA_HOME/osu-lazer-cleaner/logs/` on Linux, which is
 `~/.local/share/osu-lazer-cleaner/logs/` unless you have set the variable. The last seven days
 are kept. **About** has a button that opens the folder. Attach the newest file to an issue.
@@ -181,26 +181,7 @@ clean, restore, deletion, or compaction. Failures record the whole error chain, 
 sentence the interface showed.
 
 `RUST_LOG` overrides the level. `RUST_LOG=debug` adds a line per blob, which is worth having
-when a single file is behaving oddly and far too much otherwise. On the command line the log
-file keeps everything while stderr stays at warnings, so `--json` output is unaffected.
-
-## Command line
-
-One executable holds both interfaces. Run it with no arguments and the window opens; give it a
-subcommand and it runs headless, which is useful for scripting and for checking a scan without
-a desktop session.
-
-```
-osu-lazer-cleaner scan
-osu-lazer-cleaner clean videos storyboards --confirm
-osu-lazer-cleaner snapshot list
-osu-lazer-cleaner snapshot delete 20260907-215337 --confirm
-```
-
-Every command takes `--library <path>` to point at a specific directory and `--json` for
-machine-readable output. Successful JSON commands write one JSON document to stdout, including
-when `scan --dump` also saves a report. Progress messages go to stderr. `clean`, `snapshot
-restore`, and `snapshot delete` change nothing until you add `--confirm`.
+when a single file is behaving oddly and far too much otherwise.
 
 ## Development
 
@@ -218,7 +199,7 @@ The workspace is layered so that everything portable stays testable on Linux:
 - `cleaner-core` holds storage discovery, `.osu` and `.osb` parsing, scanning, and snapshots.
   It depends on no interface, and touches a platform only in `storage`, `running`, and
   `folders`, each behind a `cfg` with a portable fallback.
-- `cleaner-app` holds both interfaces and builds the one executable. It is the only crate that
+- `cleaner-app` holds the window and builds the one executable. It is the only crate that
   depends on egui. `assets/` carries the icon, Inter, and Phosphor; `app.rc` and `app.manifest`
   put the icon, the version, and the DPI settings into the Windows executable.
 
