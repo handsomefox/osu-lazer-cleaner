@@ -599,6 +599,9 @@ impl eframe::App for App {
 
         self.show_modal(&ctx);
         if crate::about::show(&ctx, &mut self.about) {
+            // The button promises a check, so start one as the window opens. The updater leaves
+            // a running check or download alone.
+            self.updater.check_now();
             self.update_window = true;
         }
         let idle = self.idle();

@@ -14,7 +14,10 @@ repository = "https://github.com/handsomefox/osu-lazer-cleaner"
 description = "A desktop app that safely removes unwanted beatmap content from an osu!lazer library"
 
 [workspace.dependencies]
-app-update = { git = "https://github.com/handsomefox/app-update", tag = "v0.1.0", version = "=0.1.0" }
+app-diagnostics = { git = "https://github.com/handsomefox/app-internals", tag = "v0.2.0", version = "=0.2.0" }
+app-folders = { git = "https://github.com/handsomefox/app-internals", tag = "v0.2.0", version = "=0.2.0" }
+app-update = { git = "https://github.com/handsomefox/app-internals", tag = "v0.2.0", version = "=0.2.0" }
+app-update-ui = { git = "https://github.com/handsomefox/app-internals", tag = "v0.2.0", version = "=0.2.0" }
 bindgen = "=0.73.2"
 crossbeam-channel = "=0.5.17"
 cmake = "=0.1.58"
@@ -28,15 +31,11 @@ sha2 = "=0.11.1"
 tempfile = "=3.27.0"
 thiserror = "=2.0.21"
 tracing = "=0.1.44"
-tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 walkdir = "=2.5.0"
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Storage_FileSystem",
-    "Win32_System_Com",
-    "Win32_UI_Shell",
 ] }
 
 [profile.release]

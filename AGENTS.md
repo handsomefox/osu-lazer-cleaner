@@ -18,11 +18,12 @@ The workspace is layered so that everything portable stays testable on Linux.
   to depend on egui. `main` always opens the window and ignores any arguments; there is no
   command-line interface. `assets/` carries the icon and the vendored fonts, and `build.rs`
   compiles `app.rc` so the executable carries the icon, the version, and the manifest.
-- `app-update` updates the app itself from its GitHub releases, on Windows and Linux. It
-  lives in its own repository, [handsomefox/app-update](https://github.com/handsomefox/app-update),
-  and the workspace pins it to a tag. That repository's `AGENTS.md` covers changing and
-  releasing it. `cleaner-app/src/update.rs` holds this app's chip and window around it, and
-  the window creates the updater.
+- The shared crates come from [handsomefox/app-internals](https://github.com/handsomefox/app-internals),
+  pinned to a tag: `app-update` updates the app from its GitHub releases, on Windows and Linux,
+  `app-update-ui` draws the update dialog's content, `app-diagnostics` writes the log files,
+  and `app-folders` finds the user folders and opens the log folder. That repository's
+  `AGENTS.md` covers changing them. `cleaner-app/src/update.rs` holds this app's chip, its
+  window, and the `Look` that themes the dialog, and the window creates the updater.
 
 The vendored Inter files have their Private Use Area cmap entries stripped. Upstream Inter maps
 stylistic-set alternates into U+E000..U+F8FF, where the Phosphor icon glyphs live, and Inter

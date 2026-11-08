@@ -8,7 +8,8 @@ const REPOSITORY: &str = "https://github.com/handsomefox/osu-lazer-cleaner";
 
 /// Draws the About window while `open` is set, and clears it when the user closes it.
 ///
-/// Returns true when the user asked for the update window, which replaces this one.
+/// Returns true when the user asked to check for updates. The caller starts a check and opens
+/// the update window, which replaces this one.
 pub(crate) fn show(ctx: &egui::Context, open: &mut bool) -> bool {
     if !*open {
         return false;
@@ -57,8 +58,11 @@ pub(crate) fn show(ctx: &egui::Context, open: &mut bool) -> bool {
                 open_log_folder();
             }
             if ui
-                .button(crate::icons::labelled(crate::icons::UPDATE, "App updates"))
-                .on_hover_text("Check for a new version and choose how often to check")
+                .button(crate::icons::labelled(
+                    crate::icons::UPDATE,
+                    "Check for updates",
+                ))
+                .on_hover_text("Check GitHub for a new version now, and choose how often to check")
                 .clicked()
             {
                 updates = true;
@@ -82,67 +86,11 @@ pub(crate) fn show(ctx: &egui::Context, open: &mut bool) -> bool {
 /// Opens the log directory in the system file manager, so the user can pick up the file rather
 /// than be told a path to type.
 fn open_log_folder() {
-    let Some(directory) = cleaner_core::folders::logs_dir() else {
+    let Some(directory) = crate::diagnostics::logs_dir() else {
         tracing::warn!("no log directory to open");
         return;
     };
-    if let Err(error) = std::fs::create_dir_all(&directory) {
-        tracing::warn!("failed to create the log directory: {error}");
-        return;
-    }
-
-    #[cfg(windows)]
-    open_in_explorer(&directory);
-
-    #[cfg(not(windows))]
-    {
-        let command = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        if let Err(error) = std::process::Command::new(command).arg(&directory).spawn() {
-            tracing::warn!("failed to open the log folder: {error}");
-        }
-    }
-}
-
-/// Asks the shell to open a folder.
-///
-/// Spawning `explorer.exe` is unreliable: Explorer hands the path to the running shell and
-/// exits, so the launch can fail after `spawn` has already reported success. `ShellExecuteW`
-/// is the documented way to ask the shell to open something, and starts no process of ours.
-#[cfg(windows)]
-fn open_in_explorer(directory: &std::path::Path) {
-    use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-    let mut path: Vec<u16> = directory.as_os_str().encode_wide().collect();
-    if path.contains(&0) {
-        tracing::warn!("the log directory path contains NUL");
-        return;
-    }
-    path.push(0);
-    let verb: Vec<u16> = "open\0".encode_utf16().collect();
-
-    // SAFETY: both strings are NUL-terminated and live through this synchronous call, and every
-    // other argument is the documented null. winit initialises COM on the thread that runs the
-    // window, which is this one, and ShellExecuteW needs it for shell extensions.
-    let result = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            verb.as_ptr(),
-            path.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        )
-    };
-
-    // The return value is an instance handle above 32, and an error code at or below it.
-    let code = result as usize;
-    if code <= 32 {
-        tracing::warn!(code, "failed to open the log folder");
+    if let Err(error) = app_folders::reveal(&directory) {
+        tracing::warn!("failed to open the log folder: {error}");
     }
 }
