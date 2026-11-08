@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.7.3
+
+- Remove a snapshot from the list when it no longer exists, for example after
+  `snapshot delete` on the command line. Clicking it failed every time.
+- After a compaction, keep the controls locked until the new database copy is listed.
+- Say so when the background worker stops unexpectedly. The window showed a spinner forever.
+- Fail a `--json` command with an error when its output cannot be written. It printed an empty
+  line.
+- Log how long a snapshot deletion took.
+- Refuse an app update whose checksum on GitHub cannot be read, instead of skipping that check.
+- Retry putting the current version back when installing an app update fails.
+
 ## 1.7.2
 
 - New installs check for a new version each time the window opens. Existing installs keep their
