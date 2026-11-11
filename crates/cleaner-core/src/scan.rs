@@ -281,7 +281,12 @@ fn classify_set(
 /// Storyboard art and custom hitsounds are named inside `.osu` and `.osb` files, so finding
 /// them means reading those files. Everything else is settled by the database or by the
 /// filename: audio and background come from `BeatmapMetadata`, videos and junk from the
-/// extension, skin elements from the name.
+/// extension.
+///
+/// A skin-element name does not settle a file. A storyboard can draw `star.png` or play
+/// `combobreak.wav` too, and [`categorise`] ranks storyboard art above skin elements, so
+/// the file's category depends on what the difficulties say. [`sample_depth`] keeps the cost
+/// down: those names only need `[Events]`, not `[HitObjects]`.
 ///
 /// A set therefore needs parsing only when it owns a file that none of those explain. When it
 /// owns nothing but difficulties, its audio track, and its background, there is nothing left
@@ -299,7 +304,6 @@ fn needs_parsing(set: &cleaner_realm::BeatmapSet, known: &ReferenceIndex) -> boo
             || known.audio.contains(&key)
             || known.backgrounds.contains(&key)
             || catalog::is_junk(name)
-            || skin::is_skin_element(name)
             || osu::VIDEO_EXTENSIONS
                 .iter()
                 .any(|extension| has_extension(name, extension));
@@ -411,13 +415,17 @@ enum Depth {
 /// outright. A set that owns no sample beyond its audio track therefore has nothing for them to
 /// find, and skipping them skips most of every difficulty.
 ///
+/// A sample with a skin-element name needs neither: [`categorise`] ranks skin elements above
+/// hitsounds, so a hit object naming one cannot change its category.
+///
 /// Getting this wrong can only leave a file in the library: an unread section means one fewer
-/// reference, which means one fewer candidate.
+/// hitsound reference, which means one fewer candidate.
 fn sample_depth(set: &cleaner_realm::BeatmapSet) -> Depth {
     let owns_a_sample = set.files.iter().any(|file| {
-        osu::AUDIO_EXTENSIONS
-            .iter()
-            .any(|extension| has_extension(&file.filename, extension))
+        !skin::is_skin_element(&file.filename)
+            && osu::AUDIO_EXTENSIONS
+                .iter()
+                .any(|extension| has_extension(&file.filename, extension))
             && !set
                 .audio
                 .iter()
@@ -978,20 +986,79 @@ mod tests {
     }
 
     #[test]
-    fn junk_and_skin_files_do_not_trigger_parsing() {
-        // Both are recognised by name, so reading the difficulties would find nothing new.
+    fn junk_does_not_trigger_parsing() {
+        // Junk is recognised by name, so reading the difficulties would find nothing new.
+        let set = set_with(
+            &["Map.osu", "audio.mp3", "bg.jpg", "Thumbs.db"],
+            &["audio.mp3"],
+            &["bg.jpg"],
+        );
+        assert!(!needs_parsing(&set, &known(&set)));
+    }
+
+    #[test]
+    fn skin_names_need_the_events_but_not_the_hit_objects() {
+        // A storyboard can draw or play a file with a skin element's name, which makes it
+        // storyboard art. Only `[Events]` can say so, and hit objects never outrank a skin
+        // element.
         let set = set_with(
             &[
                 "Map.osu",
                 "audio.mp3",
                 "bg.jpg",
-                "Thumbs.db",
+                "hitcircle.png",
+                "combobreak.wav",
+            ],
+            &["audio.mp3"],
+            &["bg.jpg"],
+        );
+        assert!(needs_parsing(&set, &known(&set)));
+        assert_eq!(sample_depth(&set), Depth::Events);
+    }
+
+    #[test]
+    fn a_storyboard_sprite_with_a_skin_name_is_storyboard_art() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join(crate::storage::DATABASE_FILENAME),
+            b"stub",
+        )
+        .unwrap();
+        let library = Library::open(directory.path()).unwrap();
+        let set = set_with(
+            &[
+                "Map.osu",
+                "audio.mp3",
+                "bg.jpg",
+                "star.png",
                 "hitcircle.png",
             ],
             &["audio.mp3"],
             &["bg.jpg"],
         );
-        assert!(!needs_parsing(&set, &known(&set)));
+        let difficulty = library.blob_path(&set.files[0].hash);
+        std::fs::create_dir_all(difficulty.parent().unwrap()).unwrap();
+        std::fs::write(
+            difficulty,
+            "[Events]\nSprite,Foreground,Centre,\"star.png\",320,240\n\
+             [HitObjects]\n256,192,1000,1,0,0:0:0:0:\n",
+        )
+        .unwrap();
+
+        let (candidates, read) = classify_set(&library, &set, &HashMap::new(), &HashMap::new());
+        assert_eq!(read.sets, 1, "the difficulty had to be read");
+        let roles: Vec<_> = candidates
+            .iter()
+            .map(|c| (c.filename.as_str(), c.category))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                ("bg.jpg", Category::Backgrounds),
+                ("star.png", Category::Storyboards),
+                ("hitcircle.png", Category::SkinElements),
+            ]
+        );
     }
 
     #[test]
