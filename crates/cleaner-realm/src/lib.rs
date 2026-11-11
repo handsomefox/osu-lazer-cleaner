@@ -795,15 +795,17 @@ impl Realm {
         };
 
         let hash_key = self.property_key(file_class, "Hash")?;
+        // Keyed the way osu!lazer looks a file up, without regard to case. A set holding two
+        // names that differ only in case breaks `GetFile`, which expects one match.
         let mut present: HashMap<_, _> =
             Self::read_usages(&object, files_key, filename_key, target_key, hash_key)?
                 .into_iter()
-                .map(|file| (file.filename, file.hash))
+                .map(|file| (filename_key_ignoring_case(&file.filename), file.hash))
                 .collect();
 
         for entry in entries {
             if present
-                .get(&entry.filename)
+                .get(&filename_key_ignoring_case(&entry.filename))
                 .is_some_and(|hash| hash != &entry.hash)
             {
                 return Err(RealmError::Core {
@@ -825,8 +827,10 @@ impl Realm {
 
         let mut restored = 0;
         for entry in entries {
-            // Already listed, which happens when a restore runs twice.
-            if present.contains_key(&entry.filename) {
+            // Already listed, which happens when a restore runs twice, or when the set gained
+            // the same content under a differently cased name since the clean.
+            let key = filename_key_ignoring_case(&entry.filename);
+            if present.contains_key(&key) {
                 continue;
             }
 
@@ -838,7 +842,7 @@ impl Realm {
             }
 
             restored += 1;
-            present.insert(entry.filename.clone(), entry.hash.clone());
+            present.insert(key, entry.hash.clone());
         }
 
         // SAFETY: released exactly once, after the loop.
@@ -1201,6 +1205,23 @@ pub struct ClassInfo {
     pub embedded: bool,
 }
 
+/// A filename as `StringComparison.OrdinalIgnoreCase` compares it, which is how
+/// `BeatmapSetInfoExtensions.GetFile` finds a set's file: each character in its simple
+/// uppercase form.
+fn filename_key_ignoring_case(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            let mut upper = c.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(single), None) => single,
+                // A character whose uppercase is several characters, such as `ß`, has no
+                // simple mapping and compares as itself.
+                _ => c,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1332,6 +1353,43 @@ mod tests {
             }])
             .unwrap();
         assert!(realm.read_library().unwrap().usage_counts.is_empty());
+    }
+
+    #[test]
+    fn synthetic_restore_compares_names_without_regard_to_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let realm = synthetic(&dir.path().join("client.realm"));
+        // The set still lists `Thumbs.db`. Restoring the same content under another case is
+        // already done; restoring different content under it would give the set two files
+        // that osu!lazer's lookup cannot tell apart.
+        let mut same = restoration();
+        same.filename = "THUMBS.DB".to_owned();
+        assert_eq!(realm.restore_usages(&[same], |_, _| {}).unwrap(), 0);
+
+        let mut conflicting = restoration();
+        conflicting.filename = "THUMBS.DB".to_owned();
+        conflicting.hash = "b".repeat(64);
+        assert!(realm.restore_usages(&[conflicting], |_, _| {}).is_err());
+
+        let library = realm.read_library().unwrap();
+        assert_eq!(library.beatmap_sets[0].files.len(), 1);
+        assert_eq!(library.usage_counts[&restoration().hash], 1);
+    }
+
+    #[test]
+    fn filename_keys_follow_ordinal_ignore_case() {
+        assert_eq!(
+            filename_key_ignoring_case("bg.jpg"),
+            filename_key_ignoring_case("BG.JPG")
+        );
+        assert_eq!(
+            filename_key_ignoring_case("Écran.png"),
+            filename_key_ignoring_case("éCRAN.PNG")
+        );
+        assert_ne!(
+            filename_key_ignoring_case("straße.png"),
+            filename_key_ignoring_case("STRASSE.PNG")
+        );
     }
 
     #[test]
