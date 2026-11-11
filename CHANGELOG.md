@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.7.6
+
+- Keep a background that an old beatmap names in a video event, such as `1,0,"bg.jpg"`. osu!lazer
+  shows it as the background, but the cleaner listed it under **Videos**, so cleaning videos could
+  remove it.
+- List storyboard art that has a skin element's name, such as `star.png`, under **Storyboards**.
+  A set was not read when its only unexplained files had skin names, so cleaning skin elements
+  could remove storyboard art.
+- Compare filenames without regard to case on restore, the way osu!lazer looks files up.
+  Restoring `BG.JPG` after the editor had added a different `bg.jpg` gave the set both files, and
+  osu!lazer then could not open either. The same content under another case now counts as already
+  restored, and different content keeps the snapshot.
+- Write log lines to the console when today's log file cannot be opened, instead of dropping them.
+- Opening a second copy of the app while the first has an update waiting no longer deletes the
+  first copy's download.
+
 ## 1.7.5
 
 - **Check for updates** in **About** checks GitHub right away as it opens the update window. It
