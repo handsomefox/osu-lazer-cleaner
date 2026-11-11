@@ -118,6 +118,9 @@ location.
 
 On Windows, unpack `osu-lazer-cleaner-<version>-windows-x86_64.zip` and run
 `osu-lazer-cleaner.exe` from the folder inside it. It looks for the library in `%APPDATA%\osu`.
+It needs the Microsoft Visual C++ Redistributable for x64, which most Windows installations
+already have. If Windows reports that `VCRUNTIME140.dll` or `MSVCP140.dll` was not found, install
+the [latest supported redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
 
 On Linux, unpack the archive and run the executable in the folder inside it:
 
