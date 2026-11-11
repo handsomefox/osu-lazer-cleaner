@@ -107,6 +107,18 @@ pub(crate) fn filename_key(name: &str) -> String {
 /// From `SupportedExtensions.VIDEO_EXTENSIONS`.
 pub const VIDEO_EXTENSIONS: &[&str] = &[".mp4", ".mov", ".avi", ".flv", ".mpg", ".wmv", ".m4v"];
 
+/// Whether `name` has one of the [`VIDEO_EXTENSIONS`], compared the way
+/// `Path.GetExtension(filename).ToLowerInvariant()` does: from the last dot of
+/// the last path component.
+fn is_video_file(name: &str) -> bool {
+    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    file.rfind('.').is_some_and(|dot| {
+        VIDEO_EXTENSIONS
+            .iter()
+            .any(|extension| file[dot..].eq_ignore_ascii_case(extension))
+    })
+}
+
 /// Audio extensions lazer recognises.
 ///
 /// From `SupportedExtensions.AUDIO_EXTENSIONS`.
@@ -254,8 +266,15 @@ fn read_event(line: &str, known: &FileIndex, references: &mut References) {
             }
         }
         "1" | "Video" => {
+            // Some very old beatmaps typed their background as a video.
+            // `LegacyBeatmapDecoder` takes a `Video` event whose file is not a
+            // video as the background, so a Videos clean must leave it alone.
             if let Some(name) = field(&fields, 2) {
-                references.videos.insert(name);
+                if is_video_file(&name) {
+                    references.videos.insert(name);
+                } else {
+                    references.backgrounds.insert(name);
+                }
             }
         }
         "4" | "Sprite" => {
@@ -424,6 +443,17 @@ mod tests {
 
         assert!(refs.backgrounds.contains("bg.jpg"));
         assert!(refs.videos.contains("intro.mp4"));
+    }
+
+    #[test]
+    fn a_video_event_naming_an_image_is_the_background() {
+        let text = "[Events]\n1,0,\"BG.JPG\"\nVideo,0,\"sb/intro.MP4\"\n1,0,\"clip.mp4.png\"\n";
+        let refs = parse(text, SourceKind::Difficulty, &files(&[]));
+
+        assert!(refs.backgrounds.contains("BG.JPG"));
+        assert!(refs.backgrounds.contains("clip.mp4.png"));
+        assert!(refs.videos.contains("sb/intro.MP4"));
+        assert_eq!(refs.videos.len(), 1);
     }
 
     #[test]
