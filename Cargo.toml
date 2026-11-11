@@ -16,6 +16,7 @@ description = "A desktop app that safely removes unwanted beatmap content from a
 [workspace.dependencies]
 app-diagnostics = { git = "https://github.com/handsomefox/app-internals", tag = "v0.2.2", version = "=0.2.2" }
 app-folders = { git = "https://github.com/handsomefox/app-internals", tag = "v0.2.2", version = "=0.2.2" }
+app-process = { git = "https://github.com/handsomefox/app-internals", tag = "v0.2.2", version = "=0.2.2" }
 app-update = { git = "https://github.com/handsomefox/app-internals", tag = "v0.2.2", version = "=0.2.2" }
 app-update-ui = { git = "https://github.com/handsomefox/app-internals", tag = "v0.2.2", version = "=0.2.2" }
 bindgen = "=0.73.2"
@@ -34,7 +35,6 @@ tracing = "=0.1.44"
 walkdir = "=2.5.0"
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
-    "Win32_System_Diagnostics_ToolHelp",
     "Win32_Storage_FileSystem",
 ] }
 

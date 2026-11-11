@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 app-folders.workspace = true
+app-process.workspace = true
 cleaner-realm = { version = "=1.7.5", path = "../cleaner-realm" }
 jiff.workspace = true
 serde.workspace = true
