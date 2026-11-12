@@ -241,6 +241,18 @@ fn prepare(
     Ok((removals.len(), final_dir, blobs))
 }
 
+/// Whether a scan would have put this file under Backgrounds had it been a background then.
+///
+/// `scan::categorise` ranks junk, videos, and `.osb` files above backgrounds, so a background
+/// with one of those names was already offered as such; everything else ranks below.
+fn ranks_below_backgrounds(candidate: &crate::Candidate) -> bool {
+    match candidate.category {
+        crate::Category::Junk | crate::Category::Videos | crate::Category::Backgrounds => false,
+        crate::Category::Storyboards => !candidate.filename.to_ascii_lowercase().ends_with(".osb"),
+        _ => true,
+    }
+}
+
 /// Rejects shifted indices and recomputes which blobs lose their last owner.
 fn validate_candidates<'a>(
     candidates: &'a [crate::Candidate],
@@ -279,7 +291,7 @@ fn validate_candidates<'a>(
             // The editor can make a file the background after the scan without changing its
             // hash or usage (`ResourcesSection` sets `Metadata.BackgroundFile`). Removing it
             // would then take a background the plan never offered.
-            || (candidate.category != crate::Category::Backgrounds
+            || (ranks_below_backgrounds(candidate)
                 && set.backgrounds.iter().any(|background| {
                     crate::osu::filename_key(background)
                         == crate::osu::filename_key(&file.filename)
@@ -874,8 +886,16 @@ mod tests {
             .backgrounds
             .push(candidate.filename.clone());
         assert!(validate_candidates(std::slice::from_ref(&candidate), &current).is_err());
-        // A background the plan offered as one is still cleaned.
-        candidate.category = Category::Backgrounds;
+        // A background the plan offered as one is still cleaned, and so is one a scan ranks
+        // above backgrounds by its name.
+        for category in [Category::Backgrounds, Category::Junk, Category::Videos] {
+            candidate.category = category;
+            assert!(validate_candidates(std::slice::from_ref(&candidate), &current).is_ok());
+        }
+        candidate.category = Category::Storyboards;
+        candidate.filename = "Map.osb".to_owned();
+        current.beatmap_sets[0].files[0].filename = "Map.osb".to_owned();
+        current.beatmap_sets[0].backgrounds = vec!["Map.osb".to_owned()];
         assert!(validate_candidates(&[candidate], &current).is_ok());
     }
 
