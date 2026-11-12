@@ -661,7 +661,11 @@ impl App {
         }
 
         // Every request is cancelled, a second one while the question is open included.
+        // A close from the taskbar can come while minimized; bring the window back so the
+        // question is seen.
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         if !matches!(self.modal, Some(Question::Quit(_))) {
             self.modal = Some(Question::Quit(activity));
         }
