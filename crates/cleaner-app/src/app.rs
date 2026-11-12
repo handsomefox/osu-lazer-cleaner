@@ -212,6 +212,8 @@ pub(crate) struct App {
     /// What the last compaction did, if one has run.
     compaction: Option<cleaner_core::Compaction>,
     modal: Option<Question>,
+    /// The user chose "Close anyway", so the next close request goes through.
+    close_confirmed: bool,
     last_result: Option<String>,
     /// Whether the About modal is open.
     about: bool,
@@ -269,6 +271,7 @@ impl App {
             database_bytes: 0,
             compaction: None,
             modal: None,
+            close_confirmed: false,
             last_result: None,
             about: false,
             updater: app_update::Updater::new(crate::update::APP_INFO, {
@@ -544,11 +547,16 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// Runs before every frame, and also while the window is minimized, when eframe calls only
+    /// this. A close request then still meets the guard.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.absorb_events();
+        self.guard_close(ctx);
+    }
+
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.updater.poll(&mut self.update_settings);
         let ctx = root.ctx().clone();
-        self.guard_close(&ctx);
         self.shortcuts(&ctx);
 
         egui::Panel::top("header")
@@ -647,13 +655,16 @@ impl App {
             return;
         };
 
-        // Already asked, and the answer has not arrived yet.
-        if matches!(self.modal, Some(Question::Quit(_))) {
+        // The user answered "Close anyway".
+        if self.close_confirmed {
             return;
         }
 
+        // Every request is cancelled, a second one while the question is open included.
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        self.modal = Some(Question::Quit(activity));
+        if !matches!(self.modal, Some(Question::Quit(_))) {
+            self.modal = Some(Question::Quit(activity));
+        }
     }
 
     /// Title, screen switch, and the library path.
@@ -1505,6 +1516,7 @@ impl App {
                             self.worker.send(Command::DeleteSnapshot { id: id.clone() });
                         }
                         Question::Quit(_) => {
+                            self.close_confirmed = true;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     }
