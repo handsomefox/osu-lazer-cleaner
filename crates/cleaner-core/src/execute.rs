@@ -276,6 +276,14 @@ fn validate_candidates<'a>(
             || set.audio.iter().any(|audio| {
                 crate::osu::filename_key(audio) == crate::osu::filename_key(&file.filename)
             })
+            // The editor can make a file the background after the scan without changing its
+            // hash or usage (`ResourcesSection` sets `Metadata.BackgroundFile`). Removing it
+            // would then take a background the plan never offered.
+            || (candidate.category != crate::Category::Backgrounds
+                && set.backgrounds.iter().any(|background| {
+                    crate::osu::filename_key(background)
+                        == crate::osu::filename_key(&file.filename)
+                }))
             || !seen.insert((candidate.set_index, candidate.file_index))
         {
             return Err(SnapshotError::StalePlan);
@@ -854,6 +862,21 @@ mod tests {
             .audio
             .push(candidate.filename.to_uppercase());
         assert!(validate_candidates(&[candidate], &current).is_err());
+    }
+
+    #[test]
+    fn clean_rejects_a_file_that_became_the_background() {
+        let mut candidate = plan_with_one_selected().groups[0].candidates[0].clone();
+        candidate.category = Category::Storyboards;
+        let mut current = current_library(&candidate, 1);
+        assert!(validate_candidates(std::slice::from_ref(&candidate), &current).is_ok());
+        current.beatmap_sets[0]
+            .backgrounds
+            .push(candidate.filename.clone());
+        assert!(validate_candidates(std::slice::from_ref(&candidate), &current).is_err());
+        // A background the plan offered as one is still cleaned.
+        candidate.category = Category::Backgrounds;
+        assert!(validate_candidates(&[candidate], &current).is_ok());
     }
 
     #[test]
