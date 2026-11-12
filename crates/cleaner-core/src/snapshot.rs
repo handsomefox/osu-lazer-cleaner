@@ -1209,23 +1209,26 @@ mod tests {
 
     #[test]
     fn failed_workers_finish_with_unclaimed_blobs() {
-        let hash = "a".repeat(64);
-        let (_dir, library) = library_with_blob(&hash, b"payload");
-        let temp = begin(&library).unwrap();
-        std::fs::remove_file(library.blob_path(&hash)).unwrap();
-        let count = std::thread::available_parallelism().map_or(4, std::num::NonZero::get) * 2 + 1;
-        let snapshot = Snapshot {
-            dir: temp,
-            manifest: manifest(vec![(hash, 7); count]),
-        };
+        // Distinct jobs, several per worker, each failing: the workers must stop claiming
+        // jobs once one fails, and the call must return rather than wait on the rest.
+        let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        let hashes: Vec<String> = (0..workers * 4 + 1).map(|i| format!("{i:064x}")).collect();
+        let jobs: Vec<(&str, u64)> = hashes.iter().map(|hash| (hash.as_str(), 1)).collect();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
         let started = std::time::Instant::now();
-        let error = restore_blobs(&library, &snapshot, &mut |_, _| {
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(10),
-                "restore workers did not finish"
-            );
-        });
-        assert!(error.is_err());
+        let result = each_blob(
+            &jobs,
+            |_, _| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Err(SnapshotError::StalePlan)
+            },
+            &mut |_, _| {},
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let calls = calls.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(calls < jobs.len(), "{calls} of {} jobs ran", jobs.len());
     }
 
     #[test]
