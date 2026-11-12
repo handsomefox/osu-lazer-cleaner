@@ -1588,17 +1588,43 @@ mod tests {
             let counts = contents.usage_counts;
             let sets = contents.beatmap_sets;
 
-            let total: u32 = counts.values().sum();
-            let from_sets: u32 = sets
-                .iter()
-                .map(|s| u32::try_from(s.files.len()).expect("set has a sane file count"))
-                .sum();
+            let total: usize = counts.values().map(|&n| n as usize).sum();
 
-            // Scores and skins own usages too, so the global total must exceed what beatmap
-            // sets alone account for. Counting only sets is the bug this guards against.
+            // Count each owner class's usages straight off the database, every beatmap set
+            // included, even protected and pending ones the scan leaves out of its list.
+            let usage = realm.class_key("RealmNamedFileUsage").unwrap();
+            let filename_key = realm.property_key(usage, "Filename").unwrap();
+            let target_key = realm.property_key(usage, "File").unwrap();
+            let hash_key = realm
+                .property_key(realm.class_key("File").unwrap(), "Hash")
+                .unwrap();
+            let owned = |class_name: &str| -> usize {
+                let class = realm.class_key(class_name).unwrap();
+                let list = realm.property_key(class, "Files").unwrap();
+                (0..realm.count(class).unwrap())
+                    .map(|index| {
+                        let object = realm.object_at(class, index).unwrap();
+                        Realm::read_usages(&object, list, filename_key, target_key, hash_key)
+                            .unwrap()
+                            .len()
+                    })
+                    .sum()
+            };
+            let all_sets = owned("BeatmapSet");
+            let scores = owned("Score");
+            let skins = owned("Skin");
+            let assets = realm
+                .optional_class_key("RealmOnlineAsset")
+                .unwrap()
+                .map_or(0, |class| realm.count(class).unwrap());
+
+            // Scores and skins own usages too. Counting only sets is the bug this guards
+            // against, so the sample must have some, and every one must be in the total.
+            assert!(scores + skins > 0, "the sample has no score or skin files");
             assert!(
-                total > from_sets,
-                "expected owners beyond beatmap sets: {total} total vs {from_sets} from sets"
+                total >= all_sets + scores + skins && total <= all_sets + scores + skins + assets,
+                "{total} counted, against {all_sets} from sets, {scores} from scores, \
+                 {skins} from skins, and up to {assets} from online assets"
             );
 
             // Deduplication is the whole reason refcounting exists: some blob must be shared.
