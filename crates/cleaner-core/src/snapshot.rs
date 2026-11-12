@@ -1212,7 +1212,7 @@ mod tests {
         // Distinct jobs, several per worker, each failing: the workers must stop claiming
         // jobs once one fails, and the call must return rather than wait on the rest.
         let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-        let hashes: Vec<String> = (0..workers * 4 + 1).map(|i| format!("{i:064x}")).collect();
+        let hashes: Vec<String> = (0..=workers * 4).map(|i| format!("{i:064x}")).collect();
         let jobs: Vec<(&str, u64)> = hashes.iter().map(|hash| (hash.as_str(), 1)).collect();
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let started = std::time::Instant::now();
