@@ -483,7 +483,10 @@ impl App {
             return;
         }
 
-        if rescan && self.library.is_some() && self.screen == Screen::Clean {
+        // A scan started under an open question would run while its answer starts a second
+        // operation behind it.
+        if rescan && self.modal.is_none() && self.library.is_some() && self.screen == Screen::Clean
+        {
             self.scan();
         }
 
@@ -1486,7 +1489,10 @@ impl App {
                 let button =
                     egui::Button::new(egui::RichText::new(action).color(theme::BASE)).fill(fill);
 
-                if ui.add(button).clicked() {
+                // Only quitting may be answered while the worker is busy: anything else would
+                // queue a second operation behind the running one.
+                let enabled = self.idle() || matches!(modal, Question::Quit(_));
+                if ui.add_enabled(enabled, button).clicked() {
                     match &modal {
                         Question::Clean => self.confirm_clean(),
                         Question::Restore(id) => {
