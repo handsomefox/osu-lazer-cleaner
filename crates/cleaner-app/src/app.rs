@@ -316,7 +316,15 @@ impl App {
                         }
                     }
 
-                    self.status = format!("Scanned {} beatmap sets", plan.sets_scanned);
+                    self.status = if plan.sets_unreadable == 0 {
+                        format!("Scanned {} beatmap sets", plan.sets_scanned)
+                    } else {
+                        format!(
+                            "Scanned {} beatmap sets. {} were left out because a difficulty or \
+                             storyboard could not be read; the log names them.",
+                            plan.sets_scanned, plan.sets_unreadable
+                        )
+                    };
                     self.plan = Some(*plan);
                     self.activity = None;
                     self.browse = None;

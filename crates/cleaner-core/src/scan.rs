@@ -88,6 +88,7 @@ pub fn build_plan(
 
     let titles = set_titles(&sets, &candidates);
     let mut plan = assemble(candidates, titles, selected, total_sets, &sizes);
+    plan.sets_unreadable = read.unread;
     plan.timings = Timings {
         measure_ms,
         database_ms,
@@ -134,6 +135,7 @@ fn classify_sets(
     let parsed = std::sync::atomic::AtomicUsize::new(0);
     let files_read = std::sync::atomic::AtomicUsize::new(0);
     let bytes_read = std::sync::atomic::AtomicU64::new(0);
+    let unreadable = std::sync::atomic::AtomicUsize::new(0);
     let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let done = std::sync::atomic::AtomicUsize::new(0);
@@ -154,6 +156,9 @@ fn classify_sets(
                     for set in *chunk {
                         let (candidates, read) = classify_set(library, set, sizes, usage_counts);
                         local.extend(candidates);
+                        if read.unread > 0 {
+                            unreadable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         if read.files > 0 {
                             parsed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             files_read.fetch_add(read.files, std::sync::atomic::Ordering::Relaxed);
@@ -193,6 +198,7 @@ fn classify_sets(
             sets: parsed.load(std::sync::atomic::Ordering::Relaxed),
             files: files_read.load(std::sync::atomic::Ordering::Relaxed),
             bytes: bytes_read.load(std::sync::atomic::Ordering::Relaxed),
+            unread: unreadable.load(std::sync::atomic::Ordering::Relaxed),
         },
     )
 }
@@ -209,6 +215,9 @@ struct Read {
     files: usize,
     /// Bytes read from them.
     bytes: u64,
+    /// Difficulty and storyboard files that could not be read. Summed over a scan, the
+    /// beatmap sets that had one.
+    unread: usize,
 }
 
 /// Classifies one beatmap set's files.
@@ -238,6 +247,16 @@ fn classify_set(
         references.absorb(found);
         read = counts;
         read.sets = 1;
+        // A file the unread source names would look unused, and a storyboard sprite called
+        // star.png would become a skin element. Nothing in the set is offered instead.
+        if read.unread > 0 {
+            tracing::warn!(
+                set = %set.title,
+                unread = read.unread,
+                "could not read every difficulty and storyboard; the set is left out"
+            );
+            return (Vec::new(), read);
+        }
     }
 
     // Files a beatmap cannot play without. These are never candidates, whatever category else
@@ -367,6 +386,7 @@ fn read_references(library: &Library, set: &cleaner_realm::BeatmapSet) -> (osu::
     let depth = sample_depth(set);
 
     let index = osu::FileIndex::new(set.files.iter().map(|file| file.filename.as_str()));
+    let mut unread = 0;
     let sources: Vec<(String, SourceKind)> = set
         .files
         .iter()
@@ -381,10 +401,11 @@ fn read_references(library: &Library, set: &cleaner_realm::BeatmapSet) -> (osu::
 
             // A storyboard has no `[HitObjects]` and is small, so it is always read whole.
             let stop_at_hit_objects = depth == Depth::Events && kind == SourceKind::Difficulty;
-            Some((
-                read_source(&library.blob_path(&file.hash), stop_at_hit_objects)?,
-                kind,
-            ))
+            let text = read_source(&library.blob_path(&file.hash), stop_at_hit_objects);
+            if text.is_none() {
+                unread += 1;
+            }
+            Some((text?, kind))
         })
         .collect();
 
@@ -392,6 +413,7 @@ fn read_references(library: &Library, set: &cleaner_realm::BeatmapSet) -> (osu::
         sets: 0,
         files: sources.len(),
         bytes: sources.iter().map(|(text, _)| text.len() as u64).sum(),
+        unread,
     };
     (
         osu::parse_all(sources.iter().map(|(t, k)| (t.as_str(), *k)), &index),
@@ -540,6 +562,7 @@ fn assemble(
         set_titles,
         excluded: HashSet::new(),
         sets_scanned,
+        sets_unreadable: 0,
         blobs_total: sizes.len(),
         bytes_total: sizes.values().sum(),
     }
@@ -918,6 +941,7 @@ mod tests {
 
         let (references, read) = read_references(&library, &set);
         assert!(read.files > 0, "the difficulty file was opened");
+        assert_eq!(read.unread, 0);
         assert!(
             references.storyboard.contains("bg.jpg"),
             "everything before the hit objects is still read"
@@ -1059,6 +1083,31 @@ mod tests {
                 ("hitcircle.png", Category::SkinElements),
             ]
         );
+    }
+
+    #[test]
+    fn a_set_with_an_unreadable_storyboard_offers_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join(crate::storage::DATABASE_FILENAME),
+            b"stub",
+        )
+        .unwrap();
+        let library = Library::open(directory.path()).unwrap();
+        let set = set_with(
+            &["Map.osu", "audio.mp3", "Storyboard.osb", "star.png"],
+            &["audio.mp3"],
+            &[],
+        );
+        let difficulty = library.blob_path(&set.files[0].hash);
+        std::fs::create_dir_all(difficulty.parent().unwrap()).unwrap();
+        std::fs::write(difficulty, "[Events]\n").unwrap();
+        // The storyboard's blob is missing, so star.png, which it may draw, cannot be told
+        // from a skin element.
+
+        let (candidates, read) = classify_set(&library, &set, &HashMap::new(), &HashMap::new());
+        assert_eq!(read.unread, 1);
+        assert!(candidates.is_empty(), "{candidates:?}");
     }
 
     #[test]

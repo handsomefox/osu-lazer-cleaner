@@ -220,6 +220,9 @@ pub struct Plan {
     pub excluded: HashSet<SetId>,
     /// Beatmap sets examined.
     pub sets_scanned: usize,
+    /// Beatmap sets left out because a difficulty or storyboard could not be read, which
+    /// leaves no way to tell which of their files are in use.
+    pub sets_unreadable: usize,
     /// Blobs present in the library.
     pub blobs_total: usize,
     /// Bytes held by the library's blob store.
