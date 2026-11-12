@@ -388,6 +388,20 @@ fn video_fixture(two_owners: bool) -> (Fixture, String) {
     (Fixture::build(&sets, &[(&video, b"video bytes")]), video)
 }
 
+/// Makes `snapshot` look as one written before 1.7.7 does: no link to a blob another owner kept.
+fn without_held(snapshot: &crate::Snapshot) -> crate::Snapshot {
+    let mut snapshot = snapshot.clone();
+    for (hash, _) in std::mem::take(&mut snapshot.manifest.held) {
+        std::fs::remove_file(snapshot.dir.join("blobs").join(hash)).unwrap();
+    }
+    std::fs::write(
+        snapshot.dir.join("manifest.json"),
+        serde_json::to_string_pretty(&snapshot.manifest).unwrap(),
+    )
+    .unwrap();
+    snapshot
+}
+
 fn clean_video(fixture: &Fixture, exclude_second: bool) -> crate::Snapshot {
     let mut plan = fixture.scan(&[Category::Videos]);
     plan.exclude([2; 16], exclude_second);
@@ -463,7 +477,7 @@ fn partial_blob_restoration_retains_every_recovery_link() {
 #[test]
 fn a_snapshot_needed_by_an_older_clean_cannot_be_deleted() {
     let (fixture, video) = video_fixture(true);
-    let older = clean_video(&fixture, true);
+    let older = without_held(&clean_video(&fixture, true));
     let newer = clean_video(&fixture, false);
     assert!(older.manifest.blobs.is_empty());
     assert!(matches!(
@@ -496,7 +510,7 @@ fn deleting_dependent_snapshots_first_allows_reclaiming_the_blob() {
 #[test]
 fn an_old_snapshot_cannot_reattach_a_missing_shared_blob() {
     let (fixture, video) = video_fixture(true);
-    let older = clean_video(&fixture, true);
+    let older = without_held(&clean_video(&fixture, true));
     let newer = clean_video(&fixture, false);
     // Reproduce a dependency already deleted by version 1.0 or outside the cleaner.
     std::fs::remove_dir_all(newer.dir).unwrap();
@@ -507,6 +521,47 @@ fn an_old_snapshot_cannot_reattach_a_missing_shared_blob() {
         .read_library()
         .unwrap();
     assert!(!contents.usage_counts.contains_key(&video));
+}
+
+#[test]
+fn a_shared_blob_is_restorable_after_its_other_owner_is_deleted() {
+    let (fixture, video) = video_fixture(true);
+    // Clean the first set's video while the second set keeps it.
+    let snapshot = clean_video(&fixture, true);
+    assert!(snapshot.manifest.blobs.is_empty(), "nothing freed");
+    assert_eq!(snapshot.manifest.held.len(), 1);
+    assert!(fixture.holds(&video), "the second set still uses it");
+    // Deleting the snapshot alone would reclaim nothing, and is allowed.
+    assert_eq!(snapshot.manifest.bytes(), 0);
+
+    // osu!lazer deletes the second set, then `RealmFileStore.Cleanup` deletes the blob, which
+    // no usage points at any more.
+    let realm = cleaner_realm::Realm::open_for_write(&fixture.library.database()).unwrap();
+    cleaner_realm::fixture::keep_first_sets(&realm, 1).unwrap();
+    drop(realm);
+    std::fs::remove_file(fixture.library.blob_path(&video)).unwrap();
+
+    crate::restore(&fixture.library, &snapshot, |_| {}).unwrap();
+    assert_eq!(
+        std::fs::read(fixture.library.blob_path(&video)).unwrap(),
+        b"video bytes"
+    );
+    let contents = cleaner_realm::Realm::open_read_only(&fixture.library.database())
+        .unwrap()
+        .read_library()
+        .unwrap();
+    assert_eq!(contents.usage_counts.get(&video), Some(&1));
+}
+
+#[test]
+fn a_newer_snapshot_can_go_once_the_older_holds_its_own_link() {
+    let (fixture, video) = video_fixture(true);
+    let older = clean_video(&fixture, true);
+    let newer = clean_video(&fixture, false);
+    crate::snapshot::delete(&fixture.library, &newer).unwrap();
+    assert!(!fixture.holds(&video));
+    crate::restore(&fixture.library, &older, |_| {}).unwrap();
+    assert!(fixture.holds(&video));
 }
 
 #[test]

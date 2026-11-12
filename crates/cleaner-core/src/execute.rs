@@ -196,12 +196,28 @@ fn prepare(
     let (final_dir, blobs) = realm.erase_usages_with(|realm| {
         let current = realm.read_library()?;
         let freed = validate_candidates(candidates, &current)?;
+        // A blob another owner still uses stays in the library, but osu!lazer deletes it as
+        // soon as that owner goes (`RealmFileStore.Cleanup`), and a restore would then have
+        // nothing to put back. The snapshot keeps its own link to those too.
+        let freed_hashes: std::collections::HashSet<&str> =
+            freed.iter().map(|(hash, _)| *hash).collect();
+        let mut shared_seen = std::collections::HashSet::new();
+        let shared: Vec<(&str, u64)> = candidates
+            .iter()
+            .filter(|c| c.set_index != crate::plan::NO_SET_INDEX)
+            .filter(|c| !freed_hashes.contains(c.hash.as_str()))
+            .filter(|c| shared_seen.insert(c.hash.as_str()))
+            .map(|c| (c.hash.as_str(), c.bytes))
+            .collect();
+        let all: Vec<(&str, u64)> = freed.iter().chain(&shared).copied().collect();
 
-        let blobs = snapshot::each_blob(
-            &freed,
+        let (blobs, held): (Vec<_>, Vec<_>) = snapshot::each_blob(
+            &all,
             |hash, _| snapshot::preserve_blob(library, snapshot_dir, hash),
             &mut |done, total| progress(CleanProgress::Preserving { done, total }),
-        )?;
+        )?
+        .into_iter()
+        .partition(|(hash, _)| freed_hashes.contains(hash.as_str()));
 
         let manifest = Manifest {
             format_version: snapshot::FORMAT_VERSION,
@@ -210,6 +226,7 @@ fn prepare(
             schema_version: realm.schema_version(),
             detached: candidates.to_vec(),
             blobs,
+            held,
         };
 
         // Publish recovery data before committing. An interrupted clean stays restorable,

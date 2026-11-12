@@ -95,6 +95,13 @@ pub struct Manifest {
     pub detached: Vec<Candidate>,
     /// Hashes of blobs moved into the snapshot, with their sizes.
     pub blobs: Vec<(String, u64)>,
+    /// Blobs the clean detached that another owner still used, so they stayed in the library.
+    /// The snapshot keeps a link to each anyway, because osu!lazer deletes a blob once its
+    /// last owner goes, and a restore needs the bytes back. Deleting the snapshot reclaims
+    /// none of them while the library still holds them. Absent from snapshots written before
+    /// 1.7.7.
+    #[serde(default)]
+    pub held: Vec<(String, u64)>,
 }
 
 impl Manifest {
@@ -500,7 +507,12 @@ pub fn restore_blobs(
     progress: &mut impl FnMut(usize, usize),
 ) -> Result<usize, SnapshotError> {
     validate_snapshot_dir(library, &snapshot.dir)?;
-    for (hash, _) in &snapshot.manifest.blobs {
+    for (hash, _) in snapshot
+        .manifest
+        .blobs
+        .iter()
+        .chain(&snapshot.manifest.held)
+    {
         validate_hash(hash)?;
     }
     for candidate in &snapshot.manifest.detached {
@@ -509,7 +521,12 @@ pub fn restore_blobs(
     // Older snapshots can refer to shared blobs that they never stored. Check those too,
     // before committing any restored references to files that may have disappeared since.
     let mut expected: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
-    for (hash, size) in &snapshot.manifest.blobs {
+    for (hash, size) in snapshot
+        .manifest
+        .blobs
+        .iter()
+        .chain(&snapshot.manifest.held)
+    {
         if expected
             .insert(hash, *size)
             .is_some_and(|previous| previous != *size)
@@ -807,7 +824,7 @@ pub fn delete(library: &Library, snapshot: &Snapshot) -> Result<(), SnapshotErro
             .iter()
             .map(|c| c.hash.as_str())
             .collect();
-        for (hash, size) in &current.manifest.blobs {
+        for (hash, size) in current.manifest.blobs.iter().chain(&current.manifest.held) {
             if !needed.contains(hash.as_str()) {
                 continue;
             }
@@ -936,6 +953,7 @@ mod tests {
             schema_version: 51,
             detached: Vec::new(),
             blobs,
+            held: Vec::new(),
         }
     }
 
