@@ -1161,7 +1161,9 @@ impl App {
         }
     }
 
-    /// Includes or excludes every set the search currently shows.
+    /// Includes or excludes every set the search currently shows: the first [`BROWSE_LIMIT`]
+    /// matches, as the list draws them. A set below the limit is not on screen, so a bulk
+    /// action leaves it as the user last set it.
     fn set_all(&mut self, plan: &mut Plan, keep: bool) {
         let Some(browse) = &self.browse else {
             return;
@@ -1169,6 +1171,7 @@ impl App {
         for entry in browse
             .matches
             .iter()
+            .take(BROWSE_LIMIT)
             .filter_map(|index| browse.sets.get(*index))
         {
             plan.exclude(entry.set, keep);
