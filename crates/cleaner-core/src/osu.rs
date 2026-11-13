@@ -255,11 +255,11 @@ fn substitute<'a>(line: &'a str, variables: &Variables) -> std::borrow::Cow<'a, 
 
 /// [`parse`], substituting variables into event lines first.
 ///
-/// The game substitutes the variables defined so far: `start`, then each definition in `text`
-/// as it comes. A later definition of the same name changes what the lines after it name. Each
-/// event line is read that way and also with `last`, the variables in force at the end, so a
-/// line before its definition still counts. That finds every file the game draws, and perhaps
-/// a few it does not, which only keeps more files.
+/// Each event line is read with `last`, the variables in force at the end, so a line before its
+/// definition still counts. The game substitutes the variables defined so far instead: `start`,
+/// then each definition in `text` as it comes, so a later definition of the same name changes
+/// what the lines after it name. The storyboard art a line names that way is kept too, which
+/// finds every file the game draws, and perhaps a few it does not.
 fn parse_with(
     text: &str,
     kind: SourceKind,
@@ -271,11 +271,15 @@ fn parse_with(
     let mut section = String::new();
     let mut variables = start.clone();
     let read_events = |line: &str, variables: &Variables, references: &mut References| {
-        let in_order = substitute(line, variables);
-        read_event(&in_order, known, references);
         let at_end = substitute(line, last);
-        if at_end != in_order {
-            read_event(&at_end, known, references);
+        read_event(&at_end, known, references);
+        let in_order = substitute(line, variables);
+        if in_order != at_end {
+            // Storyboard art only. A background or video found this way would outrank the
+            // storyboard that draws the same file, and a clean of that category would take it.
+            let mut extra = References::default();
+            read_event(&in_order, known, &mut extra);
+            references.storyboard.extend(extra.storyboard);
         }
     };
 
@@ -694,6 +698,17 @@ mod tests {
             "{references:?}"
         );
         assert!(references.storyboard.contains("late.png"), "{references:?}");
+
+        // Only storyboard art: a background found this way would outrank the sprite.
+        let storyboard = "[Variables]\n$image=star.png\n[Events]\n0,0,\"$image\",0,0\n\
+                          Sprite,Foreground,Centre,\"star.png\",320,240\n\
+                          [Variables]\n$image=glow.png\n";
+        let references = parse(storyboard, SourceKind::Storyboard, &known);
+        assert!(references.storyboard.contains("star.png"), "{references:?}");
+        assert!(
+            !references.backgrounds.contains("star.png"),
+            "{references:?}"
+        );
     }
 
     #[test]
