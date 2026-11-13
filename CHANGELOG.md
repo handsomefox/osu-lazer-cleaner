@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.7.7
+
+- A snapshot keeps its own copy of a file that another beatmap set still used when it was cleaned.
+  If you later deleted that other set in osu!lazer, the game removed the file and the snapshot could
+  not be restored.
+- Storyboards that name their art through `[Variables]`, such as `$sprite=star.png`, are read the
+  way osu!lazer reads them, including a variable given a new value partway through. That art was
+  listed under **Skin elements** and could be removed.
+- A beatmap set whose difficulty or storyboard file cannot be read is left out of the scan, and the
+  status line says how many. Its storyboard art could be listed as skin elements.
+- A clean refuses a file that became a beatmap's background in the editor after the scan.
+- **Keep all shown** and **Clean all shown** change only the 500 sets the list shows, not matches
+  below the limit.
+- After a clean, compaction, restore, or delete fails, the window stays locked until the snapshot
+  list is read again. An operation started in that moment could look finished while it still ran.
+- F5 does nothing while a question is open, and a question cannot start an operation while another
+  runs. Pressing F5 under the clean question could make a running clean look finished.
+- Closing the window during a clean, restore, or delete always asks first. Closing it from the
+  taskbar while minimized brings it back with the question, and closing it again while the question
+  is open no longer closes it.
+- Updates installed from this version on are safer with two copies of the app open. A copy that
+  starts while another installs an update no longer deletes that download, and a copy no longer
+  installs an older update over a newer one that another copy installed. Files you keep beside the
+  app, and logs you renamed to keep, are no longer deleted at startup.
+
 ## 1.7.6
 
 - Keep a background that an old beatmap names in a video event, such as `1,0,"bg.jpg"`. osu!lazer
