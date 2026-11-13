@@ -186,7 +186,7 @@ pub enum SourceKind {
 /// extension, and hitsounds implied by a sample bank index.
 #[must_use]
 pub fn parse(text: &str, kind: SourceKind, known: &FileIndex) -> References {
-    parse_with(text, kind, known, &variables(text))
+    parse_with(text, kind, known, &Variables::new(), &variables(text))
 }
 
 /// Storyboard variables, `$name=value`, in the order they were first defined. A later
@@ -211,20 +211,24 @@ fn variables(text: &str) -> Variables {
             section = name.to_ascii_lowercase();
             continue;
         }
-        if section != "variables" {
-            continue;
+        if section == "variables" {
+            define_from(&mut variables, line);
         }
-        let line = match line.find("//") {
-            Some(index) if index > 0 => &line[..index],
-            _ => line,
-        };
-        let (key, value) = line
-            .trim_end()
-            .split_once('=')
-            .unwrap_or((line.trim_end(), ""));
-        define(&mut variables, key, value);
     }
     variables
+}
+
+/// Defines the variable on one line of a `[Variables]` section.
+fn define_from(variables: &mut Variables, line: &str) {
+    let line = match line.find("//") {
+        Some(index) if index > 0 => &line[..index],
+        _ => line,
+    };
+    let (key, value) = line
+        .trim_end()
+        .split_once('=')
+        .unwrap_or((line.trim_end(), ""));
+    define(variables, key, value);
 }
 
 fn define(variables: &mut Variables, key: &str, value: &str) {
@@ -249,15 +253,31 @@ fn substitute<'a>(line: &'a str, variables: &Variables) -> std::borrow::Cow<'a, 
     std::borrow::Cow::Owned(line)
 }
 
-/// [`parse`], substituting `variables` into event lines first.
+/// [`parse`], substituting variables into event lines first.
+///
+/// The game substitutes the variables defined so far: `start`, then each definition in `text`
+/// as it comes. A later definition of the same name changes what the lines after it name. Each
+/// event line is read that way and also with `last`, the variables in force at the end, so a
+/// line before its definition still counts. That finds every file the game draws, and perhaps
+/// a few it does not, which only keeps more files.
 fn parse_with(
     text: &str,
     kind: SourceKind,
     known: &FileIndex,
-    variables: &Variables,
+    start: &Variables,
+    last: &Variables,
 ) -> References {
     let mut references = References::default();
     let mut section = String::new();
+    let mut variables = start.clone();
+    let read_events = |line: &str, variables: &Variables, references: &mut References| {
+        let in_order = substitute(line, variables);
+        read_event(&in_order, known, references);
+        let at_end = substitute(line, last);
+        if at_end != in_order {
+            read_event(&at_end, known, references);
+        }
+    };
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -272,7 +292,8 @@ fn parse_with(
 
         match section.as_str() {
             "general" => read_general(trimmed, &mut references),
-            "events" => read_event(&substitute(line, variables), known, &mut references),
+            "variables" => define_from(&mut variables, line),
+            "events" => read_events(line, &variables, &mut references),
             "hitobjects" if kind == SourceKind::Difficulty => {
                 read_hit_object(trimmed, known, &mut references);
             }
@@ -281,7 +302,7 @@ fn parse_with(
             }
             // A `.osb` has no section header before its events, so treat bare lines as events.
             "" if kind == SourceKind::Storyboard => {
-                read_event(&substitute(line, variables), known, &mut references);
+                read_events(line, &variables, &mut references);
             }
             _ => {}
         }
@@ -294,9 +315,8 @@ fn parse_with(
 ///
 /// osu!lazer decodes a storyboard with each difficulty, the difficulty first, through one
 /// decoder, so a `.osb` sees the variables of whichever difficulty is played as well as its own.
-/// The storyboard is therefore read once on its own and once with each difficulty's variables.
-/// Variables apply to every event line in a source, even ones before the definition, which can
-/// only find more references than the game does, never fewer.
+/// The storyboard is therefore read once on its own and once with each difficulty's variables,
+/// starting from those the difficulty ends with.
 #[must_use]
 pub fn parse_all<'a>(
     sources: impl IntoIterator<Item = (&'a str, SourceKind)>,
@@ -308,7 +328,7 @@ pub fn parse_all<'a>(
         .collect();
     let mut references = References::default();
     for (text, kind, own) in &sources {
-        references.absorb(parse_with(text, *kind, known, own));
+        references.absorb(parse_with(text, *kind, known, &Variables::new(), own));
         if *kind != SourceKind::Storyboard {
             continue;
         }
@@ -320,7 +340,7 @@ pub fn parse_all<'a>(
             for (name, value) in own {
                 define(&mut combined, name, value);
             }
-            references.absorb(parse_with(text, *kind, known, &combined));
+            references.absorb(parse_with(text, *kind, known, difficulty, &combined));
         }
     }
     references
@@ -642,6 +662,38 @@ mod tests {
         );
         assert!(references.storyboard.contains("glow.png"), "{references:?}");
         assert!(references.backgrounds.contains("bg.jpg"));
+    }
+
+    #[test]
+    fn a_redefined_variable_keeps_what_it_named_before() {
+        let known = FileIndex::new(["star.png", "glow.png", "early.png", "late.png"]);
+        // osu!lazer substitutes the definitions read so far, so the first event draws
+        // star.png and the second glow.png.
+        let storyboard = "[Variables]\n$sprite=star.png\n[Events]\n\
+                          Sprite,Foreground,Centre,\"$sprite\",320,240\n\
+                          [Variables]\n$sprite=glow.png\n[Events]\n\
+                          Sprite,Foreground,Centre,\"$sprite\",320,240\n";
+        let references = parse(storyboard, SourceKind::Storyboard, &known);
+        assert!(references.storyboard.contains("star.png"), "{references:?}");
+        assert!(references.storyboard.contains("glow.png"), "{references:?}");
+
+        // A storyboard starts from the variables its difficulty ends with.
+        let difficulty = "[Variables]\n$s=early.png\n";
+        let uses = "[Events]\nSprite,Foreground,Centre,\"$s\",320,240\n\
+                    [Variables]\n$s=late.png\n[Events]\n\
+                    Sprite,Foreground,Centre,\"$s\",320,240\n";
+        let references = parse_all(
+            [
+                (difficulty, SourceKind::Difficulty),
+                (uses, SourceKind::Storyboard),
+            ],
+            &known,
+        );
+        assert!(
+            references.storyboard.contains("early.png"),
+            "{references:?}"
+        );
+        assert!(references.storyboard.contains("late.png"), "{references:?}");
     }
 
     #[test]
