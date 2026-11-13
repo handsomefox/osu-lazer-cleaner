@@ -246,7 +246,7 @@ impl App {
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default();
 
-        let worker = Worker::spawn(ctx.clone());
+        let mut worker = Worker::spawn(ctx.clone());
         worker.send(Command::OpenLibrary);
 
         Self {
@@ -289,7 +289,7 @@ impl App {
     /// behind it and then act on a plan describing a library that no longer exists. A worker
     /// that stopped would never answer one, so its absence locks everything too.
     fn idle(&self) -> bool {
-        self.activity.is_none() && !self.worker.stopped()
+        self.activity.is_none() && !self.worker.busy() && !self.worker.stopped()
     }
 
     /// Applies everything the worker reported since the last frame.
@@ -374,6 +374,8 @@ impl App {
                     self.error = Some(message);
                     self.activity = None;
                 }
+                // `Worker::drain` keeps these to itself.
+                Event::Done => {}
             }
         }
     }

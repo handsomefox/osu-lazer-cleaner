@@ -118,6 +118,9 @@ pub(crate) enum Event {
         /// Message to show.
         message: String,
     },
+    /// The worker finished a command and sent everything it will about it. [`Worker::drain`]
+    /// counts these and never returns them.
+    Done,
 }
 
 /// A copy of `client.realm` a compaction kept.
@@ -163,6 +166,8 @@ pub(crate) struct Worker {
     events: Receiver<Event>,
     /// Whether the worker thread has gone, which only a panic does while the window is open.
     stopped: bool,
+    /// Commands sent whose [`Event::Done`] has not arrived yet.
+    pending: usize,
 }
 
 impl Worker {
@@ -181,12 +186,15 @@ impl Worker {
             commands: command_tx,
             events: event_rx,
             stopped: false,
+            pending: 0,
         }
     }
 
     /// Queues a command. Dropping the worker makes this a no-op.
-    pub(crate) fn send(&self, command: Command) {
-        let _ = self.commands.send(command);
+    pub(crate) fn send(&mut self, command: Command) {
+        if self.commands.send(command).is_ok() {
+            self.pending += 1;
+        }
     }
 
     /// Takes any events that have arrived.
@@ -197,6 +205,7 @@ impl Worker {
         let mut events = Vec::new();
         loop {
             match self.events.try_recv() {
+                Ok(Event::Done) => self.pending = self.pending.saturating_sub(1),
                 Ok(event) => events.push(event),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -219,6 +228,12 @@ impl Worker {
     pub(crate) fn stopped(&self) -> bool {
         self.stopped
     }
+
+    /// Whether a command sent is still running or waiting, or has events still to arrive. A
+    /// failed command still sends a refreshed snapshot list after its failure, for one.
+    pub(crate) fn busy(&self) -> bool {
+        self.pending > 0
+    }
 }
 
 /// Worker loop. Owns the library so the interface thread cannot touch it.
@@ -227,6 +242,7 @@ fn run(commands: &Receiver<Command>, events: &Sender<Event>, ctx: &egui::Context
 
     while let Ok(command) = commands.recv() {
         handle(&mut library, command, events);
+        let _ = events.send(Event::Done);
         ctx.request_repaint();
     }
 }
@@ -565,10 +581,46 @@ mod tests {
             commands,
             events,
             stopped: false,
+            pending: 0,
         };
 
         assert!(matches!(worker.drain().as_slice(), [Event::Failed { .. }]));
         assert!(worker.stopped());
         assert!(worker.drain().is_empty());
+    }
+
+    #[test]
+    fn a_command_keeps_the_worker_busy_until_it_is_done() {
+        let (commands, received) = unbounded();
+        let (sender, events) = unbounded();
+        let mut worker = Worker {
+            commands,
+            events,
+            stopped: false,
+            pending: 0,
+        };
+        worker.send(Command::Compact);
+        assert!(worker.busy());
+        assert!(received.try_recv().is_ok());
+
+        // A failure, then the refresh that follows it: the command is not over yet.
+        sender
+            .send(failed_message("compaction failed".to_owned()))
+            .unwrap();
+        assert!(matches!(worker.drain().as_slice(), [Event::Failed { .. }]));
+        assert!(worker.busy());
+
+        sender
+            .send(Event::Snapshots {
+                entries: Vec::new(),
+                backups: Vec::new(),
+            })
+            .unwrap();
+        sender.send(Event::Done).unwrap();
+        assert!(matches!(
+            worker.drain().as_slice(),
+            [Event::Snapshots { .. }]
+        ));
+        assert!(!worker.busy());
     }
 }
