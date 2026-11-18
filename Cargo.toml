@@ -11,7 +11,6 @@ version = "1.7.7"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/handsomefox/osu-lazer-cleaner"
-description = "A desktop app that safely removes unwanted beatmap content from an osu!lazer library"
 
 [workspace.dependencies]
 app-diagnostics = { git = "https://github.com/handsomefox/app-internals", tag = "v0.3.0", version = "=0.3.0" }
