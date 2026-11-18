@@ -33,7 +33,7 @@ Nothing has been read yet on the first run, so the window offers the one thing t
 | Hitsounds | Custom hit samples. Beatmaps fall back to the default skin. |
 | Skin elements | Per-beatmap skin overrides. Beatmaps fall back to your active skin. |
 | Junk files | `thumbs.db`, `desktop.ini`, `.DS_Store`. |
-| Unreferenced files | Files nothing points at any more. |
+| Unreferenced files | Files nothing points at any more, left untouched for at least 10 minutes. |
 
 Junk and unreferenced files are selected by default, because neither can change how a beatmap
 plays. The rest are opt-in.
@@ -138,8 +138,10 @@ newer, and an X11 or Wayland session with OpenGL for the window. It looks for th
 `$XDG_DATA_HOME/osu`, then `~/.local/share/osu`, where the AppImage keeps it, then
 `~/.var/app/sh.ppy.osu/data/osu`, where the Flathub build does.
 
-Close osu!lazer before cleaning, restoring, or compacting the database. The window watches for
-the game and says so while it is open.
+Close osu!lazer before cleaning, restoring, or compacting the database. These three refuse to
+start while the game runs, because osu!lazer writes a file into the library before it records
+the file in the database, and a clean in between would remove a file the game is still importing.
+The window watches for the game and disables those buttons while it is open.
 
 Keyboard: `Ctrl+Tab` switches screens, `Ctrl+1` and `Ctrl+2` go straight to one, `F5` scans
 again, and `Esc` closes whatever is open. It reopens on whichever of the two screens you used
@@ -151,7 +153,8 @@ licences, and a button that opens the log folder.
 The **Snapshots** screen shows the database size and a **Compact database** button. Compaction
 reclaims the space left by removed database rows. It reports when another open handle prevents
 the rewrite. A copy of `client.realm` is taken first and kept until you delete it, so a rewrite
-osu!lazer will not open costs nothing but the time to rename the copy back.
+osu!lazer will not open costs nothing but the time to rename the copy back. When the rewrite is
+prevented, the database is unchanged, so that copy is removed and the older copies are kept.
 
 ## Updates
 
@@ -224,8 +227,8 @@ because some differences appear only there:
 cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 ```
 
-Testing a Windows executable needs the database on an NTFS volume, because Windows file
-locking does not work over the WSL filesystem.
+To test a Windows executable, put the library on an NTFS volume of that Windows machine.
+Windows file locking does not work on a library shared from a Linux filesystem.
 
 Synthetic Realm tests run in CI and cover cached asset references, transaction rollback, and
 restoration after osu!lazer removes a file record. Additional tests use a real library at

@@ -15,7 +15,7 @@ use crate::format::elapsed_ms;
 use crate::operation::OperationLock;
 use crate::plan::Candidate;
 use crate::safety::is_safe_path;
-use crate::storage::{Library, is_blob_hash};
+use crate::storage::{Library, is_hex_digest};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -29,8 +29,12 @@ fn guard(library: &Library, path: &Path) -> Result<(), SnapshotError> {
     Ok(())
 }
 
+/// Refuses a name that could reach outside the blob store.
+///
+/// Either case passes, so a snapshot an older version took of an uppercase name stays
+/// restorable. New plans are held to lowercase before they get here.
 fn validate_hash(hash: &str) -> Result<(), SnapshotError> {
-    if !is_blob_hash(hash) {
+    if !is_hex_digest(hash) {
         return Err(SnapshotError::OutsideLibrary {
             path: PathBuf::from(hash),
         });
@@ -127,8 +131,7 @@ impl Snapshot {
     pub fn id(&self) -> String {
         self.dir
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
+            .map_or_default(|n| n.to_string_lossy().into_owned())
     }
 }
 
@@ -1139,6 +1142,25 @@ mod tests {
             b"payload",
             "restored bytes must be identical"
         );
+    }
+
+    #[test]
+    fn a_snapshot_an_older_version_took_of_an_uppercase_name_still_restores() {
+        // Before 1.8 a scan offered `ABCD…` as an unreferenced blob. On NTFS that is the file
+        // osu!lazer opens for `abcd…`, so the user needs it back.
+        let hash = "C".repeat(64);
+        let (_dir, library) = library_with_blob(&hash, b"payload");
+
+        clean_one(&library, &hash, 7);
+        let snapshots = list(&library).unwrap();
+
+        assert_eq!(
+            restore_blobs(&library, &snapshots[0], &mut |_, _| {}).unwrap(),
+            1
+        );
+        assert_eq!(std::fs::read(library.blob_path(&hash)).unwrap(), b"payload");
+        delete(&library, &snapshots[0]).unwrap();
+        assert!(list(&library).unwrap().is_empty());
     }
 
     #[test]

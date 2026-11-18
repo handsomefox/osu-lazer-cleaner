@@ -363,11 +363,16 @@ impl Realm {
         // SAFETY: `realm_config_new` allocates a config we own and release below. Each setter
         // copies what it needs, so `raw_path` only has to outlive the `set_path` call.
         // `set_scheduler` copies the scheduler, so we release our handle afterwards.
+        //
+        // File format upgrades stay off in both modes. realm-core would otherwise rewrite a
+        // file written by an older Realm into its own format on open, and the osu!lazer that
+        // owns the library might not read the result.
         let ptr = unsafe {
             let config = sys::realm_config_new();
             sys::realm_config_set_path(config, raw_path.as_ptr());
             sys::realm_config_set_schema(config, std::ptr::null());
             sys::realm_config_set_schema_mode(config, mode);
+            sys::realm_config_set_disable_format_upgrade(config, true);
             sys::realm_config_set_scheduler(config, scheduler);
             sys::realm_config_set_automatic_change_notifications(config, false);
             let realm = sys::realm_open(config);
@@ -1470,6 +1475,42 @@ mod tests {
             // osu!lazer was at schema 52 when this was written; older files are still readable.
             assert!(realm.schema_version() > 0, "expected a real schema version");
         });
+    }
+
+    /// A file in an older Realm format is refused, not upgraded, whichever way it is opened.
+    ///
+    /// The sample is realm-core's own format 23 file. The realm-core this crate builds writes
+    /// format 24 and upgrades 23 on open unless upgrades are disabled.
+    #[test]
+    fn an_older_file_format_is_never_upgraded() {
+        let sample = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor/realm-core/test/test_upgrade_database_4_23.realm");
+        // The path is baked in at build time, so a test binary copied to another machine, such
+        // as a Windows test VM, cannot find it. Anywhere this crate builds, it is there.
+        let Ok(original) = std::fs::read(&sample) else {
+            tracing::warn!(path = %sample.display(), "skipping: no realm-core sample here");
+            return;
+        };
+
+        for (mode, open) in [
+            (
+                "read-only",
+                Realm::open_read_only as fn(&Path) -> Result<Realm, RealmError>,
+            ),
+            ("write", Realm::open_for_write),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("client.realm");
+            std::fs::write(&path, &original).unwrap();
+
+            let opened = open(&path);
+            assert!(opened.is_err(), "{mode} opened an older format");
+            drop(opened);
+            assert!(
+                std::fs::read(&path).unwrap() == original,
+                "{mode} changed the file"
+            );
+        }
     }
 
     /// The write-path gate: a real transaction must not migrate the database.

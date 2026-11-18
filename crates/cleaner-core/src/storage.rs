@@ -2,6 +2,7 @@
 
 use crate::error::StorageError;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 /// Name of the Realm database lazer writes.
 ///
@@ -43,8 +44,7 @@ impl Library {
             root = %resolved.display(),
             redirected = resolved != root,
             database_bytes = std::fs::metadata(resolved.join(DATABASE_FILENAME))
-                .map(|meta| meta.len())
-                .unwrap_or_default(),
+                .map_or_default(|meta| meta.len()),
             "library opened"
         );
         Ok(Self { root: resolved })
@@ -104,9 +104,43 @@ impl Library {
     }
 }
 
-/// Reports whether a name is a 64-character hex SHA-256, the only name a blob can have.
+/// Reports whether a name is a 64-character lowercase hex SHA-256, the only name a blob can have.
+///
+/// osu!lazer writes hashes in lowercase (`ComputeSHA2Hash`). Uppercase is refused because NTFS
+/// ignores case: a stray `files/a/ab/ABCD…` is the same file lazer opens for `abcd…`, and
+/// treating it as a separate blob that nothing references would offer that file for removal.
 pub(crate) fn is_blob_hash(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Reports whether a name is a 64-character hex digest in either case.
+///
+/// Only for snapshots that already exist. Versions before 1.8 accepted uppercase names, so a
+/// snapshot can hold one, and it has to stay restorable and deletable. Nothing new is ever
+/// planned under such a name: discovery and plan checks use [`is_blob_hash`].
+pub(crate) fn is_hex_digest(name: &str) -> bool {
     name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// How long a blob that no usage points at must sit unmodified before it counts as left over.
+///
+/// osu!lazer writes a blob into `files/` before the transaction that adds its usage commits, so
+/// a blob caught between the two looks unreferenced. Ten minutes covers any import.
+pub const UNREFERENCED_MIN_AGE: Duration = Duration::from_mins(10);
+
+/// Reports whether the file at `path` was last modified at least [`UNREFERENCED_MIN_AGE`]
+/// before `now`.
+///
+/// A file that cannot be read, or whose modification time is later than `now`, is not settled.
+pub(crate) fn is_settled(path: &Path, now: SystemTime) -> bool {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= UNREFERENCED_MIN_AGE)
 }
 
 /// Builds the `files/`-relative path for a hash.
@@ -131,33 +165,12 @@ fn redirect_target(root: &Path) -> Option<PathBuf> {
         if key.trim().eq_ignore_ascii_case("FullPath") {
             let value = value.trim();
             if !value.is_empty() {
-                return Some(PathBuf::from(translate_path(value)));
+                return Some(PathBuf::from(value));
             }
         }
     }
 
     None
-}
-
-/// Rewrites a Windows path so it resolves when running under WSL.
-///
-/// `storage.ini` always holds a Windows path, because lazer wrote it. A Linux build reading
-/// the same file through `/mnt` needs `E:\Games\osu!lazer` to become `/mnt/e/Games/osu!lazer`.
-/// On Windows the path is already correct and passes through unchanged.
-fn translate_path(raw: &str) -> String {
-    if cfg!(windows) {
-        return raw.to_owned();
-    }
-
-    let bytes = raw.as_bytes();
-    let looks_like_drive = bytes.len() > 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic();
-    if !looks_like_drive {
-        return raw.to_owned();
-    }
-
-    let drive = raw[..1].to_ascii_lowercase();
-    let rest = raw[2..].replace('\\', "/");
-    format!("/mnt/{drive}{rest}")
 }
 
 /// Directories lazer may keep its data in, most likely first.
@@ -176,9 +189,6 @@ fn default_roots() -> Vec<PathBuf> {
             home.as_deref(),
             crate::folders::data_home().as_deref(),
         ));
-
-        // A Linux build under WSL can also reach a Windows install through `/mnt`.
-        roots.extend(windows_roots_from_wsl());
     }
 
     roots
@@ -209,23 +219,6 @@ fn unix_roots(home: Option<&Path>, data_home: Option<&Path>) -> Vec<PathBuf> {
     roots
 }
 
-/// Finds `%APPDATA%\osu` on mounted Windows drives, for WSL.
-fn windows_roots_from_wsl() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    let Ok(users) = std::fs::read_dir("/mnt/c/Users") else {
-        return roots;
-    };
-
-    for entry in users.flatten() {
-        let candidate = entry.path().join("AppData/Roaming/osu");
-        if candidate.is_dir() {
-            roots.push(candidate);
-        }
-    }
-
-    roots
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +228,49 @@ mod tests {
         assert!(is_blob_hash(&"a".repeat(64)));
         assert!(!is_blob_hash(&"a".repeat(63)));
         assert!(!is_blob_hash("IMPORTANT READ ME.txt"));
+    }
+
+    #[test]
+    fn a_blob_name_in_uppercase_is_not_a_blob() {
+        // On NTFS this name is the same file osu!lazer opens for the lowercase hash.
+        assert!(!is_blob_hash(&"A".repeat(64)));
+        assert!(!is_blob_hash(&format!("{}F", "a".repeat(63))));
+        assert!(is_blob_hash(&"0123456789abcdef".repeat(4)));
+    }
+
+    /// Writes a file and sets its modification time to `age` before now.
+    fn file_aged(path: &Path, age: Duration) {
+        std::fs::write(path, b"blob").unwrap();
+        // Windows needs a handle opened for writing to change the time.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    #[test]
+    fn only_a_file_untouched_for_ten_minutes_is_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+
+        let old = dir.path().join("old");
+        file_aged(&old, UNREFERENCED_MIN_AGE + Duration::from_secs(60));
+        assert!(is_settled(&old, now));
+
+        let young = dir.path().join("young");
+        file_aged(&young, Duration::from_secs(60));
+        assert!(
+            !is_settled(&young, now),
+            "a file being imported is not settled"
+        );
+
+        assert!(
+            !is_settled(&old, now - 2 * UNREFERENCED_MIN_AGE),
+            "a modification time later than now is not settled"
+        );
+        assert!(!is_settled(&dir.path().join("missing"), now));
     }
 
     #[test]
@@ -270,16 +306,6 @@ mod tests {
         assert_eq!(library.root(), real);
     }
 
-    #[cfg(not(windows))]
-    #[test]
-    fn windows_drive_paths_translate_for_wsl() {
-        assert_eq!(
-            translate_path(r"E:\Games\osu!lazer"),
-            "/mnt/e/Games/osu!lazer"
-        );
-        assert_eq!(translate_path("/already/unix"), "/already/unix");
-    }
-
     #[test]
     fn the_xdg_data_directory_is_tried_before_the_default() {
         let home = Path::new("/home/me");
@@ -313,6 +339,7 @@ mod tests {
             unix_roots(None, Some(Path::new("/data"))),
             [PathBuf::from("/data/osu")]
         );
-        assert!(unix_roots(None, None).is_empty());
+        let roots = unix_roots(None, None);
+        assert!(roots.is_empty(), "nothing to look in: {roots:?}");
     }
 }

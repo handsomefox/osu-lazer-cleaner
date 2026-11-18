@@ -49,6 +49,21 @@ impl Fixture {
         crate::build_plan(&self.library, &selected, |_| {}).unwrap()
     }
 
+    /// Sets a blob's modification time far enough back that a scan treats it as settled.
+    fn age(&self, hash: &str) {
+        // Windows needs a handle opened for writing to change the time.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(self.library.blob_path(hash))
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    - crate::storage::UNREFERENCED_MIN_AGE
+                    - std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+    }
+
     /// Whether the library still holds a blob.
     fn holds(&self, hash: &str) -> bool {
         self.library.blob_path(hash).is_file()
@@ -331,6 +346,15 @@ fn unreferenced_blobs_are_swept_without_touching_the_database() {
         &[(&orphan, b"left over"), (&difficulty, b"osu file v14")],
     );
 
+    assert_eq!(
+        fixture
+            .scan(&[Category::Unreferenced])
+            .selected_totals()
+            .files,
+        0,
+        "a blob written moments ago may be an import still in progress"
+    );
+    fixture.age(&orphan);
     let plan = fixture.scan(&[Category::Unreferenced]);
     assert_eq!(plan.selected_totals().files, 1);
 
@@ -479,7 +503,11 @@ fn a_snapshot_needed_by_an_older_clean_cannot_be_deleted() {
     let (fixture, video) = video_fixture(true);
     let older = without_held(&clean_video(&fixture, true));
     let newer = clean_video(&fixture, false);
-    assert!(older.manifest.blobs.is_empty());
+    assert!(
+        older.manifest.blobs.is_empty(),
+        "the older clean freed nothing: {:?}",
+        older.manifest.blobs
+    );
     assert!(matches!(
         crate::snapshot::delete(&fixture.library, &newer),
         Err(crate::SnapshotError::SnapshotDependency { .. })
@@ -583,4 +611,56 @@ fn a_version_one_restore_can_resume_after_its_blobs_were_moved() {
             .references,
         1
     );
+}
+
+#[test]
+fn an_unreferenced_blob_rewritten_after_the_scan_is_kept() {
+    let orphan = hash('f');
+    let fixture = Fixture::build(
+        &[SetFixture::new(
+            [1; 16],
+            "Nhelv",
+            &[("Map.osu", &hash('b'))],
+        )],
+        &[(&orphan, b"left over"), (&hash('b'), b"osu file v14")],
+    );
+    fixture.age(&orphan);
+    let plan = fixture.scan(&[Category::Unreferenced]);
+    assert_eq!(plan.selected_totals().files, 1);
+
+    // osu!lazer imports the same file again before the clean starts.
+    std::fs::write(fixture.library.blob_path(&orphan), b"left over").unwrap();
+
+    assert!(matches!(
+        crate::run(&fixture.library, &plan, &Options { dry_run: false }, |_| {}),
+        Err(crate::SnapshotError::StalePlan)
+    ));
+    assert!(fixture.holds(&orphan));
+    assert!(crate::snapshot::list(&fixture.library).unwrap().is_empty());
+}
+
+#[test]
+fn a_running_osu_lazer_blocks_cleaning_and_restoring() {
+    let (fixture, video) = video_fixture(false);
+    let snapshot = clean_video(&fixture, false);
+    crate::running::tests::pretend_lazer_runs();
+
+    assert!(matches!(
+        crate::restore(&fixture.library, &snapshot, |_| {}),
+        Err(crate::SnapshotError::LazerRunning)
+    ));
+    assert!(
+        !fixture.holds(&video),
+        "a refused restore puts nothing back"
+    );
+    assert!(snapshot.dir.join("blobs").join(&video).is_file());
+
+    let (fixture, video) = video_fixture(false);
+    let plan = fixture.scan(&[Category::Videos]);
+    assert!(matches!(
+        crate::run(&fixture.library, &plan, &Options { dry_run: false }, |_| {}),
+        Err(crate::SnapshotError::LazerRunning)
+    ));
+    assert!(fixture.holds(&video), "a refused clean removes nothing");
+    assert!(!fixture.library.snapshots_dir().exists());
 }

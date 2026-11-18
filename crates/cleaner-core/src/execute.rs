@@ -15,7 +15,7 @@ use crate::format::elapsed_ms;
 use crate::operation::OperationLock;
 use crate::plan::{Options, Plan};
 use crate::snapshot::{self, Manifest, Snapshot};
-use crate::storage::{Library, is_blob_hash};
+use crate::storage::{Library, is_blob_hash, is_settled};
 use cleaner_realm::{Realm, Removal, Restoration};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -80,7 +80,8 @@ pub struct Outcome {
 ///
 /// # Errors
 ///
-/// Returns [`SnapshotError`] if the database cannot be updated or a blob cannot be moved. The
+/// Returns [`SnapshotError::LazerRunning`] while osu!lazer runs, and touches nothing. Returns
+/// another [`SnapshotError`] if the database cannot be updated or a blob cannot be moved. The
 /// database transaction is all-or-nothing, so a failure there leaves the library untouched.
 pub fn run(
     library: &Library,
@@ -100,6 +101,7 @@ pub fn run(
         });
     }
 
+    crate::running::ensure_lazer_closed()?;
     check_database_path(library)?;
     let _lock = OperationLock::acquire(library)?;
     let started = std::time::Instant::now();
@@ -196,6 +198,7 @@ fn prepare(
     let (final_dir, blobs) = realm.erase_usages_with(|realm| {
         let current = realm.read_library()?;
         let freed = validate_candidates(candidates, &current)?;
+        check_unreferenced_settled(library, candidates, std::time::SystemTime::now())?;
         // A blob another owner still uses stays in the library, but osu!lazer deletes it as
         // soon as that owner goes (`RealmFileStore.Cleanup`), and a restore would then have
         // nothing to put back. The snapshot keeps its own link to those too.
@@ -320,6 +323,31 @@ fn validate_candidates<'a>(
     Ok(freed)
 }
 
+/// Rejects the plan if a blob it found unreferenced was modified since.
+///
+/// The scan only offers blobs left alone for [`UNREFERENCED_MIN_AGE`], but it can be minutes
+/// old. A blob osu!lazer wrote again since then may be an import whose usage has not committed
+/// yet. A blob that is already gone is not an error: nothing is lost by skipping it.
+///
+/// [`UNREFERENCED_MIN_AGE`]: crate::storage::UNREFERENCED_MIN_AGE
+fn check_unreferenced_settled(
+    library: &Library,
+    candidates: &[crate::Candidate],
+    now: std::time::SystemTime,
+) -> Result<(), SnapshotError> {
+    for candidate in candidates {
+        if candidate.set_index != crate::plan::NO_SET_INDEX {
+            continue;
+        }
+        let path = library.blob_path(&candidate.hash);
+        if path.exists() && !is_settled(&path, now) {
+            tracing::warn!(hash = %candidate.hash, "an unreferenced blob changed after the scan");
+            return Err(SnapshotError::StalePlan);
+        }
+    }
+    Ok(())
+}
+
 /// What the copies of `client.realm` taken before a compaction are called, either side of the
 /// time the copy was taken.
 ///
@@ -375,11 +403,16 @@ impl Compaction {
 /// depends on. A copy is taken first and kept afterwards, so a rewrite that produces a database
 /// osu!lazer will not open costs nothing but the time to put the copy back.
 ///
+/// Old copies are pruned only after a rewrite. When realm-core declines, the copy just taken is
+/// removed instead: the database did not change, so the copies already kept still match it.
+///
 /// # Errors
 ///
-/// Returns [`SnapshotError`] if the database cannot be copied, opened, or measured. Nothing is
+/// Returns [`SnapshotError::LazerRunning`] while osu!lazer runs, and copies nothing. Returns
+/// another [`SnapshotError`] if the database cannot be copied, opened, or measured. Nothing is
 /// rewritten unless the copy is complete and on disk.
 pub fn compact(library: &Library) -> Result<Compaction, SnapshotError> {
+    crate::running::ensure_lazer_closed()?;
     check_database_path(library)?;
     let _lock = OperationLock::acquire(library)?;
     let path = library.database();
@@ -395,8 +428,9 @@ pub fn compact(library: &Library) -> Result<Compaction, SnapshotError> {
 
     let started = std::time::Instant::now();
     let before = measure("measuring the database")?;
-    back_up_database(library)?;
+    let copy = back_up_database(library)?;
     let rewritten = Realm::open_for_write(&path)?.compact()?;
+    after_compaction(library, &copy, rewritten);
     let after = measure("measuring the database")?;
     tracing::info!(
         rewritten,
@@ -414,7 +448,25 @@ pub fn compact(library: &Library) -> Result<Compaction, SnapshotError> {
     })
 }
 
-/// Copies `client.realm` beside the snapshots under a new name, then prunes the oldest copies.
+/// Prunes the oldest copies after a rewrite, or removes `copy` when there was none.
+///
+/// A declined compaction left the database as it was, so pruning then would delete a good copy
+/// for nothing, and keeping `copy` would add one full-size duplicate per attempt.
+fn after_compaction(library: &Library, copy: &Path, rewritten: bool) {
+    if rewritten {
+        let name = copy.file_name().and_then(std::ffi::OsStr::to_str);
+        prune_database_backups(library, name.unwrap_or_default());
+        return;
+    }
+    match std::fs::remove_file(copy) {
+        Ok(()) => tracing::info!(copy = %copy.display(), "compaction declined, copy removed"),
+        Err(error) => {
+            tracing::warn!(copy = %copy.display(), %error, "could not remove an unneeded copy");
+        }
+    }
+}
+
+/// Copies `client.realm` beside the snapshots under a new name.
 ///
 /// The copy lands under a temporary name and is renamed into place, so an interrupted copy
 /// never replaces a good one with a truncated file.
@@ -443,7 +495,6 @@ fn back_up_database(library: &Library) -> Result<PathBuf, SnapshotError> {
         return written.map(|()| destination);
     }
 
-    prune_database_backups(library, &name);
     Ok(destination)
 }
 
@@ -703,12 +754,14 @@ fn release_all(
 ///
 /// # Errors
 ///
-/// Returns [`SnapshotError`] if a blob cannot be moved back or the database cannot be updated.
+/// Returns [`SnapshotError::LazerRunning`] while osu!lazer runs, and touches nothing. Returns
+/// another [`SnapshotError`] if a blob cannot be moved back or the database cannot be updated.
 pub fn restore(
     library: &Library,
     snapshot: &Snapshot,
     progress: impl FnMut(CleanProgress),
 ) -> Result<usize, SnapshotError> {
+    crate::running::ensure_lazer_closed()?;
     check_database_path(library)?;
     let _lock = OperationLock::acquire(library)?;
     let started = std::time::Instant::now();
@@ -853,11 +906,8 @@ mod tests {
         let plan = plan_with_one_selected();
         let candidate = &plan.groups[0].candidates[0];
         let mut current = current_library(candidate, 2);
-        assert!(
-            validate_candidates(std::slice::from_ref(candidate), &current)
-                .unwrap()
-                .is_empty()
-        );
+        let freed = validate_candidates(std::slice::from_ref(candidate), &current).unwrap();
+        assert!(freed.is_empty(), "another usage keeps the blob: {freed:?}");
         current.beatmap_sets[0].id = [1; 16];
         assert!(validate_candidates(std::slice::from_ref(candidate), &current).is_err());
         current.beatmap_sets[0].id = candidate.set_id;
@@ -921,11 +971,8 @@ mod tests {
 
         // A skin holds the third reference, so the blob has to stay.
         current.usage_counts.insert(first.hash.clone(), 3);
-        assert!(
-            validate_candidates(&candidates, &current)
-                .unwrap()
-                .is_empty()
-        );
+        let freed = validate_candidates(&candidates, &current).unwrap();
+        assert!(freed.is_empty(), "the skin keeps the blob: {freed:?}");
     }
 
     #[test]
@@ -937,8 +984,7 @@ mod tests {
         assert!(run(&library, &plan, &Options { dry_run: false }, |_| {}).is_err());
 
         let leftovers: Vec<_> = std::fs::read_dir(library.snapshots_dir())
-            .map(|entries| entries.flatten().map(|e| e.path()).collect())
-            .unwrap_or_default();
+            .map_or_default(|entries| entries.flatten().map(|e| e.path()).collect());
         assert!(leftovers.is_empty(), "left behind {leftovers:?}");
     }
 
@@ -982,7 +1028,8 @@ mod tests {
         );
 
         remove_database_backup(&library, &copy.name).unwrap();
-        assert!(database_backups(&library).is_empty());
+        let left = database_backups(&library);
+        assert!(left.is_empty(), "the copy must be gone: {left:?}");
         remove_database_backup(&library, &copy.name)
             .expect("removing a missing copy is not an error");
     }
@@ -1024,7 +1071,8 @@ mod tests {
         assert_eq!(copies.len(), 1, "an older copy must still be offered");
         assert_eq!(copies[0].name, LEGACY_BACKUP);
         remove_database_backup(&library, LEGACY_BACKUP).unwrap();
-        assert!(database_backups(&library).is_empty());
+        let left = database_backups(&library);
+        assert!(left.is_empty(), "the copy must be gone: {left:?}");
     }
 
     #[test]
@@ -1083,6 +1131,12 @@ mod tests {
             .collect();
 
         let fresh = back_up_database(&library).expect("could not write the copy");
+        assert_eq!(
+            database_backups(&library).len(),
+            MAX_DATABASE_BACKUPS + 1,
+            "nothing is pruned before the rewrite"
+        );
+        after_compaction(&library, &fresh, true);
 
         assert!(
             fresh.exists(),
@@ -1093,6 +1147,110 @@ mod tests {
         assert!(
             !left.iter().any(|copy| copy.name == existing[0]),
             "the oldest of the others is the one to go"
+        );
+    }
+
+    #[test]
+    fn a_declined_compaction_prunes_nothing_and_drops_its_own_copy() {
+        let (_dir, library) = library();
+        let existing = write_copies(&library, MAX_DATABASE_BACKUPS);
+
+        let fresh = back_up_database(&library).expect("could not write the copy");
+        after_compaction(&library, &fresh, false);
+
+        assert!(
+            !fresh.exists(),
+            "the database did not change, so its copy is not needed"
+        );
+        let left: Vec<String> = database_backups(&library)
+            .into_iter()
+            .map(|copy| copy.name)
+            .collect();
+        let mut newest_first = existing;
+        newest_first.reverse();
+        assert_eq!(left, newest_first, "every older copy must survive");
+    }
+
+    #[test]
+    fn a_failed_compaction_prunes_nothing() {
+        let (_dir, library) = library();
+        let existing = write_copies(&library, MAX_DATABASE_BACKUPS);
+
+        // The stub is not a real database, so the rewrite fails after the copy is taken.
+        assert!(compact(&library).is_err());
+
+        let left: Vec<String> = database_backups(&library)
+            .into_iter()
+            .map(|copy| copy.name)
+            .collect();
+        assert_eq!(left.len(), MAX_DATABASE_BACKUPS + 1);
+        assert!(existing.iter().all(|name| left.contains(name)));
+    }
+
+    #[test]
+    fn nothing_runs_while_osu_lazer_does() {
+        let (_dir, library) = library();
+        crate::running::tests::pretend_lazer_runs();
+
+        assert!(matches!(
+            compact(&library),
+            Err(SnapshotError::LazerRunning)
+        ));
+        assert!(
+            !library.snapshots_dir().exists(),
+            "a refused compaction copies nothing"
+        );
+
+        assert!(matches!(
+            run(
+                &library,
+                &plan_with_one_selected(),
+                &Options { dry_run: false },
+                |_| {}
+            ),
+            Err(SnapshotError::LazerRunning)
+        ));
+        assert!(
+            !library.snapshots_dir().exists(),
+            "a refused clean starts no snapshot"
+        );
+
+        // A preview changes nothing, so it still answers.
+        assert!(
+            run(
+                &library,
+                &plan_with_one_selected(),
+                &Options::default(),
+                |_| {}
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_unreferenced_blob_written_since_the_scan_is_refused() {
+        let (_dir, library) = library();
+        let mut candidate = plan_with_one_selected().groups[0].candidates[0].clone();
+        candidate.set_index = crate::plan::NO_SET_INDEX;
+        candidate.category = Category::Unreferenced;
+        let blob = library.blob_path(&candidate.hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"importing").unwrap();
+        let now = std::time::SystemTime::now();
+
+        assert!(matches!(
+            check_unreferenced_settled(&library, std::slice::from_ref(&candidate), now),
+            Err(SnapshotError::StalePlan)
+        ));
+        let later = now + crate::storage::UNREFERENCED_MIN_AGE;
+        assert!(
+            check_unreferenced_settled(&library, std::slice::from_ref(&candidate), later).is_ok()
+        );
+
+        std::fs::remove_file(&blob).unwrap();
+        assert!(
+            check_unreferenced_settled(&library, &[candidate], now).is_ok(),
+            "a blob that is already gone is skipped, not refused"
         );
     }
 

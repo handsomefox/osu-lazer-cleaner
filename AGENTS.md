@@ -61,6 +61,14 @@ Each rule comes from osu!lazer's own source. Read the source before changing one
 - **Recovery data is published before the database commits.** A clean that fails before its
   commit removes its own half-built snapshot, because those links would pin blobs the library
   still owns. Never reorder those steps.
+- **Nothing changes the library while osu!lazer runs.** `RealmFileStore.Add` writes a blob into
+  `files/` before the transaction that adds its usage commits, so a blob mid-import looks
+  unreferenced. `run`, `restore`, and `compact` return `SnapshotError::LazerRunning` while the
+  game runs. As a second guard, an unreferenced blob is offered, and later cleaned, only once it
+  has sat unmodified for `UNREFERENCED_MIN_AGE`.
+- **Blob names are lowercase hex.** NTFS ignores case, so `files/a/ab/ABCD…` is the file lazer
+  opens for `abcd…`. `is_blob_hash` refuses uppercase. Only snapshot code accepts it, through
+  `is_hex_digest`, so that snapshots older versions took stay restorable.
 - **Paths are re-checked immediately before they are touched**, independently of the check made
   while scanning. A plan can be minutes old by the time it runs.
 

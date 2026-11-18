@@ -10,7 +10,7 @@ use crate::format::elapsed_ms;
 use crate::osu::{self, SourceKind};
 use crate::plan::{Candidate, Group, NO_SET, NO_SET_INDEX, Plan, Progress, SetId, Timings};
 use crate::skin;
-use crate::storage::{Library, is_blob_hash};
+use crate::storage::{Library, is_blob_hash, is_settled};
 use cleaner_realm::Realm;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -83,7 +83,12 @@ pub fn build_plan(
         classify_sets(library, &sets, &sizes, &usage_counts, &mut progress);
     let classify_ms = elapsed_ms(classify_started);
 
-    candidates.extend(orphan_blobs(&sizes, &usage_counts));
+    candidates.extend(orphan_blobs(
+        library,
+        &sizes,
+        &usage_counts,
+        std::time::SystemTime::now(),
+    ));
     progress(Progress::Done);
 
     let titles = set_titles(&sets, &candidates);
@@ -496,13 +501,22 @@ fn read_source(path: &Path, stop_at_hit_objects: bool) -> Option<String> {
 ///
 /// lazer sweeps these itself on every startup, so a healthy library has none. They appear when
 /// a previous clean was interrupted, or when lazer crashed mid-import.
+///
+/// A blob modified less than [`UNREFERENCED_MIN_AGE`] before `now` is left out. lazer writes a
+/// blob before the transaction that adds its usage commits, so a new one is likely an import
+/// still in progress.
+///
+/// [`UNREFERENCED_MIN_AGE`]: crate::storage::UNREFERENCED_MIN_AGE
 fn orphan_blobs(
+    library: &Library,
     sizes: &HashMap<String, u64>,
     usage_counts: &HashMap<String, u32>,
+    now: std::time::SystemTime,
 ) -> Vec<Candidate> {
     sizes
         .iter()
         .filter(|(hash, _)| !usage_counts.contains_key(*hash))
+        .filter(|(hash, _)| is_settled(&library.blob_path(hash), now))
         .map(|(hash, bytes)| Candidate {
             set_index: NO_SET_INDEX,
             set_id: NO_SET,
@@ -772,6 +786,56 @@ mod tests {
     }
 
     #[test]
+    fn a_new_unreferenced_blob_is_not_offered() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join(crate::storage::DATABASE_FILENAME),
+            b"stub",
+        )
+        .unwrap();
+        let library = Library::open(directory.path()).unwrap();
+        let hash = "e".repeat(64);
+        let blob = library.blob_path(&hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"importing").unwrap();
+        let sizes = HashMap::from([(hash.clone(), 9)]);
+        let now = std::time::SystemTime::now();
+
+        assert!(
+            orphan_blobs(&library, &sizes, &HashMap::new(), now).is_empty(),
+            "a blob written moments ago may be an import whose usage has not committed"
+        );
+        let later = now + crate::storage::UNREFERENCED_MIN_AGE;
+        let offered = orphan_blobs(&library, &sizes, &HashMap::new(), later);
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].hash, hash);
+        assert!(
+            orphan_blobs(&library, &sizes, &HashMap::from([(hash, 1)]), later).is_empty(),
+            "a blob something uses is never unreferenced"
+        );
+    }
+
+    #[test]
+    fn an_uppercase_copy_of_a_blob_is_not_measured() {
+        let directory = tempfile::tempdir().unwrap();
+        let shard = directory.path().join("a").join("ab");
+        std::fs::create_dir_all(&shard).unwrap();
+        // On NTFS this name is the file osu!lazer opens for `abcc…`.
+        std::fs::write(shard.join(format!("AB{}", "C".repeat(62))), b"blob").unwrap();
+        let other = directory.path().join("b").join("bc");
+        std::fs::create_dir_all(&other).unwrap();
+        let lower = format!("bc{}", "d".repeat(62));
+        std::fs::write(other.join(&lower), b"blob").unwrap();
+
+        let mut sizes = HashMap::new();
+        let counted = std::sync::atomic::AtomicUsize::new(0);
+        measure_shard(&shard, &mut sizes, &counted);
+        measure_shard(&other, &mut sizes, &counted);
+
+        assert_eq!(sizes, HashMap::from([(lower, 4)]));
+    }
+
+    #[test]
     fn sets_with_nothing_to_clean_are_not_labelled() {
         let with_video = set_with(&["intro.mp4"], &[], &[]);
         let mut without = with_video.clone();
@@ -863,7 +927,8 @@ mod tests {
         std::fs::create_dir_all(files.join("a")).unwrap();
 
         assert_eq!(blob_shards(&files).len(), 1, "fall back to the first level");
-        assert!(blob_shards(&directory.path().join("missing")).is_empty());
+        let missing = blob_shards(&directory.path().join("missing"));
+        assert!(missing.is_empty(), "nothing to walk: {missing:?}");
     }
 
     #[test]

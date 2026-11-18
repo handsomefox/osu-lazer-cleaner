@@ -46,6 +46,10 @@ pub enum SnapshotError {
     #[error("another cleaner operation is using this library; wait for it to finish")]
     OperationInProgress,
 
+    /// osu!lazer is running, and could be adding files while this changed the library.
+    #[error("osu!lazer is running; close it, then try again")]
+    LazerRunning,
+
     /// Another snapshot depends on files this deletion would remove.
     #[error(
         "snapshot {dependent} needs files from {snapshot}; restore the newer snapshot first, or delete {dependent} first"

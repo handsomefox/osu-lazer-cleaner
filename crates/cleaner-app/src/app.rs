@@ -15,6 +15,9 @@ use std::time::Duration;
 /// Enumerating processes is cheap, but not so cheap that it belongs in every frame.
 const LAZER_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
+/// What every control that changes the library says while osu!lazer runs.
+const CLOSE_LAZER_FIRST: &str = "osu!lazer is running. Close it first, then try again.";
+
 /// How many beatmap sets the browse list shows before it asks the user to narrow the search.
 const BROWSE_LIMIT: usize = 500;
 
@@ -536,9 +539,9 @@ impl App {
                 );
                 ui.label(
                     egui::RichText::new(
-                        "Close it before cleaning, restoring, or compacting. The game sweeps \
-                         unreferenced files on startup and holds the database open, so leaving \
-                         it running makes those three fail or take longer than they should.",
+                        "Cleaning, restoring, and compacting are off until you close it. The \
+                         game adds files to the library while it runs, and a clean at the same \
+                         time could remove a file it is still importing.",
                     )
                     .small()
                     .color(theme::MUTED),
@@ -830,7 +833,8 @@ impl App {
     fn action_bar(&mut self, ui: &mut egui::Ui) {
         let removing = self.selected_totals.bytes;
         let references = self.selected_totals.references;
-        let enabled = self.idle() && references > 0;
+        let running = self.lazer_running();
+        let enabled = self.idle() && references > 0 && !running;
 
         ui.horizontal(|ui| {
             ui.add_enabled_ui(enabled, |ui| {
@@ -848,7 +852,10 @@ impl App {
                 let button =
                     egui::Button::new(egui::RichText::new(label).color(theme::BASE)).fill(fill);
 
-                if ui.add(button).clicked() {
+                let response = ui.add(button);
+                if running {
+                    response.on_disabled_hover_text(CLOSE_LAZER_FIRST);
+                } else if response.clicked() {
                     self.modal = Some(Question::Clean);
                 }
             });
@@ -1281,10 +1288,13 @@ impl App {
                     }
                 });
 
-                ui.add_enabled_ui(newest && self.idle(), |ui| {
+                let running = self.lazer_running();
+                ui.add_enabled_ui(newest && self.idle() && !running, |ui| {
                     let button = ui.button(icons::labelled(icons::RESTORE, "Put files back"));
                     if !newest {
                         button.on_disabled_hover_text("Restore the snapshot above this one first.");
+                    } else if running {
+                        button.on_disabled_hover_text(CLOSE_LAZER_FIRST);
                     } else if button.clicked() {
                         self.modal = Some(Question::Restore(entry.id.clone()));
                     }
@@ -1338,11 +1348,12 @@ impl App {
         ui.add_space(12.0);
 
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(self.idle() && self.library.is_some(), |ui| {
-                if ui
-                    .button(icons::labelled(icons::COMPACT, "Compact database"))
-                    .clicked()
-                {
+            let running = self.lazer_running();
+            ui.add_enabled_ui(self.idle() && self.library.is_some() && !running, |ui| {
+                let button = ui.button(icons::labelled(icons::COMPACT, "Compact database"));
+                if running {
+                    button.on_disabled_hover_text(CLOSE_LAZER_FIRST);
+                } else if button.clicked() {
                     self.compaction = None;
                     self.error = None;
                     self.activity = Some(Activity::Compacting);
@@ -1435,7 +1446,8 @@ impl App {
                 );
 
                 if self.lazer_running() {
-                    body.push_str("\n\nosu!lazer is running. Close it first.");
+                    body.push_str("\n\n");
+                    body.push_str(CLOSE_LAZER_FIRST);
                 }
 
                 (
@@ -1449,16 +1461,16 @@ impl App {
                 let entry = self.snapshots.iter().find(|s| &s.id == id);
                 let files = entry.map_or(0, |s| s.files);
                 let size = entry.map_or_else(String::new, |s| human_bytes(s.bytes));
-                (
-                    "Put these files back?",
-                    format!(
-                        "{files} files, {size}, return to your library, and the snapshot is \
-                         removed.\n\nYour free space will not change: the files were never \
-                         deleted, only moved aside."
-                    ),
-                    "Put files back",
-                    false,
-                )
+                let mut body = format!(
+                    "{files} files, {size}, return to your library, and the snapshot is \
+                     removed.\n\nYour free space will not change: the files were never \
+                     deleted, only moved aside."
+                );
+                if self.lazer_running() {
+                    body.push_str("\n\n");
+                    body.push_str(CLOSE_LAZER_FIRST);
+                }
+                ("Put these files back?", body, "Put files back", false)
             }
             Question::Delete(id) => {
                 let size = self
@@ -1509,9 +1521,7 @@ impl App {
                 let button =
                     egui::Button::new(egui::RichText::new(action).color(theme::BASE)).fill(fill);
 
-                // Only quitting may be answered while the worker is busy: anything else would
-                // queue a second operation behind the running one.
-                let enabled = self.idle() || matches!(modal, Question::Quit(_));
+                let enabled = may_answer(&modal, self.idle(), self.lazer_running());
                 if ui.add_enabled(enabled, button).clicked() {
                     match &modal {
                         Question::Clean => self.confirm_clean(),
@@ -1542,6 +1552,19 @@ impl App {
                 }
             });
         });
+    }
+}
+
+/// Whether the acting button of an open question works.
+///
+/// Only quitting may be answered while the worker is busy: anything else would queue a second
+/// operation behind the running one. Cleaning and restoring stay off while osu!lazer runs,
+/// because the core refuses them then.
+fn may_answer(modal: &Question, idle: bool, lazer_running: bool) -> bool {
+    match modal {
+        Question::Quit(_) => true,
+        Question::Clean | Question::Restore(_) => idle && !lazer_running,
+        Question::Delete(_) => idle,
     }
 }
 
@@ -1746,12 +1769,38 @@ mod tests {
     }
 
     #[test]
+    fn a_running_game_blocks_only_the_questions_that_change_the_library() {
+        let clean = Question::Clean;
+        let restore = Question::Restore("snapshot".to_owned());
+        let delete = Question::Delete("snapshot".to_owned());
+        let quit = Question::Quit(Activity::Cleaning);
+
+        for question in [&clean, &restore, &delete, &quit] {
+            assert!(may_answer(question, true, false), "{question:?}");
+        }
+        assert!(!may_answer(&clean, true, true));
+        assert!(!may_answer(&restore, true, true));
+        assert!(
+            may_answer(&delete, true, true),
+            "deleting a snapshot never touches the library"
+        );
+        assert!(
+            may_answer(&quit, false, true),
+            "quitting is always possible"
+        );
+        assert!(
+            !may_answer(&delete, false, false),
+            "a busy worker answers nothing else"
+        );
+    }
+
+    #[test]
     fn searching_ignores_case_and_surrounding_space() {
         let sets = [entry("Sotarks - Nhelv"), entry("Camellia - Ghost")];
 
         assert_eq!(matching(&sets, "  SOTARKS "), vec![0]);
         assert_eq!(matching(&sets, "e"), vec![0, 1]);
         assert_eq!(matching(&sets, ""), vec![0, 1]);
-        assert!(matching(&sets, "nothing here").is_empty());
+        assert_eq!(matching(&sets, "nothing here"), Vec::<usize>::new());
     }
 }
