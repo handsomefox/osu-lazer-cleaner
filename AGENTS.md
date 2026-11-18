@@ -21,9 +21,10 @@ The workspace is layered so that everything portable stays testable on Linux.
 - The shared crates come from [handsomefox/app-internals](https://github.com/handsomefox/app-internals),
   pinned to a tag: `app-update` updates the app from its GitHub releases, on Windows and Linux,
   `app-update-ui` draws the update dialog's content, `app-diagnostics` writes the log files,
-  and `app-folders` finds the user folders and opens the log folder. That repository's
-  `AGENTS.md` covers changing them. `cleaner-app/src/update.rs` holds this app's chip, its
-  window, and the `Look` that themes the dialog, and the window creates the updater.
+  `app-folders` finds the user folders and opens the log folder, `app-paths` is the path guard
+  in `cleaner-core/src/safety.rs`, and `app-instance` keeps one window open on Windows. That
+  repository's `AGENTS.md` covers changing them. `cleaner-app/src/update.rs` holds this app's
+  chip, its window, and the `Look` that themes the dialog, and the window creates the updater.
 
 The vendored Inter files have their Private Use Area cmap entries stripped. Upstream Inter maps
 stylistic-set alternates into U+E000..U+F8FF, where the Phosphor icon glyphs live, and Inter

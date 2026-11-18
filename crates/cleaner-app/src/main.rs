@@ -37,11 +37,34 @@ fn gui() -> ExitCode {
         ..eframe::NativeOptions::default()
     };
 
-    let started = eframe::run_native(
-        APP_ID,
-        options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
-    );
+    // The guard lives only for the window, so an updated copy started below finds the lock
+    // free.
+    let started = {
+        // A second launch brings this window forward instead of opening another. Off Windows
+        // every launch opens its own window.
+        let instance = match app_instance::acquire(APP_ID) {
+            Ok(app_instance::Instance::Primary(guard)) => Some(guard),
+            Ok(app_instance::Instance::Secondary) => {
+                tracing::info!("another copy is running; asked it to come forward");
+                return ExitCode::SUCCESS;
+            }
+            // Run without the guard rather than refuse to start.
+            Err(error) => {
+                tracing::warn!(%error, "running without the single-instance lock");
+                None
+            }
+        };
+        eframe::run_native(
+            APP_ID,
+            options,
+            Box::new(|cc| {
+                if let Some(guard) = &instance {
+                    bring_forward_on_activate(guard, &cc.egui_ctx);
+                }
+                Ok(Box::new(app::App::new(cc)))
+            }),
+        )
+    };
 
     // eframe saves the app's state before `run_native` returns, so the updated copy starts
     // from everything this one knew.
@@ -55,6 +78,19 @@ fn gui() -> ExitCode {
             tracing::error!("{error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Restores and focuses the window whenever another launch signals.
+fn bring_forward_on_activate(guard: &app_instance::Guard, ctx: &egui::Context) {
+    let ctx = ctx.clone();
+    let watching = guard.on_activate(move || {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    });
+    if let Err(error) = watching {
+        tracing::warn!(%error, "a second launch will not bring this window forward");
     }
 }
 
