@@ -19,7 +19,7 @@ app-folders.workspace = true
 app-instance.workspace = true
 app-update.workspace = true
 app-update-ui.workspace = true
-cleaner-core = { version = "=1.7.7", path = "../cleaner-core" }
+cleaner-core = { version = "=1.8.0", path = "../cleaner-core" }
 crossbeam-channel.workspace = true
 eframe.workspace = true
 egui_extras.workspace = true

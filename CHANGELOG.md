@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.8.0
+
+- On Windows, opening osu!lazer Cleaner while it is already open brings the open window to the
+  front instead of starting a second copy.
+- Cleaning, restoring, and compacting refuse to start while osu!lazer is running, and their
+  buttons stay disabled until you close it. osu!lazer saves a new file into the library before it
+  records the file in the database, so a clean in between could remove a file the game was still
+  importing.
+- **Unreferenced files** lists only files that have not changed for at least 10 minutes. A clean
+  started from an older scan stops if one of those files changed since, and asks you to scan again.
+- A file in `files/` whose name is a real file's name in uppercase is no longer listed under
+  **Unreferenced files**. On Windows that name opens the same file osu!lazer uses, so cleaning it
+  removed a file the game still needed. A snapshot an older version took of such a file can still
+  be restored.
+- Compacting keeps every older copy of `client.realm` when the database is not rewritten. It
+  removed the oldest copy even then.
+- The cleaner never upgrades `client.realm` to a newer Realm file format. A database in an older
+  format fails to open instead.
+- Running the Linux build under WSL to clean a Windows osu! install is no longer supported; use the
+  Windows build.
+
 ## 1.7.7
 
 - A snapshot keeps its own copy of a file that another beatmap set still used when it was cleaned.
